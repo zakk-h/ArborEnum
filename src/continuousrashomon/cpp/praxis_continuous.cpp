@@ -1801,7 +1801,7 @@ private:
             }
         }
 
-        auto node = make_shared<TreeTrieNode>(); // wraps in shared pointer so memory management is automatic
+        auto node = make_shared<TreeTrieNode>();
         node->budget = budget;
 
         int n_sub = 0;
@@ -3002,6 +3002,1109 @@ private:
         return {left_node, right_node};
     
     }
+
+    static std::unordered_set<int> local_split_features_(
+        const std::shared_ptr<TreeTrieNode>& node
+    ) {
+        std::unordered_set<int> seen;
+        if (!node) return seen;
+
+        seen.reserve(node->splits.size() * 2 + 8);
+
+        for (const auto& s : node->splits) {
+            seen.insert(s.feature);
+        }
+
+        return seen;
+    }
+
+    pair<shared_ptr<TreeTrieNode>, shared_ptr<TreeTrieNode>>
+    solve_siblings_extend(
+        shared_ptr<TreeTrieNode> left_node,
+        shared_ptr<TreeTrieNode> right_node,
+        int loss_l,
+        int loss_r,
+        const Packed& Lmask,
+        const Packed& Rmask,
+        int budget,
+        int8_t depth,
+        const PathKey& pkL,
+        const PathKey& pkR,
+        const ContinuousPath& cpathL,
+        const ContinuousPath& cpathR
+    ) {
+        int left_budget = budget - loss_r;
+
+        if (left_budget >= 0) {
+            if (left_node) {
+                left_node = construct_trie_extend(
+                    left_node,
+                    Lmask,
+                    depth - 1,
+                    left_budget,
+                    pkL,
+                    cpathL
+                );
+            } else {
+                left_node = construct_trie(
+                    Lmask,
+                    depth - 1,
+                    left_budget,
+                    pkL,
+                    cpathL
+                );
+            }
+        } else {
+            left_node = nullptr;
+        }
+
+        int min_left =
+            left_node ? left_node->min_objective : numeric_limits<int>::max();
+
+        int right_budget =
+            (min_left == numeric_limits<int>::max()) ? -1 : budget - min_left;
+
+        if (right_budget >= 0) {
+            if (right_node) {
+                right_node = construct_trie_extend(
+                    right_node,
+                    Rmask,
+                    depth - 1,
+                    right_budget,
+                    pkR,
+                    cpathR
+                );
+            } else {
+                right_node = construct_trie(
+                    Rmask,
+                    depth - 1,
+                    right_budget,
+                    pkR,
+                    cpathR
+                );
+            }
+        } else {
+            right_node = nullptr;
+        }
+
+        int min_right =
+            right_node ? right_node->min_objective : numeric_limits<int>::max();
+
+        while (true) {
+            bool changed = false;
+
+            const int new_left_budget =
+                (min_right == numeric_limits<int>::max())
+                    ? -1
+                    : budget - min_right;
+
+            if (new_left_budget > left_budget) {
+                left_budget = new_left_budget;
+
+                if (left_budget >= 0) {
+                    if (left_node) {
+                        left_node = construct_trie_extend(
+                            left_node,
+                            Lmask,
+                            depth - 1,
+                            left_budget,
+                            pkL,
+                            cpathL
+                        );
+                    } else {
+                        left_node = construct_trie(
+                            Lmask,
+                            depth - 1,
+                            left_budget,
+                            pkL,
+                            cpathL
+                        );
+                    }
+
+                    const int new_min_left = left_node
+                        ? left_node->min_objective
+                        : numeric_limits<int>::max();
+
+                    if (new_min_left < min_left) {
+                        min_left = new_min_left;
+                        changed = true;
+                    }
+                }
+            }
+
+            const int new_right_budget =
+                (min_left == numeric_limits<int>::max())
+                    ? -1
+                    : budget - min_left;
+
+            if (new_right_budget > right_budget) {
+                right_budget = new_right_budget;
+
+                if (right_budget >= 0) {
+                    if (right_node) {
+                        right_node = construct_trie_extend(
+                            right_node,
+                            Rmask,
+                            depth - 1,
+                            right_budget,
+                            pkR,
+                            cpathR
+                        );
+                    } else {
+                        right_node = construct_trie(
+                            Rmask,
+                            depth - 1,
+                            right_budget,
+                            pkR,
+                            cpathR
+                        );
+                    }
+
+                    const int new_min_right = right_node
+                        ? right_node->min_objective
+                        : numeric_limits<int>::max();
+
+                    if (new_min_right < min_right) {
+                        min_right = new_min_right;
+                        changed = true;
+                    }
+                }
+            }
+
+            if (!changed) {
+                break;
+            }
+        }
+
+        return {left_node, right_node};
+    }
+
+    shared_ptr<TreeTrieNode> construct_trie_extend(shared_ptr<TreeTrieNode> node, const Packed& mask, int8_t depth, int budget, const PathKey& pk, const ContinuousPath& cpath = empty_continuous_path()) {
+        if (!node) {
+            return construct_trie(mask, depth, budget, pk, cpath);
+        }
+
+        if (budget <= node->budget) {
+            return node;
+        }
+
+
+        const uint64_t k = key_of_subproblem(mask, pk);
+        K3 key{k, depth, budget};
+
+        if (trie_cache_enabled) {
+            if (auto it = trie_cache.find(key); it != trie_cache.end()) {
+                return it->second; // exact lookup for simplicity
+            }
+        }
+
+        node->budget = budget;
+
+        // add newly feasible leaves, don't duplicate them
+        {
+            std::unordered_set<int> existing_leaf_preds;
+            existing_leaf_preds.reserve(node->leaves.size() * 2 + 4);
+
+            for (const auto& leaf : node->leaves) {
+                existing_leaf_preds.insert(leaf.prediction);
+            }
+
+            int n_sub = 0;
+
+            if (num_classes == 2) {
+                int pos = 0;
+                count_total_pos_binary(mask, n_sub, pos);
+
+                if (!majority_leaf_only) {
+                    const int cost0 = gamma + pos;
+                    const int cost1 = gamma + (n_sub - pos);
+
+                    if (cost0 <= budget && !existing_leaf_preds.count(0)) {
+                        node->add_leaf(0, cost0);
+                    }
+
+                    if (cost1 <= budget && !existing_leaf_preds.count(1)) {
+                        node->add_leaf(1, cost1);
+                    }
+                } else {
+                    const int neg = n_sub - pos;
+                    const int best_c = (pos >= neg) ? 1 : 0;
+                    const int mis = std::min(pos, neg);
+                    const int best_cost = gamma + mis;
+
+                    if (best_cost <= budget && !existing_leaf_preds.count(best_c)) {
+                        node->add_leaf(best_c, best_cost);
+                    }
+                }
+            } else {
+                n_sub = count_total(mask);
+
+                std::vector<int> cnts;
+                count_per_class(mask, cnts);
+
+                if (!majority_leaf_only) {
+                    for (int c = 0; c < num_classes; ++c) {
+                        const int mis = n_sub - cnts[(size_t)c];
+                        const int cost = gamma + mis;
+
+                        if (cost <= budget && !existing_leaf_preds.count(c)) {
+                            node->add_leaf(c, cost);
+                        }
+                    }
+                } else {
+                    int best_c = 0;
+                    int best_cnt = cnts[0];
+
+                    for (int c = 1; c < num_classes; ++c) {
+                        const int v = cnts[(size_t)c];
+                        if (v > best_cnt || (v == best_cnt && c > best_c)) {
+                            best_cnt = v;
+                            best_c = c;
+                        }
+                    }
+
+                    const int mis = n_sub - best_cnt;
+                    const int best_cost = gamma + mis;
+
+                    if (best_cost <= budget && !existing_leaf_preds.count(best_c)) {
+                        node->add_leaf(best_c, best_cost);
+                    }
+                }
+            }
+        }
+
+        if (depth == 0 || budget < 2 * gamma) {
+            if (trie_cache_enabled) trie_cache.emplace(key, node);
+            return node;
+        }
+
+        Packed L(n_words), R(n_words);
+
+        const int8_t k_here = (proxy_style == 2 && depth >= 0 && depth < (int)k_at_depth.size())
+            ? k_at_depth[depth-1]
+            : lookahead_init;
+
+        const int first_continuous_feature = continuous_starts.empty() ? n_features : continuous_starts[0];
+        auto already_split = local_split_features_(node);
+
+        for (int f = 0; f < first_continuous_feature; ++f) {
+            if (already_split.count(f)) {
+                // if this happens, we still need to do the extended solve siblings because we have a bigger budget
+                auto it = std::find_if(
+                    node->splits.begin(),
+                    node->splits.end(),
+                    [&](const SplitNode& s) {
+                        return s.feature == f;
+                    }
+                );
+
+                if (it == node->splits.end()) {
+                    // Should not happen if already_split was built from node->splits.
+                    continue;
+                }
+
+                and_bits(mask, X_bits[f], L);
+                andnot_bits(mask, X_bits[f], R);
+
+                if (!L.any() || !R.any()) {
+                    continue;
+                }
+
+                const PathKey* pkLp = &empty_pk();
+                const PathKey* pkRp = &empty_pk();
+
+                PathKey pkL_local;
+                PathKey pkR_local;
+
+                make_child_pks_if_needed_(
+                    f,
+                    pk,
+                    pkLp,
+                    pkRp,
+                    pkL_local,
+                    pkR_local
+                );
+
+                const ContinuousPath* cpathLp = &cpath;
+                const ContinuousPath* cpathRp = &cpath;
+
+                ContinuousPath cpathL_local;
+                ContinuousPath cpathR_local;
+
+                make_child_continuous_paths_if_needed_(
+                    f,
+                    cpath,
+                    cpathLp,
+                    cpathRp,
+                    cpathL_local,
+                    cpathR_local
+                );
+
+                const int lossL = it->left
+                    ? it->left->min_objective
+                    : std::numeric_limits<int>::max();
+
+                const int lossR = it->right
+                    ? it->right->min_objective
+                    : std::numeric_limits<int>::max();
+
+                auto LR = solve_siblings_extend(
+                    it->left,
+                    it->right,
+                    lossL,
+                    lossR,
+                    L,
+                    R,
+                    budget,
+                    depth,
+                    *pkLp,
+                    *pkRp,
+                    *cpathLp,
+                    *cpathRp
+                );
+
+                it->left = LR.first;
+                it->right = LR.second;
+
+                if (it->left && it->right) {
+                    const int min_sum = it->left->min_objective + it->right->min_objective;
+                    if (min_sum < node->min_objective) {
+                        node->min_objective = min_sum;
+                    }
+                }
+
+                continue;
+            }
+
+            and_bits(mask, X_bits[f], L);
+            andnot_bits(mask, X_bits[f], R);
+
+            if (!L.any() || !R.any()) continue;
+
+            // build child pks (canonical sorted)
+            // pk refs default to EMPTY
+            const PathKey* pkLp = &empty_pk();
+            const PathKey* pkRp = &empty_pk();
+
+            // only build PKs in LITS_EXACT
+            PathKey pkL_local, pkR_local;
+            if (key_mode == KeyMode::LITS_EXACT) {
+                pkL_local = pk;
+                pkR_local = pk;
+                pk_insert_sorted(pkL_local, enc_lit(f, 1));
+                pk_insert_sorted(pkR_local, enc_lit(f, 0));
+                pkLp = &pkL_local;
+                pkRp = &pkR_local;
+            }
+
+            int lossL, lossR;
+
+            // to evaluate whether lossL+lossR is within budget (for non rule list mode), we can first handle an early pruning case
+            if (lookahead_init < 0) {
+                lossL = leaf_objective(L);
+            } else if (lookahead_init == 0) {
+                lossL = greedy_proxy_objective_(L, depth - 1, *pkLp, cpath);
+            } else {
+                if (proxy_style == 4) {
+                    lossL = split_algorithm(L, depth - 1, k_here, *pkLp);
+                } else {
+                    lossL = lickety_proxy_objective_(L, depth - 1, k_here, *pkLp, cpath);
+                }
+            }
+
+            // either L or R would work here, could take larger, but very cheap to just choose one
+            if (!rule_list_mode) {
+                if (lossL + gamma > budget) continue;
+            }
+
+            // now compute R if we need it for more information
+            if (lookahead_init < 0) {
+                lossR = leaf_objective(R);
+            } else if (lookahead_init == 0) {
+                lossR = greedy_proxy_objective_(R, depth - 1, *pkRp, cpath);
+            } else {
+                if (proxy_style == 4) {
+                    lossR = split_algorithm(R, depth - 1, k_here, *pkRp);
+                } else {
+                    lossR = lickety_proxy_objective_(R, depth - 1, k_here, *pkRp, cpath);
+                }
+            }
+
+            // standard pruning logic in paper
+            if (!rule_list_mode) {
+                if (lossL + lossR > budget) continue; // approximation decision tree rashomon set
+            } else {
+                if (lossL > budget - gamma && lossR > budget - gamma) continue; // exact rule list rashomon set
+            }
+
+            
+            // LR has two entries: first and second.
+            // these are null because it is a new split
+            auto LR = solve_siblings_extend(
+                nullptr,
+                nullptr,
+                lossL,
+                lossR,
+                L,
+                R,
+                budget,
+                depth,
+                *pkLp,
+                *pkRp,
+                cpath,
+                cpath
+            );
+
+            // the left and right TreeTrieNode (OR nodes) to be added to the AND/OR graph being built
+            if (!LR.first || !LR.second) continue; // safeguard, especially needed if we allow non-injective keys
+            
+            node->add_split(f, LR.first, LR.second); // add split with left and right subtries
+        }
+
+        // continuous groups, already fully binarized
+        for (int cont_pos = 0; cont_pos < (int)continuous_starts.size(); ++cont_pos) {
+            const int raw_start_idx = continuous_starts[(size_t)cont_pos];
+
+            const int raw_end_idx = (cont_pos + 1 < (int)continuous_starts.size())
+                ? continuous_starts[(size_t)(cont_pos + 1)]
+                : n_features;
+
+            auto [start_idx, end_idx] =
+                tighten_continuous_interval_from_path_(
+                    raw_start_idx,
+                    raw_end_idx,
+                    cpath
+                );
+
+            if (start_idx >= end_idx) {
+                continue;
+            }
+
+            enumerate_continuous_feature_for_trie_extend(
+                node,
+                mask,
+                depth,
+                budget,
+                pk,
+                cpath,
+                k_here,
+                start_idx,
+                end_idx,
+                L,
+                R,
+                already_split
+            );
+        }
+
+        if (trie_cache_enabled) trie_cache.emplace(key, node);
+        return node;
+    }
+
+    void enumerate_continuous_feature_for_trie_extend(
+        shared_ptr<TreeTrieNode>& node,
+        const Packed& mask,
+        int8_t depth,
+        int budget,
+        const PathKey& pk,
+        const ContinuousPath& cpath,
+        int8_t k_here,
+        int start_idx,
+        int end_idx,
+        Packed& L,
+        Packed& R,
+        std::unordered_set<int>& already_split
+    ){
+        // continuous threshold group is [start_idx, end_idx).
+        // threshold columns are already binarized and monotone ordered.
+        if (start_idx >= end_idx) return;
+
+        // evaluated[feat] = {lossL, lossR}
+        //
+        // feat is the absolute threshold-column feature index.
+        // this scratch table includes both feasible and failed evaluated thresholds.
+        // successful splits are stored persistently by node->add_split(feat, ...).
+        // std::map<int, std::pair<int,int>> evaluated;
+
+        std::deque<std::pair<int,int>> Q;
+        Q.push_back({start_idx, end_idx - 1});
+
+        int M_L = start_idx;
+        int M_R = end_idx - 1;
+
+        while (!Q.empty()) {
+            auto [i, j] = Q.front();
+            Q.pop_front();
+
+            // auto shrunk = shrink_interval_with_bound_bitvector_(
+            //     evaluated,
+            //     mask,
+            //     start_idx,
+            //     end_idx,
+            //     i,
+            //     j,
+            //     M_L,
+            //     M_R,
+            //     budget
+            // );
+
+            i = std::max(i, M_L);
+            j = std::min(j, M_R);
+
+            if (i > j) continue;
+
+            const int feat = i + ((j - i) >> 1); // midpoint of thresholds, recall we aren't deduplicating
+
+            if (already_split.count(feat)) {
+
+                auto it = std::find_if(
+                    node->splits.begin(),
+                    node->splits.end(),
+                    [&](const SplitNode& s) {
+                        return s.feature == feat;
+                    }
+                );
+
+                if (it != node->splits.end()) {
+                    and_bits(mask, X_bits[feat], L);
+                    andnot_bits(mask, X_bits[feat], R);
+
+                    if (L.any() && R.any()) {
+                        const PathKey* pkLp = &empty_pk();
+                        const PathKey* pkRp = &empty_pk();
+
+                        PathKey pkL_local;
+                        PathKey pkR_local;
+
+                        make_child_pks_if_needed_(
+                            feat,
+                            pk,
+                            pkLp,
+                            pkRp,
+                            pkL_local,
+                            pkR_local
+                        );
+
+                        const ContinuousPath* cpathLp = &cpath;
+                        const ContinuousPath* cpathRp = &cpath;
+
+                        ContinuousPath cpathL_local;
+                        ContinuousPath cpathR_local;
+
+                        make_child_continuous_paths_if_needed_(
+                            feat,
+                            cpath,
+                            cpathLp,
+                            cpathRp,
+                            cpathL_local,
+                            cpathR_local
+                        );
+
+                        const int lossL = it->left
+                            ? it->left->min_objective
+                            : std::numeric_limits<int>::max();
+
+                        const int lossR = it->right
+                            ? it->right->min_objective
+                            : std::numeric_limits<int>::max();
+
+                        auto LR = solve_siblings_extend(
+                            it->left,
+                            it->right,
+                            lossL,
+                            lossR,
+                            L,
+                            R,
+                            budget,
+                            depth,
+                            *pkLp,
+                            *pkRp,
+                            *cpathLp,
+                            *cpathRp
+                        );
+
+                        it->left = LR.first;
+                        it->right = LR.second;
+
+                        if (it->left && it->right) {
+                            const int min_sum =
+                                it->left->min_objective + it->right->min_objective;
+
+                            if (min_sum < node->min_objective) {
+                                node->min_objective = min_sum;
+                            }
+                        }
+
+                    }
+                }
+
+                if (i <= feat - 1) {
+                    Q.push_back({i, feat - 1});
+                }
+
+                if (feat + 1 <= j) {
+                    Q.push_back({feat + 1, j});
+                }
+
+                continue;
+            }
+
+            split_threshold_bits_(mask, feat, L, R);
+
+            const bool left_empty = !L.any();
+            const bool right_empty = !R.any();
+
+            if (left_empty || right_empty) {
+                if (left_empty && !right_empty) {
+                    // threshold too low: all thresholds <= feat also have empty left.
+                    // only higher thresholds can become valid.
+                    if (feat + 1 <= j) {
+                        Q.push_back({feat + 1, j});
+                    }
+                } else if (!left_empty && right_empty) {
+                    // threshold too high: all thresholds >= feat also have empty right.
+                    // only lower thresholds can become valid.
+                    if (i <= feat - 1) {
+                        Q.push_back({i, feat - 1});
+                    }
+                }
+                // if both are empty, mask itself is empty, which should not happen here.
+                continue;
+            }
+
+            const PathKey* pkLp = &empty_pk();
+            const PathKey* pkRp = &empty_pk();
+
+            PathKey pkL_local;
+            PathKey pkR_local;
+
+            make_child_pks_if_needed_(
+                feat,
+                pk,
+                pkLp,
+                pkRp,
+                pkL_local,
+                pkR_local
+            );
+
+            const ContinuousPath* cpathLp = &cpath;
+            const ContinuousPath* cpathRp = &cpath;
+
+            ContinuousPath cpathL_local;
+            ContinuousPath cpathR_local;
+
+            make_child_continuous_paths_if_needed_(
+                feat,
+                cpath,
+                cpathLp,
+                cpathRp,
+                cpathL_local,
+                cpathR_local
+            );
+
+            int lossL;
+            int lossR;
+
+            if (lookahead_init < 0) {
+                lossL = leaf_objective(L);
+            } else if (lookahead_init == 0) {
+                lossL = greedy_proxy_objective_(L, depth - 1, *pkLp, *cpathLp);
+            } else {
+                if (proxy_style == 4) {
+                    lossL = split_algorithm(L, depth - 1, k_here, *pkLp);
+                } else {
+                    lossL = lickety_proxy_objective_(L, depth - 1, k_here, *pkLp, *cpathLp);
+                }
+            }
+
+            if (lookahead_init < 0) {
+                lossR = leaf_objective(R);
+            } else if (lookahead_init == 0) {
+                lossR = greedy_proxy_objective_(R, depth - 1, *pkRp, *cpathRp);
+            } else {
+                if (proxy_style == 4) {
+                    lossR = split_algorithm(R, depth - 1, k_here, *pkRp);
+                } else {
+                    lossR = lickety_proxy_objective_(R, depth - 1, k_here, *pkRp, *cpathRp);
+                }
+            }
+
+            // evaluated[feat] = {lossL, lossR};
+
+            const int total_proxy = lossL + lossR;
+
+            bool feasible;
+            if (!rule_list_mode) {
+                feasible = (total_proxy <= budget);
+            } else {
+                feasible = !(lossL > budget - gamma && lossR > budget - gamma);
+            }
+
+            if (feasible) {
+                auto LR = solve_siblings_extend(
+                    nullptr,
+                    nullptr,
+                    lossL,
+                    lossR,
+                    L,
+                    R,
+                    budget,
+                    depth,
+                    *pkLp,
+                    *pkRp,
+                    *cpathLp,
+                    *cpathRp
+                );
+
+                if (LR.first && LR.second) {
+                    // persistent successful split storage.
+                    // feat is the actual threshold-column index.
+                    node->add_split(feat, LR.first, LR.second);
+
+                    // if (evaluated_use_min_objectives) {
+                    //     evaluated[feat] = {
+                    //         LR.first->min_objective,
+                    //         LR.second->min_objective
+                    //     };
+                    // } else {
+                    //     evaluated[feat] = {lossL, lossR};
+                    // }
+                } 
+
+                if (i <= feat - 1) {
+                    Q.push_back({i, feat - 1});
+                }
+
+                if (feat + 1 <= j) {
+                    Q.push_back({feat + 1, j});
+                }
+
+                continue; // we enumerate nearby thresholds because they are high quality too
+            }
+            /*
+            if (feasible) {
+                // given a threshold split_feat and guessed child objective values guessL, guessR, 
+                // try to build the left/right Rashomon subtries under this split, 
+                // add the split to the parent node if both children exist, 
+                // and report the true child minimum objectives
+                auto solve_and_add_from_guesses = [&](
+                    int split_feat,
+                    int guessL,
+                    int guessR,
+                    int& out_minL,
+                    int& out_minR
+                ) -> bool {
+                    split_threshold_bits_(mask, split_feat, L, R);
+
+                    if (!L.any() || !R.any()) {
+                        return false;
+                    }
+
+                    const PathKey* local_pkLp = &empty_pk();
+                    const PathKey* local_pkRp = &empty_pk();
+
+                    PathKey local_pkL;
+                    PathKey local_pkR;
+
+                    make_child_pks_if_needed_(
+                        split_feat,
+                        pk,
+                        local_pkLp,
+                        local_pkRp,
+                        local_pkL,
+                        local_pkR
+                    );
+
+                    const ContinuousPath* local_cpathLp = &cpath;
+                    const ContinuousPath* local_cpathRp = &cpath;
+
+                    ContinuousPath local_cpathL;
+                    ContinuousPath local_cpathR;
+
+                    make_child_continuous_paths_if_needed_(
+                        split_feat,
+                        cpath,
+                        local_cpathLp,
+                        local_cpathRp,
+                        local_cpathL,
+                        local_cpathR
+                    );
+
+                    std::pair<
+                        std::shared_ptr<TreeTrieNode>,
+                        std::shared_ptr<TreeTrieNode>
+                    > LR;
+
+                    if (rule_list_mode) {
+                        LR = solve_siblings(
+                            guessL,
+                            guessR,
+                            L,
+                            R,
+                            budget,
+                            depth,
+                            *local_pkLp,
+                            *local_pkRp,
+                            *local_cpathLp,
+                            *local_cpathRp
+                        );
+                    } else if (use_multipass) {
+                        LR = solve_siblings(
+                            guessL,
+                            guessR,
+                            L,
+                            R,
+                            budget,
+                            depth,
+                            *local_pkLp,
+                            *local_pkRp,
+                            *local_cpathLp,
+                            *local_cpathRp
+                        );
+                    } else {
+                        LR = symmetric_single_pass(
+                            guessL,
+                            guessR,
+                            L,
+                            R,
+                            budget,
+                            depth,
+                            *local_pkLp,
+                            *local_pkRp,
+                            *local_cpathLp,
+                            *local_cpathRp
+                        );
+                    }
+
+                    if (!LR.first || !LR.second) {
+                        // evaluated[split_feat] = {guessL, guessR};
+                        return false;
+                    }
+
+                    node->add_split(split_feat, LR.first, LR.second);
+
+                    out_minL = LR.first->min_objective;
+                    out_minR = LR.second->min_objective;
+
+                    // store the actual subgraph minima
+                    // evaluated[split_feat] = {out_minL, out_minR};
+
+                    return true;
+                };
+
+                int base_minL = std::numeric_limits<int>::max();
+                int base_minR = std::numeric_limits<int>::max();
+
+                const bool base_ok = solve_and_add_from_guesses(
+                    feat,
+                    lossL,
+                    lossR,
+                    base_minL,
+                    base_minR
+                );
+                
+                // this should never happen, would be a collision on the fingerprints if so
+                if (!base_ok) {
+                    // evaluated[feat] = {lossL, lossR};
+
+                    if (i <= feat - 1) {
+                        Q.push_back({i, feat - 1});
+                    }
+
+                    if (feat + 1 <= j) {
+                        Q.push_back({feat + 1, j});
+                    }
+
+                    continue;
+                }
+
+                // in rule-list mode, keep the old behavior because the feasibility condition
+                // is not simply minL + minR <= budget.
+                if (rule_list_mode) {
+                    if (i <= feat - 1) {
+                        Q.push_back({i, feat - 1});
+                    }
+
+                    if (feat + 1 <= j) {
+                        Q.push_back({feat + 1, j});
+                    }
+
+                    continue;
+                }
+
+                // walk left from the feasible threshold.
+                // moving left means:
+                // left child loses x points  -> do not decrease its min objective
+                // right child gains x points -> add x to the right guess
+                {
+                    int anchor_feat = feat;
+                    int anchor_minL = base_minL;
+                    int anchor_minR = base_minR;
+                    int delta = budget - (anchor_minL + anchor_minR);
+
+                    int t = feat - 1; // start of walking left, feat is midpoint
+
+                    for (; t >= i; --t) {
+                        if (delta < 0) break; // if delta = 0, consecutive columns may be the same when acting on this subproblem, we don't want to skip them
+
+                        const int x = threshold_distance_bitvector_(
+                            mask,
+                            t,
+                            anchor_feat
+                        );
+
+                        if (x > delta) {
+                            break;
+                        }
+
+                        const int guessL = anchor_minL;
+                        const int guessR = anchor_minR + x;
+
+                        int new_minL = std::numeric_limits<int>::max(); // the method will fill these in 
+                        int new_minR = std::numeric_limits<int>::max();
+
+                        const bool ok = solve_and_add_from_guesses(
+                            t,
+                            guessL,
+                            guessR,
+                            new_minL,
+                            new_minR
+                        );
+
+                        if (!ok) {
+                            break;
+                        }
+
+                        anchor_feat = t; // new reference location
+                        anchor_minL = new_minL; // reference location best objectives
+                        anchor_minR = new_minR;
+                        delta = budget - (anchor_minL + anchor_minR); // new delta at this reference
+                    }
+
+                    // continue normal interval search on the part not covered by the local feasible walk
+                    if (i <= t) {
+                        Q.push_back({i, t});
+                    }
+                }
+
+                // walk right from the feasible threshold.
+                // moving right means:
+                // left child gains x points  -> add x to the left guess
+                // right child loses x points -> do not decrease its min objective
+                {
+                    int anchor_feat = feat;
+                    int anchor_minL = base_minL;
+                    int anchor_minR = base_minR;
+                    int delta = budget - (anchor_minL + anchor_minR);
+
+                    int t = feat + 1;
+
+                    for (; t <= j; ++t) {
+                        if (delta < 0) break;
+
+                        const int x = threshold_distance_bitvector_(
+                            mask,
+                            anchor_feat,
+                            t
+                        );
+
+                        if (x > delta) {
+                            break;
+                        }
+
+                        const int guessL = anchor_minL + x;
+                        const int guessR = anchor_minR;
+
+                        int new_minL = std::numeric_limits<int>::max();
+                        int new_minR = std::numeric_limits<int>::max();
+
+                        const bool ok = solve_and_add_from_guesses(
+                            t,
+                            guessL,
+                            guessR,
+                            new_minL,
+                            new_minR
+                        );
+
+                        if (!ok) {
+                            break;
+                        }
+
+                        anchor_feat = t;
+                        anchor_minL = new_minL;
+                        anchor_minR = new_minR;
+                        delta = budget - (anchor_minL + anchor_minR);
+                    }
+
+                    // continue normal interval search on the part
+                    // not covered by the local feasible walk.
+                    if (t <= j) {
+                        Q.push_back({t, j});
+                    }
+                }
+
+                continue; // we just finished everything we do if a threshold is within budget, go to the next iteration and get a new threshold
+            }
+            */
+
+
+            // evaluated[feat] = {lossL, lossR};
+
+            // failed split pruning.
+            // if left is pure/zero-error leaf objective, farther-left thresholds
+            // cannot improve the left side enough, so move M_L right.
+            if (lossL == gamma) {
+                M_L = std::max(M_L, feat + 1);
+            }
+
+            // if right is pure/zero-error leaf objective, farther-right thresholds
+            // cannot improve the right side enough, so move M_R left.
+            if (lossR == gamma) {
+                M_R = std::min(M_R, feat - 1);
+            }
+
+            const int delta = total_proxy - budget;
+
+            if (delta <= 0) {
+                // this is only possible in rule-list mode, where infeasible means
+                // both sides individually exceed budget - gamma, not necessarily
+                // that lossL + lossR > budget.
+                if (i <= feat - 1) {
+                    Q.push_back({i, feat - 1});
+                }
+
+                if (feat + 1 <= j) {
+                    Q.push_back({feat + 1, j});
+                }
+
+                continue;
+            }
+
+            const int a = tighten_upper_bound_bitvector_(
+                mask,
+                start_idx,
+                feat,
+                feat - 1,
+                delta
+            );
+
+            const int b = tighten_lower_bound_bitvector_(
+                mask,
+                end_idx,
+                feat,
+                feat + 1,
+                delta
+            );
+
+            if (i <= a) {
+                Q.push_back({i, a});
+            }
+
+            if (b <= j) {
+                Q.push_back({b, j});
+            }
+        }
+    }
+
 
     inline void count_total_pos_binary(const Packed& mask, int& n, int& pos) const {
         const Packed& Ypos = Y_bits[(size_t)1];
