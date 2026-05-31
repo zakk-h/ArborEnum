@@ -501,6 +501,33 @@ struct KLA {
     };
 };
 
+struct KContProxy {
+    uint64_t k; // 64-bit fingerprint or interning id
+    int depth;
+    int start_idx; // continuous feature that we are working with
+
+    bool operator==(const KContProxy& o) const {
+        return k == o.k && depth == o.depth && start_idx == o.start_idx;
+    }
+
+    struct Hash {
+        size_t operator()(const KContProxy& x) const noexcept {
+            size_t h = (size_t)x.k;
+            h ^= (size_t)x.depth + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+            h ^= (size_t)x.start_idx + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+            return h;
+        }
+    };
+};
+
+using ProxyCompletionTree = std::map<int, std::pair<int,int>>;
+
+std::unordered_map<
+    KContProxy,
+    ProxyCompletionTree,
+    KContProxy::Hash
+> continuous_proxy_completion_cache;
+
 struct HistEntry {
     int obj;
     uint64_t cnt;
@@ -1693,7 +1720,233 @@ public:
         return generalized_lickety_split_continuous(root, depth_budget, /*k=*/1, root_pk);
     }
 
+    shared_ptr<TreeTrieNode> anytime_continuous_rset(
+        int8_t depth_budget,
+        double rashomon_mult,
+        const std::vector<int>& proxy_threshold_features,
+        int refinement_width
+    ) {
+        if (n_samples <= 0 || n_features <= 0 || n_words <= 0) {
+            throw std::runtime_error(
+                "anytime_continuous_rset requires prepared/fitted internal data."
+            );
+        }
+
+        if (depth_budget < 0) {
+            throw std::runtime_error("depth_budget must be nonnegative.");
+        }
+
+        const int first_cont = first_continuous_feature_();
+
+        // B_bin = ordinary non-continuous binary features.
+        std::vector<int> B_bin;
+        B_bin.reserve((std::size_t)first_cont);
+
+        for (int f = 0; f < first_cont; ++f) {
+            B_bin.push_back(f);
+        }
+
+        // B_proxy = user-selected proxy threshold features.
+        std::vector<int> B_proxy = proxy_threshold_features;
+
+        for (int f : B_proxy) {
+            if (f < 0 || f >= n_features) {
+                throw std::runtime_error(
+                    "proxy_threshold_features contains out-of-range feature index."
+                );
+            }
+        }
+
+        sort_unique_ints_inplace_(B_proxy);
+
+        // B_active = B_bin union B_proxy.
+        std::vector<int> B_active;
+        B_active.reserve(B_bin.size() + B_proxy.size());
+
+        B_active.insert(B_active.end(), B_bin.begin(), B_bin.end());
+        B_active.insert(B_active.end(), B_proxy.begin(), B_proxy.end());
+
+        sort_unique_ints_inplace_(B_active);
+
+        Packed root(n_words);
+
+        for (int w = 0; w < n_words - 1; ++w) {
+            root.w[(std::size_t)w] = ~0ULL;
+        }
+
+        root.w[(std::size_t)(n_words - 1)] = tail_mask;
+
+        const PathKey& root_pk = empty_pk();
+        const ContinuousPath& root_cpath = empty_continuous_path();
+
+        const std::vector<int> old_allowed_proxy_features = allowed_proxy_features;
+        const bool old_restrict_lickety = restrict_proxy_in_lickety;
+        const bool old_restrict_depthd = restrict_proxy_in_depthd_exact;
+        const bool old_restrict_greedy = restrict_proxy_in_greedy;
+
+        allowed_proxy_features = B_proxy;
+        restrict_proxy_in_lickety = true;
+        restrict_proxy_in_depthd_exact = true;
+        restrict_proxy_in_greedy = true;
+
+        int P_root;
+
+        if (lookahead_init < 0) {
+            P_root = leaf_objective(root);
+        } else if (lookahead_init == 0) {
+            P_root = greedy_proxy_objective_(
+                root,
+                depth_budget,
+                root_pk,
+                root_cpath
+            );
+        } else {
+            P_root = lickety_proxy_objective_(
+                root,
+                depth_budget,
+                lookahead_init,
+                root_pk,
+                root_cpath
+            );
+        }
+
+        const int eps_abs = (int)llround(
+            (1.0 + rashomon_mult) * (double)P_root
+        );
+
+        shared_ptr<TreeTrieNode> G_min = construct_trie(
+            root,
+            depth_budget,
+            eps_abs,
+            root_pk,
+            root_cpath,
+            &B_active
+        );
+
+        while (!active_contains_all_threshold_columns_(B_active)) {
+            std::vector<int> B_new = SelectNewThresholds(
+                B_active,
+                continuous_starts,
+                refinement_width
+            );
+
+            if (B_new.empty()) {
+                break;
+            }
+
+            sort_unique_ints_inplace_(B_new);
+
+            B_active.insert(B_active.end(), B_new.begin(), B_new.end());
+            sort_unique_ints_inplace_(B_active);
+
+            RefineGraphDfs(
+                G_min,
+                root,
+                depth_budget,
+                root_pk,
+                root_cpath,
+                B_active
+            );
+        }
+
+        allowed_proxy_features = old_allowed_proxy_features;
+        restrict_proxy_in_lickety = old_restrict_lickety;
+        restrict_proxy_in_depthd_exact = old_restrict_depthd;
+        restrict_proxy_in_greedy = old_restrict_greedy;
+
+        result = G_min;
+        obj_bound = eps_abs;
+        best_objective = P_root;
+        trained_depth_budget = depth_budget;
+
+        return G_min;
+    }
+
 private:
+    bool active_contains_all_threshold_columns_(
+        const std::vector<int>& B_active
+    ) const {
+        if (continuous_starts.empty()) {
+            return true;
+        }
+
+        std::vector<int> active = B_active;
+        sort_unique_ints_inplace_(active);
+
+        const int first_cont = first_continuous_feature_();
+
+        for (int f = first_cont; f < n_features; ++f) {
+            if (!std::binary_search(active.begin(), active.end(), f)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    std::vector<int> SelectNewThresholds(
+        const std::vector<int>& B_active,
+        const std::vector<int>& continuous_starts,
+        int refinement_width
+    ) const {
+        if (refinement_width <= 0 || continuous_starts.empty()) return {};
+
+        std::vector<int> active = B_active;
+        sort_unique_ints_inplace_(active);
+
+        std::vector<int> out;
+
+        for (int g = 0; g < (int)continuous_starts.size(); ++g) {
+            const int start = continuous_starts[(std::size_t)g];
+            const int end = continuous_group_end_(g); // exclusive
+
+            std::vector<int> A;
+            for (int f = start; f < end; ++f) {
+                if (std::binary_search(active.begin(), active.end(), f)) {
+                    A.push_back(f);
+                }
+            }
+
+            if (A.empty()) continue;
+
+            // also refine before the first active threshold and after the last one.
+            std::vector<int> anchors;
+            anchors.reserve(A.size() + 2);
+            anchors.push_back(start - 1);
+            anchors.insert(anchors.end(), A.begin(), A.end());
+            anchors.push_back(end);
+
+            for (int t = 0; t + 1 < (int)anchors.size(); ++t) {
+                const int lo = anchors[(std::size_t)t];
+                const int hi = anchors[(std::size_t)(t + 1)];
+
+                const int gap = hi - lo - 1;
+                if (gap <= 0) continue;
+
+                if (gap <= refinement_width) {
+                    for (int f = lo + 1; f <= hi - 1; ++f) {
+                        out.push_back(f);
+                    }
+                } else {
+                    for (int k = 1; k <= refinement_width; ++k) {
+                        const int f = lo + (int)std::llround(
+                            (double)k * (double)(hi - lo) /
+                            (double)(refinement_width + 1)
+                        );
+
+                        if (f > lo && f < hi) {
+                            out.push_back(f);
+                        }
+                    }
+                }
+            }
+        }
+
+        sort_unique_ints_inplace_(out);
+        return out;
+    }
+
+
     template <typename T>
     static void validate_rectangular_matrix_(
         const std::vector<std::vector<T>>& X,
@@ -1791,7 +2044,7 @@ private:
         std::vector<std::vector<int>> sorted_idx_by_num;
     };
 
-    shared_ptr<TreeTrieNode> construct_trie(const Packed& mask, int8_t depth, int budget, const PathKey& pk, const ContinuousPath& cpath = empty_continuous_path()) {
+    shared_ptr<TreeTrieNode> construct_trie(const Packed& mask, int8_t depth, int budget, const PathKey& pk, const ContinuousPath& cpath = empty_continuous_path(), const std::vector<int>* active_features = nullptr) {
         const uint64_t k = key_of_subproblem(mask, pk);
         K3 key{k, depth, budget};
 
@@ -1936,10 +2189,16 @@ private:
             
             // LR has two entries: first and second.
             std::pair<std::shared_ptr<TreeTrieNode>, std::shared_ptr<TreeTrieNode>> LR; 
-            if (rule_list_mode) {
-                LR = solve_siblings(lossL, lossR, L, R, budget, depth, *pkLp, *pkRp, cpath, cpath);
-            } else if (use_multipass) {
-                LR = solve_siblings(lossL, lossR, L, R, budget, depth, *pkLp, *pkRp, cpath, cpath);
+            if (rule_list_mode || use_multipass) {
+                LR = solve_siblings_extend(
+                    nullptr, nullptr,
+                    lossL, lossR,
+                    L, R,
+                    budget, depth,
+                    *pkLp, *pkRp,
+                    cpath, cpath,
+                    active_features
+                );
             } else {
                 LR = symmetric_single_pass(lossL, lossR, L, R, budget, depth, *pkLp, *pkRp, cpath, cpath);
             }
@@ -1969,8 +2228,1072 @@ private:
                 continue;
             }
 
-            enumerate_continuous_feature_for_trie(
-                node,
+            // enumerate_continuous_feature_for_trie(
+            //     node,
+            //     mask,
+            //     depth,
+            //     budget,
+            //     pk,
+            //     cpath,
+            //     k_here,
+            //     start_idx,
+            //     end_idx,
+            //     L,
+            //     R
+            // );
+
+            if (active_features) {
+                enumerate_active_continuous_feature_for_trie_restricted(
+                    node,
+                    mask,
+                    depth,
+                    budget,
+                    pk,
+                    cpath,
+                    k_here,
+                    start_idx,
+                    end_idx,
+                    L,
+                    R,
+                    active_features
+                );
+            } else {
+                enumerate_continuous_feature_for_trie(
+                    node,
+                    mask,
+                    depth,
+                    budget,
+                    pk,
+                    cpath,
+                    k_here,
+                    start_idx,
+                    end_idx,
+                    L,
+                    R
+                );
+            }
+        }
+
+        if (trie_cache_enabled) trie_cache.emplace(key, node);
+        return node;
+    }
+
+    void enumerate_active_continuous_feature_for_trie_restricted(
+        shared_ptr<TreeTrieNode>& node,
+        const Packed& mask,
+        int8_t depth,
+        int budget,
+        const PathKey& pk,
+        const ContinuousPath& cpath,
+        int8_t k_here,
+        int start_idx,
+        int end_idx,
+        Packed& L,
+        Packed& R,
+        const std::vector<int>* active_features
+    ) {
+        if (!active_features || start_idx >= end_idx) return;
+
+        std::vector<int> active_thresholds;
+
+        for (int f : *active_features) { // can do this better knowing sorted and stuff
+            if (f >= start_idx && f < end_idx) {
+                active_thresholds.push_back(f);
+            }
+        }
+
+        sort_unique_ints_inplace_(active_thresholds);
+
+        if (active_thresholds.empty()) return;
+
+        const uint64_t kmask = key_of_subproblem(mask, pk);
+        KContProxy cache_key{kmask, depth, start_idx};
+        ProxyCompletionTree& evaluated =
+            continuous_proxy_completion_cache[cache_key];
+
+        std::deque<std::pair<int,int>> Q;
+        Q.push_back({0, (int)active_thresholds.size() - 1});
+
+        while (!Q.empty()) {
+            auto [i, j] = Q.front();
+            Q.pop_front();
+
+            if (i > j) continue;
+
+            const int mid = i + ((j - i) >> 1);
+            const int feat = active_thresholds[(std::size_t)mid];
+
+            split_threshold_bits_(mask, feat, L, R);
+
+            const bool left_empty = !L.any();
+            const bool right_empty = !R.any();
+
+            if (left_empty || right_empty) {
+                if (left_empty && !right_empty) {
+                    if (mid + 1 <= j) {
+                        Q.push_back({mid + 1, j});
+                    }
+                } else if (!left_empty && right_empty) {
+                    if (i <= mid - 1) {
+                        Q.push_back({i, mid - 1});
+                    }
+                }
+                continue;
+            }
+
+            const PathKey* pkLp = &empty_pk();
+            const PathKey* pkRp = &empty_pk();
+
+            PathKey pkL_local;
+            PathKey pkR_local;
+
+            make_child_pks_if_needed_(
+                feat,
+                pk,
+                pkLp,
+                pkRp,
+                pkL_local,
+                pkR_local
+            );
+
+            const ContinuousPath* cpathLp = &cpath;
+            const ContinuousPath* cpathRp = &cpath;
+
+            ContinuousPath cpathL_local;
+            ContinuousPath cpathR_local;
+
+            make_child_continuous_paths_if_needed_(
+                feat,
+                cpath,
+                cpathLp,
+                cpathRp,
+                cpathL_local,
+                cpathR_local
+            );
+
+            int lossL;
+            int lossR;
+
+            auto it_eval = evaluated.find(feat);
+
+            if (it_eval != evaluated.end()) {
+                lossL = it_eval->second.first;
+                lossR = it_eval->second.second;
+            } else {
+                if (lookahead_init < 0) {
+                    lossL = leaf_objective(L);
+                } else if (lookahead_init == 0) {
+                    lossL = greedy_proxy_objective_(
+                        L,
+                        depth - 1,
+                        *pkLp,
+                        *cpathLp
+                    );
+                } else {
+                    if (proxy_style == 4) {
+                        lossL = split_algorithm(
+                            L,
+                            depth - 1,
+                            k_here,
+                            *pkLp
+                        );
+                    } else {
+                        lossL = lickety_proxy_objective_(
+                            L,
+                            depth - 1,
+                            k_here,
+                            *pkLp,
+                            *cpathLp
+                        );
+                    }
+                }
+
+                if (lookahead_init < 0) {
+                    lossR = leaf_objective(R);
+                } else if (lookahead_init == 0) {
+                    lossR = greedy_proxy_objective_(
+                        R,
+                        depth - 1,
+                        *pkRp,
+                        *cpathRp
+                    );
+                } else {
+                    if (proxy_style == 4) {
+                        lossR = split_algorithm(
+                            R,
+                            depth - 1,
+                            k_here,
+                            *pkRp
+                        );
+                    } else {
+                        lossR = lickety_proxy_objective_(
+                            R,
+                            depth - 1,
+                            k_here,
+                            *pkRp,
+                            *cpathRp
+                        );
+                    }
+                }
+
+                evaluated[feat] = {lossL, lossR};
+            }
+
+            const int total_proxy = lossL + lossR;
+
+            bool feasible;
+            if (!rule_list_mode) {
+                feasible = (total_proxy <= budget);
+            } else {
+                feasible = !(lossL > budget - gamma && lossR > budget - gamma);
+            }
+
+            if (feasible) {
+                std::pair<
+                    std::shared_ptr<TreeTrieNode>,
+                    std::shared_ptr<TreeTrieNode>
+                > LR;
+
+                if (rule_list_mode || use_multipass) {
+                    LR = solve_siblings_extend(
+                        nullptr,
+                        nullptr,
+                        lossL,
+                        lossR,
+                        L,
+                        R,
+                        budget,
+                        depth,
+                        *pkLp,
+                        *pkRp,
+                        *cpathLp,
+                        *cpathRp,
+                        active_features
+                    );
+                } else {
+                    LR = symmetric_single_pass(
+                        lossL,
+                        lossR,
+                        L,
+                        R,
+                        budget,
+                        depth,
+                        *pkLp,
+                        *pkRp,
+                        *cpathLp,
+                        *cpathRp
+                    );
+                }
+
+                if (LR.first && LR.second) {
+                    node->add_split(feat, LR.first, LR.second);
+                    node->hist_built = false;
+                }
+
+                if (i <= mid - 1) {
+                    Q.push_back({i, mid - 1});
+                }
+
+                if (mid + 1 <= j) {
+                    Q.push_back({mid + 1, j});
+                }
+
+                continue;
+            }
+
+            const int delta = total_proxy - budget;
+
+            if (delta <= 0) {
+                if (i <= mid - 1) Q.push_back({i, mid - 1});
+                if (mid + 1 <= j) Q.push_back({mid + 1, j});
+                continue;
+            }
+
+            // moving left from feat: find the farthest active threshold on the left
+            // that is at least delta samples away from feat.
+            const int a = tighten_upper_bound_active_thresholds_(
+                mask,
+                active_thresholds,
+                mid,
+                i,
+                mid - 1,
+                delta
+            );
+
+            // moving right from feat: find the first active threshold on the right
+            // that is at least delta samples away from feat.
+            const int b = tighten_lower_bound_active_thresholds_(
+                mask,
+                active_thresholds,
+                mid,
+                mid + 1,
+                j,
+                delta
+            );
+
+            if (i <= a) {
+                Q.push_back({i, a});
+            }
+
+            if (b <= j) {
+                Q.push_back({b, j});
+            }
+        }
+    }
+
+    int tighten_lower_bound_active_thresholds_(
+        const Packed& mask,
+        const std::vector<int>& active_thresholds,
+        int anchor_pos,
+        int lo_pos,
+        int hi_pos,
+        int delta
+    ) const {
+        if (delta <= 0) return lo_pos;
+        if (lo_pos > hi_pos) return hi_pos + 1;
+
+        const int anchor_feat = active_thresholds[(std::size_t)anchor_pos];
+
+        // local probe first.
+        const int probe_end = std::min(hi_pos, lo_pos + 1);
+        for (int p = lo_pos; p <= probe_end; ++p) {
+            const int feat = active_thresholds[(std::size_t)p];
+            if (bit_distance_at_least_(mask, anchor_feat, feat, delta)) {
+                return p;
+            }
+        }
+
+        int lo = probe_end + 1;
+        int hi = hi_pos;
+        int ans = hi_pos + 1;
+
+        while (lo <= hi) {
+            const int mid = lo + ((hi - lo) >> 1);
+            const int feat = active_thresholds[(std::size_t)mid];
+
+            if (bit_distance_at_least_(mask, anchor_feat, feat, delta)) {
+                ans = mid;
+                hi = mid - 1;
+            } else {
+                lo = mid + 1;
+            }
+        }
+
+        return ans;
+    }
+
+    int tighten_upper_bound_active_thresholds_(
+        const Packed& mask,
+        const std::vector<int>& active_thresholds,
+        int anchor_pos,
+        int lo_pos,
+        int hi_pos,
+        int delta
+    ) const {
+        if (delta <= 0) return hi_pos;
+        if (lo_pos > hi_pos) return lo_pos - 1;
+
+        const int anchor_feat = active_thresholds[(std::size_t)anchor_pos];
+
+        // local probe first.
+        const int probe_start = std::max(lo_pos, hi_pos - 1);
+        for (int p = hi_pos; p >= probe_start; --p) {
+            const int feat = active_thresholds[(std::size_t)p];
+            if (bit_distance_at_least_(mask, feat, anchor_feat, delta)) {
+                return p;
+            }
+        }
+
+        int lo = lo_pos;
+        int hi = probe_start - 1;
+        int ans = lo_pos - 1;
+
+        while (lo <= hi) {
+            const int mid = lo + ((hi - lo) >> 1);
+            const int feat = active_thresholds[(std::size_t)mid];
+
+            if (bit_distance_at_least_(mask, feat, anchor_feat, delta)) {
+                ans = mid;
+                lo = mid + 1;
+            } else {
+                hi = mid - 1;
+            }
+        }
+
+        return ans;
+    }
+
+    void enumerate_continuous_feature_for_trie_extend_restricted(
+        shared_ptr<TreeTrieNode>& node,
+        const Packed& mask,
+        int8_t depth,
+        int budget,
+        const PathKey& pk,
+        const ContinuousPath& cpath,
+        int8_t k_here,
+        int start_idx,
+        int end_idx,
+        Packed& L,
+        Packed& R,
+        std::unordered_set<int>& already_split,
+        const std::vector<int>* active_features
+    ) {
+        if (!node || !active_features || start_idx >= end_idx) return;
+
+        std::vector<int> active_thresholds;
+
+        for (int f : *active_features) {
+            if (f >= start_idx && f < end_idx) {
+                active_thresholds.push_back(f);
+            }
+        }
+
+        sort_unique_ints_inplace_(active_thresholds);
+
+        if (active_thresholds.empty()) return;
+
+        const uint64_t kmask = key_of_subproblem(mask, pk);
+        KContProxy cache_key{kmask, depth, start_idx};
+
+        ProxyCompletionTree& evaluated =
+            continuous_proxy_completion_cache[cache_key];
+
+        std::deque<std::pair<int,int>> Q;
+
+        // invariant/assumption: only call on things within budget
+        auto resolve_threshold = [&](
+            int feat,
+            int lossL,
+            int lossR
+        ) -> bool {
+            split_threshold_bits_(mask, feat, L, R);
+
+            if (!L.any() || !R.any()) {
+                return false;
+            }
+
+            const PathKey* pkLp = &empty_pk();
+            const PathKey* pkRp = &empty_pk();
+
+            PathKey pkL_local;
+            PathKey pkR_local;
+
+            make_child_pks_if_needed_(
+                feat,
+                pk,
+                pkLp,
+                pkRp,
+                pkL_local,
+                pkR_local
+            );
+
+            const ContinuousPath* cpathLp = &cpath;
+            const ContinuousPath* cpathRp = &cpath;
+
+            ContinuousPath cpathL_local;
+            ContinuousPath cpathR_local;
+
+            make_child_continuous_paths_if_needed_(
+                feat,
+                cpath,
+                cpathLp,
+                cpathRp,
+                cpathL_local,
+                cpathR_local
+            );
+
+            auto it_split = std::find_if(
+                node->splits.begin(),
+                node->splits.end(),
+                [&](const SplitNode& s) {
+                    return s.feature == feat;
+                }
+            );
+
+            const bool exists = (it_split != node->splits.end());
+
+            std::shared_ptr<TreeTrieNode> old_left = nullptr;
+            std::shared_ptr<TreeTrieNode> old_right = nullptr;
+
+            if (exists) {
+                old_left = it_split->left;
+                old_right = it_split->right;
+
+                if (old_left) {
+                    lossL = old_left->min_objective;
+                }
+
+                if (old_right) {
+                    lossR = old_right->min_objective;
+                }
+            }
+
+            std::pair<
+                std::shared_ptr<TreeTrieNode>,
+                std::shared_ptr<TreeTrieNode>
+            > LR;
+
+            if (exists || rule_list_mode || use_multipass) {
+                LR = solve_siblings_extend(
+                    old_left,
+                    old_right,
+                    lossL,
+                    lossR,
+                    L,
+                    R,
+                    budget,
+                    depth,
+                    *pkLp,
+                    *pkRp,
+                    *cpathLp,
+                    *cpathRp,
+                    active_features
+                );
+            } else {
+                LR = symmetric_single_pass(
+                    lossL,
+                    lossR,
+                    L,
+                    R,
+                    budget,
+                    depth,
+                    *pkLp,
+                    *pkRp,
+                    *cpathLp,
+                    *cpathRp
+                );
+            }
+
+            if (!LR.first || !LR.second) {
+                return false;
+            }
+
+            if (exists) {
+                it_split->left = LR.first;
+                it_split->right = LR.second;
+
+                const int min_sum =
+                    LR.first->min_objective + LR.second->min_objective;
+
+                if (min_sum < node->min_objective) {
+                    node->min_objective = min_sum;
+                }
+            } else {
+                node->add_split(feat, LR.first, LR.second);
+                already_split.insert(feat);
+            }
+
+            node->hist_built = false;
+            return true;
+        };
+
+        std::map<int,int> pruned_intervals;
+
+        // we maintain pruned_intervals = {{3, 7}, {12, 15} };
+        // meaning we pruned 3,4,5,6,7 and 12,13,14,15
+        // we need to add lo,hi to this, merging it with previous or after
+        auto add_pruned_interval = [&](
+            int lo,
+            int hi
+        ) {
+            if (lo > hi) return;
+
+            lo = std::max(lo, 0);
+            hi = std::min(hi, (int)active_thresholds.size() - 1);
+
+            if (lo > hi) return;
+
+            auto it = pruned_intervals.upper_bound(lo);
+
+            if (it != pruned_intervals.begin()) {
+                auto prev = std::prev(it);
+
+                if (prev->second + 1 >= lo) {
+                    lo = std::min(lo, prev->first);
+                    hi = std::max(hi, prev->second);
+                    it = pruned_intervals.erase(prev);
+                }
+            }
+
+            while (it != pruned_intervals.end() && it->first <= hi + 1) {
+                hi = std::max(hi, it->second);
+                it = pruned_intervals.erase(it);
+            }
+
+            pruned_intervals[lo] = hi;
+        };
+
+        auto it0 = evaluated.lower_bound(start_idx);
+        // going over the red black tree, getting proxy completions, if something is feasible, 
+        // it either solves it for the first time or resolves it (pruning that index too).
+        // if it isn't feasible, it finds the pruned interval
+        for (auto it = it0; it != evaluated.end() && it->first < end_idx; ++it) {
+            const int feat = it->first;
+
+            auto pos_it = std::lower_bound(
+                active_thresholds.begin(),
+                active_thresholds.end(),
+                feat
+            );
+
+            if (pos_it == active_thresholds.end() || *pos_it != feat) {
+                continue;
+            }
+
+            const int pos =
+                (int)std::distance(active_thresholds.begin(), pos_it);
+
+            const int lossL = it->second.first;
+            const int lossR = it->second.second;
+            const int total_proxy = lossL + lossR;
+
+            bool feasible;
+            if (!rule_list_mode) {
+                feasible = (total_proxy <= budget);
+            } else {
+                feasible = !(lossL > budget - gamma && lossR > budget - gamma);
+            }
+
+            if (feasible) {
+                resolve_threshold(feat, lossL, lossR);
+                add_pruned_interval(pos, pos);
+                continue;
+            }
+
+            const int delta = total_proxy - budget;
+
+            if (delta <= 0) {
+                continue;
+            }
+
+            const int a = tighten_upper_bound_active_thresholds_(
+                mask,
+                active_thresholds,
+                pos,
+                0,
+                pos - 1,
+                delta
+            );
+
+            const int b = tighten_lower_bound_active_thresholds_(
+                mask,
+                active_thresholds,
+                pos,
+                pos + 1,
+                (int)active_thresholds.size() - 1,
+                delta
+            );
+
+            add_pruned_interval(a + 1, b - 1);
+        }
+
+        // makes the complement of the pruned intervals and uses it to initialize Q
+        {
+            int cur = 0;
+            const int last = (int)active_thresholds.size() - 1;
+
+            for (const auto& kv : pruned_intervals) {
+                const int lo = kv.first;
+                const int hi = kv.second;
+
+                if (cur <= lo - 1) {
+                    Q.push_back({cur, lo - 1});
+                }
+
+                cur = std::max(cur, hi + 1);
+
+                if (cur > last) break;
+            }
+
+            if (cur <= last) {
+                Q.push_back({cur, last});
+            }
+        }
+
+        while (!Q.empty()) {
+            auto [i, j] = Q.front();
+            Q.pop_front();
+
+            if (i > j) continue;
+
+            const int mid = i + ((j - i) >> 1);
+            const int feat = active_thresholds[(std::size_t)mid];
+
+            // should never happen unless we don't story proxy completions or something, or do the chain logic
+            if (already_split.count(feat)) {
+                auto it_split = std::find_if(
+                    node->splits.begin(),
+                    node->splits.end(),
+                    [&](const SplitNode& s) {
+                        return s.feature == feat;
+                    }
+                );
+
+                if (it_split != node->splits.end()) {
+                    const int lossL = it_split->left
+                        ? it_split->left->min_objective
+                        : std::numeric_limits<int>::max();
+
+                    const int lossR = it_split->right
+                        ? it_split->right->min_objective
+                        : std::numeric_limits<int>::max();
+
+                    resolve_threshold(feat, lossL, lossR);
+                }
+
+                if (i <= mid - 1) {
+                    Q.push_back({i, mid - 1});
+                }
+
+                if (mid + 1 <= j) {
+                    Q.push_back({mid + 1, j});
+                }
+
+                continue;
+            }
+
+            split_threshold_bits_(mask, feat, L, R);
+
+            const bool left_empty = !L.any();
+            const bool right_empty = !R.any();
+
+            if (left_empty || right_empty) {
+                if (left_empty && !right_empty) {
+                    if (mid + 1 <= j) {
+                        Q.push_back({mid + 1, j});
+                    }
+                } else if (!left_empty && right_empty) {
+                    if (i <= mid - 1) {
+                        Q.push_back({i, mid - 1});
+                    }
+                }
+
+                continue;
+            }
+
+            const PathKey* pkLp = &empty_pk();
+            const PathKey* pkRp = &empty_pk();
+
+            PathKey pkL_local;
+            PathKey pkR_local;
+
+            make_child_pks_if_needed_(
+                feat,
+                pk,
+                pkLp,
+                pkRp,
+                pkL_local,
+                pkR_local
+            );
+
+            const ContinuousPath* cpathLp = &cpath;
+            const ContinuousPath* cpathRp = &cpath;
+
+            ContinuousPath cpathL_local;
+            ContinuousPath cpathR_local;
+
+            make_child_continuous_paths_if_needed_(
+                feat,
+                cpath,
+                cpathLp,
+                cpathRp,
+                cpathL_local,
+                cpathR_local
+            );
+
+            int lossL;
+            int lossR;
+
+            // auto it_eval = evaluated.find(feat);
+
+            // if (it_eval != evaluated.end()) {
+            //     lossL = it_eval->second.first;
+            //     lossR = it_eval->second.second;
+            if (lookahead_init < 0) {
+                lossL = leaf_objective(L);
+            } else if (lookahead_init == 0) {
+                lossL = greedy_proxy_objective_(
+                    L,
+                    depth - 1,
+                    *pkLp,
+                    *cpathLp
+                );
+            } else {
+                if (proxy_style == 4) {
+                    lossL = split_algorithm(
+                        L,
+                        depth - 1,
+                        k_here,
+                        *pkLp
+                    );
+                } else {
+                    lossL = lickety_proxy_objective_(
+                        L,
+                        depth - 1,
+                        k_here,
+                        *pkLp,
+                        *cpathLp
+                    );
+                }
+            }
+
+            if (lookahead_init < 0) {
+                lossR = leaf_objective(R);
+            } else if (lookahead_init == 0) {
+                lossR = greedy_proxy_objective_(
+                    R,
+                    depth - 1,
+                    *pkRp,
+                    *cpathRp
+                );
+            } else {
+                if (proxy_style == 4) {
+                    lossR = split_algorithm(
+                        R,
+                        depth - 1,
+                        k_here,
+                        *pkRp
+                    );
+                } else {
+                    lossR = lickety_proxy_objective_(
+                        R,
+                        depth - 1,
+                        k_here,
+                        *pkRp,
+                        *cpathRp
+                    );
+                }
+            }
+
+            evaluated[feat] = {lossL, lossR};
+        
+
+            const int total_proxy = lossL + lossR;
+
+            bool feasible;
+            if (!rule_list_mode) {
+                feasible = (total_proxy <= budget);
+            } else {
+                feasible = !(lossL > budget - gamma && lossR > budget - gamma);
+            }
+
+            if (feasible) {
+                resolve_threshold(feat, lossL, lossR);
+
+                if (i <= mid - 1) {
+                    Q.push_back({i, mid - 1});
+                }
+
+                if (mid + 1 <= j) {
+                    Q.push_back({mid + 1, j});
+                }
+
+                continue;
+            }
+
+            const int delta = total_proxy - budget;
+
+            if (delta <= 0) {
+                if (i <= mid - 1) {
+                    Q.push_back({i, mid - 1});
+                }
+
+                if (mid + 1 <= j) {
+                    Q.push_back({mid + 1, j});
+                }
+
+                continue;
+            }
+
+            const int a = tighten_upper_bound_active_thresholds_(
+                mask,
+                active_thresholds,
+                mid,
+                i,
+                mid - 1,
+                delta
+            );
+
+            const int b = tighten_lower_bound_active_thresholds_(
+                mask,
+                active_thresholds,
+                mid,
+                mid + 1,
+                j,
+                delta
+            );
+
+            if (i <= a) {
+                Q.push_back({i, a});
+            }
+
+            if (b <= j) {
+                Q.push_back({b, j});
+            }
+        }
+    }
+
+    void RefineGraphDfs(
+        std::shared_ptr<TreeTrieNode>& G,
+        const Packed& mask,
+        int8_t depth,
+        const PathKey& pk,
+        const ContinuousPath& cpath,
+        const std::vector<int>& B_active
+    ) {
+        if (!G) return;
+
+        const int budget = G->budget;
+
+        if (depth <= 0 || budget < 2 * gamma) {
+            return;
+        }
+
+        Packed L(n_words), R(n_words);
+
+        const int8_t k_here =
+            (proxy_style == 2 &&
+            depth > 0 &&
+            depth < (int)k_at_depth.size())
+                ? k_at_depth[depth - 1]
+                : lookahead_init;
+
+        const std::size_t split_count_before = G->splits.size();
+
+        // post-order: first refine children of the splits that already existed.
+        for (std::size_t idx = 0; idx < split_count_before; ++idx) {
+            SplitNode& s = G->splits[idx];
+
+            if (!s.left && !s.right) {
+                continue;
+            }
+
+            split_threshold_bits_(mask, s.feature, L, R);
+
+            if (!L.any() || !R.any()) {
+                continue;
+            }
+
+            const PathKey* pkLp = &empty_pk();
+            const PathKey* pkRp = &empty_pk();
+
+            PathKey pkL_local;
+            PathKey pkR_local;
+
+            make_child_pks_if_needed_(
+                s.feature,
+                pk,
+                pkLp,
+                pkRp,
+                pkL_local,
+                pkR_local
+            );
+
+            const ContinuousPath* cpathLp = &cpath;
+            const ContinuousPath* cpathRp = &cpath;
+
+            ContinuousPath cpathL_local;
+            ContinuousPath cpathR_local;
+
+            make_child_continuous_paths_if_needed_(
+                s.feature,
+                cpath,
+                cpathLp,
+                cpathRp,
+                cpathL_local,
+                cpathR_local
+            );
+
+            if (s.left) {
+                RefineGraphDfs(
+                    s.left,
+                    L,
+                    depth - 1,
+                    *pkLp,
+                    *cpathLp,
+                    B_active
+                );
+            }
+
+            if (s.right) {
+                RefineGraphDfs(
+                    s.right,
+                    R,
+                    depth - 1,
+                    *pkRp,
+                    *cpathRp,
+                    B_active
+                );
+            }
+
+            // for binary features, we need to do one of the things that enumerate_continuous_feature_for_trie_extend_restricted does for continuous
+            // we need to resolve thresholds after we refined them with iterative budget refinement, because of what is below
+            if (s.feature < first_continuous_feature_()) {
+                const int lossL = s.left
+                    ? s.left->min_objective
+                    : std::numeric_limits<int>::max();
+
+                const int lossR = s.right
+                    ? s.right->min_objective
+                    : std::numeric_limits<int>::max();
+
+                auto LR = solve_siblings_extend(
+                    s.left,
+                    s.right,
+                    lossL,
+                    lossR,
+                    L,
+                    R,
+                    budget,
+                    depth,
+                    *pkLp,
+                    *pkRp,
+                    *cpathLp,
+                    *cpathRp,
+                    &B_active
+                );
+                if (LR.first && LR.second) {
+                    s.left = LR.first;
+                    s.right = LR.second;
+
+                    if (s.left && s.right) {
+                        const int min_sum = s.left->min_objective + s.right->min_objective;
+
+                        if (min_sum < G->min_objective) {
+                            G->min_objective = min_sum;
+                        }
+
+                    }
+                }
+            }
+        }
+
+        // now refine this OR node, using children that have already been updated.
+        // this is important because we consider existing thresholds in enumerate_continuous_feature_for_trie_extend_restricted
+        // and do iterative budget refinement again given that their minimum objectives could have improved with what we just did
+        std::unordered_set<int> already_split = local_split_features_(G);
+
+        for (int cont_pos = 0; cont_pos < (int)continuous_starts.size(); ++cont_pos) {
+            const int raw_start_idx = continuous_starts[(std::size_t)cont_pos];
+
+            const int raw_end_idx =
+                (cont_pos + 1 < (int)continuous_starts.size())
+                    ? continuous_starts[(std::size_t)(cont_pos + 1)]
+                    : n_features;
+
+            auto [start_idx, end_idx] =
+                tighten_continuous_interval_from_path_(
+                    raw_start_idx,
+                    raw_end_idx,
+                    cpath
+                );
+
+            if (start_idx >= end_idx) {
+                continue;
+            }
+
+            enumerate_continuous_feature_for_trie_extend_restricted(
+                G,
                 mask,
                 depth,
                 budget,
@@ -1980,12 +3303,11 @@ private:
                 start_idx,
                 end_idx,
                 L,
-                R
+                R,
+                already_split,
+                &B_active
             );
         }
-
-        if (trie_cache_enabled) trie_cache.emplace(key, node);
-        return node;
     }
 
     inline int bit_distance_between_thresholds_(
@@ -2540,21 +3862,10 @@ private:
                     std::shared_ptr<TreeTrieNode>
                 > LR;
 
-                if (rule_list_mode) {
-                    LR = solve_siblings(
-                        lossL,
-                        lossR,
-                        L,
-                        R,
-                        budget,
-                        depth,
-                        *pkLp,
-                        *pkRp,
-                        *cpathLp,
-                        *cpathRp
-                    );
-                } else if (use_multipass) {
-                    LR = solve_siblings(
+                 if (rule_list_mode || use_multipass) {
+                    LR = solve_siblings_extend(
+                        nullptr,
+                        nullptr,
                         lossL,
                         lossR,
                         L,
@@ -3031,7 +4342,8 @@ private:
         const PathKey& pkL,
         const PathKey& pkR,
         const ContinuousPath& cpathL,
-        const ContinuousPath& cpathR
+        const ContinuousPath& cpathR,
+        const std::vector<int>* active_features = nullptr
     ) {
         int left_budget = budget - loss_r;
 
@@ -3043,7 +4355,8 @@ private:
                     depth - 1,
                     left_budget,
                     pkL,
-                    cpathL
+                    cpathL,
+                    active_features
                 );
             } else {
                 left_node = construct_trie(
@@ -3051,7 +4364,8 @@ private:
                     depth - 1,
                     left_budget,
                     pkL,
-                    cpathL
+                    cpathL,
+                    active_features
                 );
             }
         } else {
@@ -3072,7 +4386,8 @@ private:
                     depth - 1,
                     right_budget,
                     pkR,
-                    cpathR
+                    cpathR,
+                    active_features
                 );
             } else {
                 right_node = construct_trie(
@@ -3080,7 +4395,8 @@ private:
                     depth - 1,
                     right_budget,
                     pkR,
-                    cpathR
+                    cpathR,
+                    active_features
                 );
             }
         } else {
@@ -3109,7 +4425,8 @@ private:
                             depth - 1,
                             left_budget,
                             pkL,
-                            cpathL
+                            cpathL,
+                            active_features
                         );
                     } else {
                         left_node = construct_trie(
@@ -3117,7 +4434,8 @@ private:
                             depth - 1,
                             left_budget,
                             pkL,
-                            cpathL
+                            cpathL,
+                            active_features
                         );
                     }
 
@@ -3148,7 +4466,8 @@ private:
                             depth - 1,
                             right_budget,
                             pkR,
-                            cpathR
+                            cpathR,
+                            active_features
                         );
                     } else {
                         right_node = construct_trie(
@@ -3156,7 +4475,8 @@ private:
                             depth - 1,
                             right_budget,
                             pkR,
-                            cpathR
+                            cpathR,
+                            active_features
                         );
                     }
 
@@ -3179,9 +4499,9 @@ private:
         return {left_node, right_node};
     }
 
-    shared_ptr<TreeTrieNode> construct_trie_extend(shared_ptr<TreeTrieNode> node, const Packed& mask, int8_t depth, int budget, const PathKey& pk, const ContinuousPath& cpath = empty_continuous_path()) {
+    shared_ptr<TreeTrieNode> construct_trie_extend(shared_ptr<TreeTrieNode> node, const Packed& mask, int8_t depth, int budget, const PathKey& pk, const ContinuousPath& cpath = empty_continuous_path(), const std::vector<int>* active_features = nullptr) {
         if (!node) {
-            return construct_trie(mask, depth, budget, pk, cpath);
+            return construct_trie(mask, depth, budget, pk, cpath,  active_features);
         }
 
         if (budget <= node->budget) {
@@ -3360,7 +4680,8 @@ private:
                     *pkLp,
                     *pkRp,
                     *cpathLp,
-                    *cpathRp
+                    *cpathRp,
+                    active_features
                 );
 
                 it->left = LR.first;
@@ -3452,7 +4773,8 @@ private:
                 *pkLp,
                 *pkRp,
                 cpath,
-                cpath
+                cpath,
+                active_features
             );
 
             // the left and right TreeTrieNode (OR nodes) to be added to the AND/OR graph being built
@@ -3480,20 +4802,38 @@ private:
                 continue;
             }
 
-            enumerate_continuous_feature_for_trie_extend(
-                node,
-                mask,
-                depth,
-                budget,
-                pk,
-                cpath,
-                k_here,
-                start_idx,
-                end_idx,
-                L,
-                R,
-                already_split
-            );
+            if (active_features) {
+                enumerate_continuous_feature_for_trie_extend_restricted(
+                    node,
+                    mask,
+                    depth,
+                    budget,
+                    pk,
+                    cpath,
+                    k_here,
+                    start_idx,
+                    end_idx,
+                    L,
+                    R,
+                    already_split,
+                    active_features
+                );
+            } else {
+                 enumerate_continuous_feature_for_trie_extend(
+                    node,
+                    mask,
+                    depth,
+                    budget,
+                    pk,
+                    cpath,
+                    k_here,
+                    start_idx,
+                    end_idx,
+                    L,
+                    R,
+                    already_split
+                );
+            }
         }
 
         if (trie_cache_enabled) trie_cache.emplace(key, node);
