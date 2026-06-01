@@ -1840,6 +1840,10 @@ public:
             B_active.insert(B_active.end(), B_new.begin(), B_new.end());
             sort_unique_ints_inplace_(B_active);
 
+            // the meaning of complete for this active feature set changed.
+            // do not trust old (subproblem, depth) trie-cache hits.
+            trie_cache.clear();
+
             RefineGraphDfs(
                 G_min,
                 root,
@@ -2502,7 +2506,6 @@ private:
 
                 if (LR.first && LR.second) {
                     node->add_split(feat, LR.first, LR.second);
-                    node->hist_built = false;
                 }
 
                 if (i <= mid - 1) {
@@ -2762,7 +2765,8 @@ private:
                     *pkRp,
                     *cpathLp,
                     *cpathRp,
-                    active_features
+                    active_features,
+                    true
                 );
             } else {
                 LR = symmetric_single_pass(
@@ -2798,7 +2802,6 @@ private:
                 already_split.insert(feat);
             }
 
-            node->hist_built = false;
             return true;
         };
 
@@ -3265,7 +3268,8 @@ private:
                     *pkRp,
                     *cpathLp,
                     *cpathRp,
-                    &B_active
+                    &B_active,
+                    true
                 );
                 if (LR.first && LR.second) {
                     s.left = LR.first;
@@ -4358,7 +4362,8 @@ private:
         const PathKey& pkR,
         const ContinuousPath& cpathL,
         const ContinuousPath& cpathR,
-        const std::vector<int>* active_features = nullptr
+        const std::vector<int>* active_features = nullptr,
+        bool launched_by_anytime = false
     ) {
         int left_budget = budget - loss_r;
 
@@ -4371,7 +4376,8 @@ private:
                     left_budget,
                     pkL,
                     cpathL,
-                    active_features
+                    active_features,
+                    launched_by_anytime
                 );
             } else {
                 left_node = construct_trie(
@@ -4402,7 +4408,8 @@ private:
                     right_budget,
                     pkR,
                     cpathR,
-                    active_features
+                    active_features,
+                    launched_by_anytime
                 );
             } else {
                 right_node = construct_trie(
@@ -4441,7 +4448,8 @@ private:
                             left_budget,
                             pkL,
                             cpathL,
-                            active_features
+                            active_features,
+                            launched_by_anytime
                         );
                     } else {
                         left_node = construct_trie(
@@ -4482,7 +4490,8 @@ private:
                             right_budget,
                             pkR,
                             cpathR,
-                            active_features
+                            active_features,
+                            launched_by_anytime
                         );
                     } else {
                         right_node = construct_trie(
@@ -4514,7 +4523,7 @@ private:
         return {left_node, right_node};
     }
 
-    shared_ptr<TreeTrieNode> construct_trie_extend(shared_ptr<TreeTrieNode> node, const Packed& mask, int8_t depth, int budget, const PathKey& pk, const ContinuousPath& cpath = empty_continuous_path(), const std::vector<int>* active_features = nullptr) {
+    shared_ptr<TreeTrieNode> construct_trie_extend(shared_ptr<TreeTrieNode> node, const Packed& mask, int8_t depth, int budget, const PathKey& pk, const ContinuousPath& cpath = empty_continuous_path(), const std::vector<int>* active_features = nullptr, bool launched_by_anytime = false) {
         if (!node) {
             return construct_trie(mask, depth, budget, pk, cpath,  active_features);
         }
@@ -4543,7 +4552,7 @@ private:
             );
         }
 
-        if (budget <= node->budget) {
+        if (!launched_by_anytime && budget <= node->budget) {
             return node;
         }
 
