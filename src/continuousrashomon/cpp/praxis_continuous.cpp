@@ -795,7 +795,8 @@ private:
     unordered_map<K2,  int, K2::Hash>  lickety_cache_k2; // used when lookahead_init <= 1
     unordered_map<KLA, int, KLA::Hash>  lickety_cache_kla; // used when lookahead_init > 1
 
-    unordered_map<K3, shared_ptr<TreeTrieNode>, K3::Hash> trie_cache; // if trie_cache_enabled is on
+    // unordered_map<K3, shared_ptr<TreeTrieNode>, K3::Hash> trie_cache; // if trie_cache_enabled is on
+    unordered_map<K2, shared_ptr<TreeTrieNode>, K2::Hash> trie_cache; // canonical node per (subproblem, depth)
 
     std::vector<std::vector<double>> numerical_X_cols_for_greedy;
     std::vector<std::vector<int>> numerical_global_sorted_idx;
@@ -2046,11 +2047,25 @@ private:
 
     shared_ptr<TreeTrieNode> construct_trie(const Packed& mask, int8_t depth, int budget, const PathKey& pk, const ContinuousPath& cpath = empty_continuous_path(), const std::vector<int>* active_features = nullptr) {
         const uint64_t k = key_of_subproblem(mask, pk);
-        K3 key{k, depth, budget};
+        K2 key{k, depth};
 
         if (trie_cache_enabled) {
             if (auto it = trie_cache.find(key); it != trie_cache.end()) {
-                return it->second; // exact lookup for simplicity
+                auto node = it->second;
+
+                if (node->budget >= budget) {
+                    return node;
+                }
+
+                return construct_trie_extend(
+                    node,
+                    mask,
+                    depth,
+                    budget,
+                    pk,
+                    cpath,
+                    active_features
+                );
             }
         }
 
@@ -4504,21 +4519,37 @@ private:
             return construct_trie(mask, depth, budget, pk, cpath,  active_features);
         }
 
+        const uint64_t k = key_of_subproblem(mask, pk);
+        K2 key{k, depth};
+
+        if (trie_cache_enabled) {
+            if (auto it = trie_cache.find(key); it != trie_cache.end()) {
+                node = it->second;
+
+                if (budget <= node->budget) {
+                    return node;
+                }
+            }
+        }
+
+        if (!node) { // no node was given so how can i extend it
+            return construct_trie(
+                mask,
+                depth,
+                budget,
+                pk,
+                cpath,
+                active_features
+            );
+        }
+
         if (budget <= node->budget) {
             return node;
         }
 
-
-        const uint64_t k = key_of_subproblem(mask, pk);
-        K3 key{k, depth, budget};
-
-        if (trie_cache_enabled) {
-            if (auto it = trie_cache.find(key); it != trie_cache.end()) {
-                return it->second; // exact lookup for simplicity
-            }
-        }
-
         node->budget = budget;
+
+     
 
         // add newly feasible leaves, don't duplicate them
         {
