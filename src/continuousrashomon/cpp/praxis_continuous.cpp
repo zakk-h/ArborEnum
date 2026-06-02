@@ -1517,6 +1517,212 @@ public:
         cout << "\n";
     }
 
+    void fit_anytime(
+        const std::vector<std::vector<bool>>& X_col_major,
+        const std::vector<int>& y,
+        double lambda,
+        int8_t depth_budget,
+        double rashomon_mult,
+        int8_t lookahead_k,
+        bool use_multipass_flag,
+        bool rule_list_mode_flag,
+        int proxy_style_in,
+        bool majority_leaf_only_flag,
+        bool cache_cheap_subproblems_flag,
+        bool proxy_caching_flag,
+        const std::vector<int>& proxy_threshold_features,
+        int refinement_width,
+        int max_refinement_rounds,
+        const std::vector<int>& continuous_starts_in
+    ) {
+        clear_fit_state_();
+
+        if (X_col_major.empty()) {
+            throw std::runtime_error("X_col_major is empty.");
+        }
+
+        if (X_col_major[0].empty()) {
+            throw std::runtime_error("X_col_major has zero samples.");
+        }
+
+        n_features = (int)X_col_major.size();
+        n_samples  = (int)X_col_major[0].size();
+        continuous_starts = continuous_starts_in;
+        y_train = y;
+
+        if ((int)y.size() != n_samples) {
+            throw std::runtime_error("y length does not match number of samples.");
+        }
+
+        for (int f = 1; f < n_features; ++f) {
+            if ((int)X_col_major[(std::size_t)f].size() != n_samples) {
+                throw std::runtime_error("X_col_major must be rectangular.");
+            }
+        }
+
+        if (greedy_continuous_mode == GreedyContinuousMode::NUMERICAL) {
+            if (numerical_X_cols_for_greedy.size() != continuous_starts.size() ||
+                numerical_global_sorted_idx.size() != continuous_starts.size() ||
+                numerical_unique_values_for_greedy.size() != continuous_starts.size()) {
+                throw std::runtime_error(
+                    "Numerical greedy arrays must align one-to-one with continuous_starts."
+                );
+            }
+        }
+
+        n_words = (n_samples + 63) / 64;
+        tail_mask = (n_samples % 64)
+            ? ((1ULL << (n_samples % 64)) - 1ULL)
+            : ~0ULL;
+
+        gamma = (int)llround(lambda * (double)n_samples);
+        trained_depth_budget = depth_budget;
+        lookahead_init = lookahead_k;
+        use_multipass = use_multipass_flag;
+        rule_list_mode = rule_list_mode_flag;
+        majority_leaf_only = majority_leaf_only_flag;
+        cache_cheap_subproblems = cache_cheap_subproblems_flag;
+        proxy_style = proxy_style_in;
+        proxy_caching_enabled = proxy_caching_flag;
+
+        if (!proxy_caching_enabled) { // we need this
+            proxy_caching_enabled = true;
+        }
+
+        reserve_caches_mid_();
+
+        // anytime_continuous_rset will update this
+        restrict_proxy_in_lickety = false;
+        restrict_proxy_in_depthd_exact = false;
+        restrict_proxy_in_greedy = false;
+        allowed_proxy_features.clear();
+
+        X_bits.assign(n_features, Packed(n_words));
+
+        for (int f = 0; f < n_features; ++f) {
+            auto& col = X_bits[(std::size_t)f].w;
+
+            for (int i = 0; i < n_samples; ++i) {
+                if (X_col_major[(std::size_t)f][(std::size_t)i]) {
+                    col[(std::size_t)(i >> 6)] |= (1ULL << (i & 63));
+                }
+            }
+
+            col[(std::size_t)(n_words - 1)] &= tail_mask;
+        }
+
+        int y_max = 0;
+        for (int i = 0; i < n_samples; ++i) {
+            if (y[(std::size_t)i] < 0) {
+                throw std::runtime_error("y contains negative class labels.");
+            }
+
+            y_max = std::max(y_max, y[(std::size_t)i]);
+        }
+
+        num_classes = y_max + 1;
+
+        Y_bits.assign((std::size_t)num_classes, Packed(n_words));
+
+        for (int c = 0; c < num_classes; ++c) {
+            Y_bits[(std::size_t)c].clear();
+        }
+
+        for (int i = 0; i < n_samples; ++i) {
+            const int yi = y[(std::size_t)i];
+            Y_bits[(std::size_t)yi].w[(std::size_t)(i >> 6)] |=
+                (1ULL << (i & 63));
+        }
+
+        for (int c = 0; c < num_classes; ++c) {
+            Y_bits[(std::size_t)c].w[(std::size_t)(n_words - 1)] &= tail_mask;
+        }
+
+        if (proxy_style == 2) {
+            k_at_depth.assign((std::size_t)depth_budget + 1, 1);
+
+            int K = lookahead_init;
+            int kk = K;
+
+            for (int d = depth_budget; d >= 0; --d) {
+                k_at_depth[(std::size_t)d] = std::min(d, kk);
+                kk = (kk > 1) ? (kk - 1) : K;
+            }
+        } else {
+            k_at_depth.clear();
+        }
+
+        result = anytime_continuous_rset(
+            depth_budget,
+            rashomon_mult,
+            proxy_threshold_features,
+            refinement_width,
+            max_refinement_rounds
+        );
+
+        cout << "Anytime minimum objective: " << result->min_objective << "\n";
+        cout << "Cache sizes - Greedy: " << greedy_cache.size()
+            << ", Lickety: "
+            << (use_kla_cache() ? lickety_cache_kla.size() : lickety_cache_k2.size())
+            << ", Trie: " << trie_cache.size()
+            << ", Trie cache: " << (trie_cache_enabled ? "ON" : "OFF")
+            << "\n";
+    }
+
+    void fit_prepared_anytime(
+        double lambda,
+        int8_t depth_budget,
+        double rashomon_mult,
+        int8_t lookahead_k,
+        bool use_multipass_flag,
+        bool rule_list_mode_flag,
+        int proxy_style_in,
+        bool majority_leaf_only_flag,
+        bool cache_cheap_subproblems_flag,
+        bool proxy_caching_flag,
+        const std::vector<int>& proxy_threshold_features,
+        int refinement_width,
+        int max_refinement_rounds = -1
+    ) {
+        if (!has_prepared_data) {
+            throw std::runtime_error(
+                "No prepared data. Call prepare_continuous_data(...) before fit_prepared_anytime(...)."
+            );
+        }
+
+        std::vector<int> proxy_feats =
+            proxy_threshold_features.empty()
+                ? prepared_allowed_proxy_features
+                : proxy_threshold_features;
+
+        if (proxy_feats.empty() && !prepared_continuous_starts.empty()) {
+            throw std::runtime_error(
+                "fit_prepared_anytime needs either X_active in prepare_continuous_data(...) "
+                "or nonempty proxy_threshold_features, because otherwise there are no initial "
+                "continuous threshold anchors."
+            );
+        }
+
+        fit_anytime(
+            prepared_X_col_major,
+            prepared_y,
+            lambda,
+            depth_budget,
+            rashomon_mult,
+            lookahead_k,
+            use_multipass_flag,
+            rule_list_mode_flag,
+            proxy_style_in,
+            majority_leaf_only_flag,
+            cache_cheap_subproblems_flag,
+            proxy_caching_flag,
+            proxy_feats,
+            refinement_width,
+            max_refinement_rounds,
+            prepared_continuous_starts
+        );
+    }
+
     // predict using the i-th tree in the Rashomon set: X_row_major: binary [n_samples][n_features]
     std::vector<uint8_t> get_predictions(uint64_t tree_index, const std::vector<std::vector<uint8_t>>& X_row_major) const {
         const std::size_t n_samples = X_row_major.size();
@@ -1725,7 +1931,8 @@ public:
         int8_t depth_budget,
         double rashomon_mult,
         const std::vector<int>& proxy_threshold_features,
-        int refinement_width
+        int refinement_width,
+        int max_refinement_rounds = -1
     ) {
         if (n_samples <= 0 || n_features <= 0 || n_words <= 0) {
             throw std::runtime_error(
@@ -1824,7 +2031,14 @@ public:
             &B_active
         );
 
+
+        int refinement_round = 0;
         while (!active_contains_all_threshold_columns_(B_active)) {
+            if (max_refinement_rounds >= 0 &&
+                refinement_round >= max_refinement_rounds) {
+                break;
+            }
+
             std::vector<int> B_new = SelectNewThresholds(
                 B_active,
                 continuous_starts,
@@ -1834,8 +2048,6 @@ public:
             if (B_new.empty()) {
                 break;
             }
-
-            sort_unique_ints_inplace_(B_new);
 
             B_active.insert(B_active.end(), B_new.begin(), B_new.end());
             sort_unique_ints_inplace_(B_active);
@@ -1852,6 +2064,8 @@ public:
                 root_cpath,
                 B_active
             );
+
+            ++refinement_round;
         }
 
         allowed_proxy_features = old_allowed_proxy_features;
@@ -1875,13 +2089,10 @@ private:
             return true;
         }
 
-        std::vector<int> active = B_active;
-        sort_unique_ints_inplace_(active);
-
         const int first_cont = first_continuous_feature_();
 
         for (int f = first_cont; f < n_features; ++f) {
-            if (!std::binary_search(active.begin(), active.end(), f)) {
+            if (!std::binary_search(B_active.begin(), B_active.end(), f)) {
                 return false;
             }
         }
@@ -1897,7 +2108,7 @@ private:
         if (refinement_width <= 0 || continuous_starts.empty()) return {};
 
         std::vector<int> active = B_active;
-        sort_unique_ints_inplace_(active);
+        // sort_unique_ints_inplace_(active);
 
         std::vector<int> out;
 
@@ -1912,7 +2123,8 @@ private:
                 }
             }
 
-            if (A.empty()) continue;
+            // if (A.empty()) continue; // if A is empty, then we want to start phasing in using those thresholds
+            // in this case, anchors = {start - 1, end};, so we're taking evenly spaced thresholds in threshold index space based on our parameter
 
             // also refine before the first active threshold and after the last one.
             std::vector<int> anchors;

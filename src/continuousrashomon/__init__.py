@@ -238,6 +238,104 @@ class PRAXIS:
             continuous_starts_vec,
         )
 
+    def fit_anytime(
+        self,
+        X,
+        y,
+        lambda_reg=0.01,
+        depth_budget=5,
+        rashomon_mult=0.01,
+        multiplicative_slack=0.0,
+        key_mode="hash",
+        lookahead_k=1,
+        proxy_style=0,
+        use_budget_refinement=True,
+        guarantee_rule_list_recovery=False,
+        majority_leaf_only=False,
+        cache_early_exits=False,
+        heuristic_for_greedy=1,
+        greedy_continuous_mode="binary",
+        proxy_caching=True,
+        proxy_threshold_features=None,
+        refinement_width=1,
+        max_refinement_rounds=-1,
+        continuous_starts=None,
+        trie_cache_enabled=True,
+    ):
+        X = np.asarray(X, dtype=np.uint8)
+        y = np.asarray(y, dtype=int)
+
+        if X.ndim != 2:
+            raise ValueError(f"X must be 2D, got shape {X.shape}")
+        if y.ndim != 1:
+            raise ValueError(f"y must be 1D, got shape {y.shape}")
+        if y.shape[0] != X.shape[0]:
+            raise ValueError(
+                f"y length must match X rows: got len(y)={y.shape[0]}, "
+                f"X rows={X.shape[0]}"
+            )
+
+        n_features = X.shape[1]
+
+        if continuous_starts is None:
+            continuous_starts_vec = []
+        else:
+            continuous_starts_vec = [int(v) for v in continuous_starts]
+            continuous_starts_vec = sorted(set(continuous_starts_vec))
+
+            bad = [v for v in continuous_starts_vec if v < 0 or v >= n_features]
+            if bad:
+                raise ValueError(
+                    f"continuous_starts contains invalid feature indices {bad}; "
+                    f"valid range is [0, {n_features - 1}]"
+                )
+
+        if proxy_threshold_features is None:
+            proxy_threshold_features_vec = []
+        else:
+            proxy_threshold_features_vec = [int(v) for v in proxy_threshold_features]
+            proxy_threshold_features_vec = sorted(set(proxy_threshold_features_vec))
+
+            bad = [
+                v for v in proxy_threshold_features_vec
+                if v < 0 or v >= n_features
+            ]
+            if bad:
+                raise ValueError(
+                    f"proxy_threshold_features contains invalid feature indices {bad}; "
+                    f"valid range is [0, {n_features - 1}]"
+                )
+
+        proxy_style_int = parse_proxy_style(proxy_style)
+        greedy_heur_int = parse_heuristic_for_greedy(heuristic_for_greedy)
+        greedy_cont_mode = parse_greedy_continuous_mode(greedy_continuous_mode)
+
+        self._model.fit_anytime(
+            X,
+            y,
+            float(lambda_reg),
+            int(depth_budget),
+            float(rashomon_mult),
+            float(multiplicative_slack),
+            str(key_mode),
+            bool(trie_cache_enabled),
+            int(lookahead_k),
+            bool(use_budget_refinement),
+            bool(guarantee_rule_list_recovery),
+            int(proxy_style_int),
+            bool(majority_leaf_only),
+            bool(cache_early_exits),
+            int(greedy_heur_int),
+            greedy_cont_mode,
+            bool(proxy_caching),
+            proxy_threshold_features_vec,
+            int(refinement_width),
+            int(max_refinement_rounds),
+            continuous_starts_vec,
+        )
+
+        return self
+
     def prepare_continuous_data(
         self,
         X_num,
@@ -348,6 +446,60 @@ class PRAXIS:
             bool(restrict_proxy_in_greedy),
             bool(rashomon_mode),
         )
+
+    def fit_prepared_anytime(
+        self,
+        lambda_reg=0.01,
+        depth_budget=5,
+        rashomon_mult=0.01,
+        multiplicative_slack=0.0,
+        key_mode="hash",
+        lookahead_k=1,
+        proxy_style=0,
+        use_budget_refinement=True,
+        guarantee_rule_list_recovery=False,
+        majority_leaf_only=False,
+        cache_early_exits=False,
+        heuristic_for_greedy=1,
+        greedy_continuous_mode="binary",
+        proxy_caching=True,
+        proxy_threshold_features=None,
+        refinement_width=1,
+        max_refinement_rounds=-1,
+        trie_cache_enabled=True,
+    ):
+        proxy_style_int = parse_proxy_style(proxy_style)
+        greedy_heur_int = parse_heuristic_for_greedy(heuristic_for_greedy)
+        greedy_cont_mode = parse_greedy_continuous_mode(greedy_continuous_mode)
+
+        if proxy_threshold_features is None:
+            proxy_threshold_features_vec = []
+        else:
+            proxy_threshold_features_vec = [int(v) for v in proxy_threshold_features]
+            proxy_threshold_features_vec = sorted(set(proxy_threshold_features_vec))
+
+        self._model.fit_prepared_anytime(
+            float(lambda_reg),
+            int(depth_budget),
+            float(rashomon_mult),
+            float(multiplicative_slack),
+            str(key_mode),
+            bool(trie_cache_enabled),
+            int(lookahead_k),
+            bool(use_budget_refinement),
+            bool(guarantee_rule_list_recovery),
+            int(proxy_style_int),
+            bool(majority_leaf_only),
+            bool(cache_early_exits),
+            int(greedy_heur_int),
+            greedy_cont_mode,
+            bool(proxy_caching),
+            proxy_threshold_features_vec,
+            int(refinement_width),
+            int(max_refinement_rounds),
+        )
+
+        return self
 
     def set_greedy_continuous_mode(self, mode="binary"):
         mode = parse_greedy_continuous_mode(mode)
