@@ -283,6 +283,7 @@ PYBIND11_MODULE(_core, m) {
             std::vector<int> proxy_threshold_features,
             int refinement_width,
             int max_refinement_rounds,
+            bool increase_proxy_anytime,
             std::vector<int> continuous_starts
             ) {
                 py::buffer_info xinfo = X.request();
@@ -354,6 +355,7 @@ PYBIND11_MODULE(_core, m) {
                     proxy_threshold_features,
                     refinement_width,
                     max_refinement_rounds,
+                    increase_proxy_anytime,
                     continuous_starts
                 );
             },
@@ -377,6 +379,7 @@ PYBIND11_MODULE(_core, m) {
             py::arg("proxy_threshold_features") = std::vector<int>{},
             py::arg("refinement_width") = 1,
             py::arg("max_refinement_rounds") = -1,
+            py::arg("increase_proxy_anytime") = false,
             py::arg("continuous_starts") = std::vector<int>{}
         )
 
@@ -426,7 +429,8 @@ PYBIND11_MODULE(_core, m) {
             bool proxy_caching,
             std::vector<int> proxy_threshold_features,
             int refinement_width,
-            int max_refinement_rounds
+            int max_refinement_rounds,
+            bool increase_proxy_anytime
             ) {
                 PRAXIS::KeyMode km = parse_key_mode(key_mode_str);
 
@@ -456,7 +460,8 @@ PYBIND11_MODULE(_core, m) {
                     proxy_caching,
                     proxy_threshold_features,
                     refinement_width,
-                    max_refinement_rounds
+                    max_refinement_rounds,
+                    increase_proxy_anytime
                 );
             },
             py::arg("lambda_reg") = 0.01,
@@ -476,7 +481,8 @@ PYBIND11_MODULE(_core, m) {
             py::arg("proxy_caching") = true,
             py::arg("proxy_threshold_features") = std::vector<int>{},
             py::arg("refinement_width") = 1,
-            py::arg("max_refinement_rounds") = -1
+            py::arg("max_refinement_rounds") = -1,
+            py::arg("increase_proxy_anytime") = false
         )
 
         .def(

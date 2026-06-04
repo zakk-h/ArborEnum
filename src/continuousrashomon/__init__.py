@@ -171,6 +171,7 @@ class PRAXIS:
         restrict_proxy_in_depthd_exact=False,
         restrict_proxy_in_greedy=False,
         rashomon_mode=True,
+        increase_proxy_anytime=False,
         continuous_starts=None,
         trie_cache_enabled=True,
     ):
@@ -331,6 +332,7 @@ class PRAXIS:
             proxy_threshold_features_vec,
             int(refinement_width),
             int(max_refinement_rounds),
+            bool(increase_proxy_anytime),
             continuous_starts_vec,
         )
 
@@ -466,6 +468,7 @@ class PRAXIS:
         proxy_threshold_features=None,
         refinement_width=1,
         max_refinement_rounds=-1,
+        increase_proxy_anytime=False,
         trie_cache_enabled=True,
     ):
         proxy_style_int = parse_proxy_style(proxy_style)
@@ -497,6 +500,7 @@ class PRAXIS:
             proxy_threshold_features_vec,
             int(refinement_width),
             int(max_refinement_rounds),
+            bool(increase_proxy_anytime),
         )
 
         return self

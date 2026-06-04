@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <deque>
 #include <map>
+#include <span>
 
 using namespace std;
 
@@ -291,9 +292,18 @@ static inline bool any_words(const uint64_t* a, int n_words) {
 using Lit = uint32_t; // 32-bit literal = 2*feat + sign
 using PathKey = std::vector<Lit>;
 
+// struct ContinuousPathEntry {
+//     int threshold_index = -1; // actual binarized threshold-column index
+//     bool went_true = false; // true means left branch: x <= threshold
+// };
+
+// using ContinuousPath = std::vector<ContinuousPathEntry>;
+
 struct ContinuousPathEntry {
-    int threshold_index = -1; // actual binarized threshold-column index
-    bool went_true = false; // true means left branch: x <= threshold
+    // active threshold interval for one continuous feature group.
+    // valid thresholds are [lo, hi).
+    int lo = -1;
+    int hi = -1;
 };
 
 using ContinuousPath = std::vector<ContinuousPathEntry>;
@@ -898,6 +908,28 @@ private:
     //     return train_greedy_continuous(mask, depth, pk);
     // }
 
+    int proxy_completion_objective_(
+        const Packed& mask,
+        int8_t depth,
+        int8_t k_here,
+        const PathKey& pk,
+        const ContinuousPath& cpath
+    ) {
+        if (lookahead_init < 0) {
+            return leaf_objective(mask);
+        }
+
+        if (lookahead_init == 0) {
+            return greedy_proxy_objective_(mask, depth, pk, cpath);
+        }
+
+        if (proxy_style == 4) {
+            return split_algorithm(mask, depth, k_here, pk);
+        }
+
+        return lickety_proxy_objective_(mask, depth, k_here, pk, cpath);
+    }
+
     int greedy_proxy_objective_(
         const Packed& mask,
         int8_t depth_budget,
@@ -1317,6 +1349,17 @@ public:
         );
     }
 
+    std::vector<int> all_feature_indices_() const {
+        std::vector<int> out;
+        out.reserve((std::size_t)n_features);
+
+        for (int f = 0; f < n_features; ++f) {
+            out.push_back(f);
+        }
+
+        return out;
+    }
+
     void fit(const std::vector<std::vector<bool>>& X_col_major,
              const std::vector<int>& y,
              double lambda,
@@ -1498,8 +1541,8 @@ public:
             k_at_depth.clear();
         }
 
-
-        result = construct_trie(root, depth_budget, obj_bound, root_pk, root_cpath);
+        std::vector<int> B_active_all = all_feature_indices_();
+        result = construct_trie(root, depth_budget, obj_bound, root_pk, root_cpath, &B_active_all);
 
         // cout << "Found " << result->count_trees() << " trees\n"; // we'll let the user compute this query if they want it because it is somewhat expensive
         cout << "Minimum objective: " << result->min_objective << "\n";
@@ -1533,6 +1576,7 @@ public:
         const std::vector<int>& proxy_threshold_features,
         int refinement_width,
         int max_refinement_rounds,
+        bool increase_proxy_anytime,
         const std::vector<int>& continuous_starts_in
     ) {
         clear_fit_state_();
@@ -1657,7 +1701,8 @@ public:
             rashomon_mult,
             proxy_threshold_features,
             refinement_width,
-            max_refinement_rounds
+            max_refinement_rounds,
+            increase_proxy_anytime
         );
 
         cout << "Anytime minimum objective: " << result->min_objective << "\n";
@@ -1682,7 +1727,8 @@ public:
         bool proxy_caching_flag,
         const std::vector<int>& proxy_threshold_features,
         int refinement_width,
-        int max_refinement_rounds = -1
+        int max_refinement_rounds = -1,
+        bool increase_proxy_anytime = false
     ) {
         if (!has_prepared_data) {
             throw std::runtime_error(
@@ -1719,6 +1765,7 @@ public:
             proxy_feats,
             refinement_width,
             max_refinement_rounds,
+            increase_proxy_anytime,
             prepared_continuous_starts
         );
     }
@@ -1932,7 +1979,8 @@ public:
         double rashomon_mult,
         const std::vector<int>& proxy_threshold_features,
         int refinement_width,
-        int max_refinement_rounds = -1
+        int max_refinement_rounds = -1,
+        bool increase_proxy_anytime = false
     ) {
         if (n_samples <= 0 || n_features <= 0 || n_words <= 0) {
             throw std::runtime_error(
@@ -2066,6 +2114,69 @@ public:
             );
 
             ++refinement_round;
+        }
+
+        // after all active-threshold refinement is done, optionally increase the
+        // proxy lookahead. This can recover splits that were previously pruned by
+        // a weaker proxy. The root graph G_min is kept and extended in place.
+        if (increase_proxy_anytime) {
+
+            const int old_lookahead_init = lookahead_init;
+            const int final_refinement_lookahead = std::max<int>(lookahead_init, depth_budget - 2); // d-1 is optimal at depth d, but we never evaluate at the root again, always one split lower
+
+            for (int next_k = lookahead_init + 1;
+                next_k <= final_refinement_lookahead;
+                ++next_k) {
+
+                lookahead_init = (int8_t)next_k;
+
+                if (proxy_style == 2) {
+                    k_at_depth.assign((std::size_t)depth_budget + 1, 1);
+
+                    int K = lookahead_init;
+                    int kk = K;
+
+                    for (int dd = depth_budget; dd >= 0; --dd) {
+                        k_at_depth[(std::size_t)dd] = std::min(dd, kk);
+                        kk = (kk > 1) ? (kk - 1) : K;
+                    }
+                } else {
+                    k_at_depth.clear();
+                }
+
+                // E cache: proxy completions are no longer valid because the proxy
+                // itself changed when lookahead changed.
+                continuous_proxy_completion_cache.clear();
+
+                // subgraph cache: canonical completeness was with respect to the old search
+                trie_cache.clear();
+
+                RefineGraphDfs(
+                    G_min,
+                    root,
+                    depth_budget,
+                    root_pk,
+                    root_cpath,
+                    B_active
+                );
+            }
+
+            // restore the user's original lookahead setting for external consistency
+            lookahead_init = old_lookahead_init;
+
+            if (proxy_style == 2) {
+                k_at_depth.assign((std::size_t)depth_budget + 1, 1);
+
+                int K = lookahead_init;
+                int kk = K;
+
+                for (int dd = depth_budget; dd >= 0; --dd) {
+                    k_at_depth[(std::size_t)dd] = std::min(dd, kk);
+                    kk = (kk > 1) ? (kk - 1) : K;
+                }
+            } else {
+                k_at_depth.clear();
+            }
         }
 
         allowed_proxy_features = old_allowed_proxy_features;
@@ -2233,6 +2344,8 @@ private:
         lickety_cache_k2.clear();
         lickety_cache_kla.clear();
         trie_cache.clear();
+
+        continuous_proxy_completion_cache.clear();
 
         mask_ids = MaskIdTable();
         lit_ids = LitIdTable();
@@ -2525,15 +2638,26 @@ private:
     ) {
         if (!active_features || start_idx >= end_idx) return;
 
-        std::vector<int> active_thresholds;
+        const auto active_lo = std::lower_bound(
+            active_features->begin(),
+            active_features->end(),
+            start_idx
+        );
 
-        for (int f : *active_features) { // can do this better knowing sorted and stuff
-            if (f >= start_idx && f < end_idx) {
-                active_thresholds.push_back(f);
-            }
-        }
+        const auto active_hi = std::lower_bound(
+            active_features->begin(),
+            active_features->end(),
+            end_idx
+        );
 
-        sort_unique_ints_inplace_(active_thresholds);
+        if (active_lo == active_hi) return;
+
+        // create a non-owning view of that subarray
+        std::span<const int> active_thresholds(
+            &(*active_lo),
+            (std::size_t)std::distance(active_lo, active_hi)
+        );
+
 
         if (active_thresholds.empty()) return;
 
@@ -2541,6 +2665,8 @@ private:
         KContProxy cache_key{kmask, depth, start_idx};
         ProxyCompletionTree& evaluated =
             continuous_proxy_completion_cache[cache_key];
+
+        ContinuousPath q_cpath = materialize_continuous_path_(cpath);
 
         std::deque<std::pair<int,int>> Q;
         Q.push_back({0, (int)active_thresholds.size() - 1});
@@ -2561,10 +2687,12 @@ private:
 
             if (left_empty || right_empty) {
                 if (left_empty && !right_empty) {
+                    constrain_continuous_false_branch_(q_cpath, feat);
                     if (mid + 1 <= j) {
                         Q.push_back({mid + 1, j});
                     }
                 } else if (!left_empty && right_empty) {
+                    constrain_continuous_true_branch_(q_cpath, feat);
                     if (i <= mid - 1) {
                         Q.push_back({i, mid - 1});
                     }
@@ -2595,7 +2723,7 @@ private:
 
             make_child_continuous_paths_if_needed_(
                 feat,
-                cpath,
+                q_cpath,
                 cpathLp,
                 cpathRp,
                 cpathL_local,
@@ -2773,7 +2901,7 @@ private:
 
     int tighten_lower_bound_active_thresholds_(
         const Packed& mask,
-        const std::vector<int>& active_thresholds,
+        std::span<const int> active_thresholds,
         int anchor_pos,
         int lo_pos,
         int hi_pos,
@@ -2814,7 +2942,7 @@ private:
 
     int tighten_upper_bound_active_thresholds_(
         const Packed& mask,
-        const std::vector<int>& active_thresholds,
+        std::span<const int> active_thresholds,
         int anchor_pos,
         int lo_pos,
         int hi_pos,
@@ -2853,6 +2981,23 @@ private:
         return ans;
     }
 
+    int raw_continuous_start_for_threshold_(int start_idx) const {
+        auto it = std::upper_bound(
+            continuous_starts.begin(),
+            continuous_starts.end(),
+            start_idx
+        );
+
+        if (it == continuous_starts.begin()) {
+            throw std::runtime_error(
+                "start_idx is before the first continuous feature group."
+            );
+        }
+
+        --it;
+        return *it;
+    }
+
     void enumerate_continuous_feature_for_trie_extend_restricted(
         shared_ptr<TreeTrieNode>& node,
         const Packed& mask,
@@ -2872,6 +3017,7 @@ private:
 
         std::vector<int> active_thresholds;
 
+        // TODO can make this a binary search for start and end since sorted
         for (int f : *active_features) {
             if (f >= start_idx && f < end_idx) {
                 active_thresholds.push_back(f);
@@ -2882,13 +3028,21 @@ private:
 
         if (active_thresholds.empty()) return;
 
+        const int raw_start_idx = raw_continuous_start_for_threshold_(start_idx);
+
         const uint64_t kmask = key_of_subproblem(mask, pk);
-        KContProxy cache_key{kmask, depth, start_idx};
+        KContProxy cache_key{kmask, depth, raw_start_idx};
 
         ProxyCompletionTree& evaluated =
             continuous_proxy_completion_cache[cache_key];
 
+        ContinuousPath q_cpath = materialize_continuous_path_(cpath);
+
         std::deque<std::pair<int,int>> Q;
+
+        // global bounds
+        int M_L = 0; 
+        int M_R = (int)active_thresholds.size() - 1;
 
         // invariant/assumption: only call on things within budget
         auto resolve_threshold = [&](
@@ -2925,7 +3079,7 @@ private:
 
             make_child_continuous_paths_if_needed_(
                 feat,
-                cpath,
+                q_cpath,
                 cpathLp,
                 cpathRp,
                 cpathL_local,
@@ -2949,13 +3103,13 @@ private:
                 old_left = it_split->left;
                 old_right = it_split->right;
 
-                if (old_left) {
-                    lossL = old_left->min_objective;
-                }
+                // if (old_left) {
+                //     lossL = old_left->min_objective;
+                // }
 
-                if (old_right) {
-                    lossR = old_right->min_objective;
-                }
+                // if (old_right) {
+                //     lossR = old_right->min_objective;
+                // }
             }
 
             std::pair<
@@ -3090,62 +3244,51 @@ private:
                 continue;
             }
 
+            if (!rule_list_mode) {
+                if (lossL == gamma) { 
+                    M_L = std::max(M_L, pos + 1); 
+                } 
+                if (lossR == gamma) { 
+                    M_R = std::min(M_R, pos - 1); 
+                } 
+            }
+
             const int delta = total_proxy - budget;
 
             if (delta <= 0) {
                 continue;
             }
 
-            const int a = tighten_upper_bound_active_thresholds_(
-                mask,
-                active_thresholds,
-                pos,
-                0,
-                pos - 1,
-                delta
-            );
-
-            const int b = tighten_lower_bound_active_thresholds_(
-                mask,
-                active_thresholds,
-                pos,
-                pos + 1,
-                (int)active_thresholds.size() - 1,
-                delta
-            );
+            const int a = tighten_upper_bound_active_thresholds_( mask, active_thresholds, pos, M_L, pos - 1, delta ); 
+            const int b = tighten_lower_bound_active_thresholds_( mask, active_thresholds, pos, pos + 1, M_R, delta );
 
             add_pruned_interval(a + 1, b - 1);
         }
 
         // makes the complement of the pruned intervals and uses it to initialize Q
-        {
-            int cur = 0;
-            const int last = (int)active_thresholds.size() - 1;
-
-            for (const auto& kv : pruned_intervals) {
-                const int lo = kv.first;
-                const int hi = kv.second;
-
-                if (cur <= lo - 1) {
-                    Q.push_back({cur, lo - 1});
-                }
-
-                cur = std::max(cur, hi + 1);
-
-                if (cur > last) break;
-            }
-
-            if (cur <= last) {
-                Q.push_back({cur, last});
-            }
+        { 
+            int cur = M_L; 
+            const int last = M_R; 
+            for (const auto& kv : pruned_intervals) { 
+                const int lo = kv.first; 
+                const int hi = kv.second; 
+                if (cur <= lo - 1) { 
+                    Q.push_back({cur, lo - 1}); 
+                } 
+                cur = std::max(cur, hi + 1); 
+                if (cur > last) break; 
+            } 
+            if (cur <= last) { 
+                Q.push_back({cur, last}); 
+            } 
         }
 
         while (!Q.empty()) {
-            auto [i, j] = Q.front();
-            Q.pop_front();
-
+            auto [i, j] = Q.front(); 
+            Q.pop_front(); 
+            i = std::max(i, M_L); 
+            j = std::min(j, M_R); 
             if (i > j) continue;
-
             const int mid = i + ((j - i) >> 1);
             const int feat = active_thresholds[(std::size_t)mid];
 
@@ -3189,10 +3332,14 @@ private:
 
             if (left_empty || right_empty) {
                 if (left_empty && !right_empty) {
+                    constrain_continuous_false_branch_(q_cpath, feat);
+                    M_L = std::max(M_L, mid + 1);
                     if (mid + 1 <= j) {
                         Q.push_back({mid + 1, j});
                     }
                 } else if (!left_empty && right_empty) {
+                    constrain_continuous_true_branch_(q_cpath, feat);
+                    M_R = std::min(M_R, mid - 1);
                     if (i <= mid - 1) {
                         Q.push_back({i, mid - 1});
                     }
@@ -3224,7 +3371,7 @@ private:
 
             make_child_continuous_paths_if_needed_(
                 feat,
-                cpath,
+                q_cpath,
                 cpathLp,
                 cpathRp,
                 cpathL_local,
@@ -3321,6 +3468,15 @@ private:
                 continue;
             }
 
+            if (!rule_list_mode) { 
+                if (lossL == gamma) { 
+                    M_L = std::max(M_L, mid + 1); 
+                } 
+                if (lossR == gamma) { 
+                    M_R = std::min(M_R, mid - 1); 
+                } 
+            }
+
             const int delta = total_proxy - budget;
 
             if (delta <= 0) {
@@ -3335,6 +3491,7 @@ private:
                 continue;
             }
 
+            // no need to edit the calls here because we have i = std::max(i, M_L); j = std::min(j, M_R);
             const int a = tighten_upper_bound_active_thresholds_(
                 mask,
                 active_thresholds,
@@ -3459,13 +3616,21 @@ private:
             // for binary features, we need to do one of the things that enumerate_continuous_feature_for_trie_extend_restricted does for continuous
             // we need to resolve thresholds after we refined them with iterative budget refinement, because of what is below
             if (s.feature < first_continuous_feature_()) {
-                const int lossL = s.left
-                    ? s.left->min_objective
-                    : std::numeric_limits<int>::max();
+                const int lossL = proxy_completion_objective_(
+                    L,
+                    depth - 1,
+                    k_here,
+                    *pkLp,
+                    *cpathLp
+                );
 
-                const int lossR = s.right
-                    ? s.right->min_objective
-                    : std::numeric_limits<int>::max();
+                const int lossR = proxy_completion_objective_(
+                    R,
+                    depth - 1,
+                    k_here,
+                    *pkRp,
+                    *cpathRp
+                );
 
                 auto LR = solve_siblings_extend(
                     s.left,
@@ -3967,6 +4132,7 @@ private:
         // successful splits are stored persistently by node->add_split(feat, ...).
         // std::map<int, std::pair<int,int>> evaluated;
 
+        ContinuousPath q_cpath = materialize_continuous_path_(cpath);
         std::deque<std::pair<int,int>> Q;
         Q.push_back({start_idx, end_idx - 1});
 
@@ -4003,12 +4169,14 @@ private:
 
             if (left_empty || right_empty) {
                 if (left_empty && !right_empty) {
+                    constrain_continuous_false_branch_(q_cpath, feat);
                     // threshold too low: all thresholds <= feat also have empty left.
                     // only higher thresholds can become valid.
                     if (feat + 1 <= j) {
                         Q.push_back({feat + 1, j});
                     }
                 } else if (!left_empty && right_empty) {
+                    constrain_continuous_true_branch_(q_cpath, feat);
                     // threshold too high: all thresholds >= feat also have empty right.
                     // only lower thresholds can become valid.
                     if (i <= feat - 1) {
@@ -4042,7 +4210,7 @@ private:
 
             make_child_continuous_paths_if_needed_(
                 feat,
-                cpath,
+                q_cpath,
                 cpathLp,
                 cpathRp,
                 cpathL_local,
@@ -4577,164 +4745,180 @@ private:
         const std::vector<int>* active_features = nullptr,
         bool launched_by_anytime = false
     ) {
-        int left_budget = budget - loss_r;
+        auto solve_or_extend = [&](
+            shared_ptr<TreeTrieNode> node,
+            const Packed& mask,
+            int node_budget,
+            const PathKey& pk,
+            const ContinuousPath& cpath
+        ) -> shared_ptr<TreeTrieNode> {
+            if (node_budget < 0) {
+                return nullptr;
+            }
 
-        if (left_budget >= 0) {
-            if (left_node) {
-                left_node = construct_trie_extend(
-                    left_node,
-                    Lmask,
+            if (node) {
+                return construct_trie_extend(
+                    node,
+                    mask,
                     depth - 1,
-                    left_budget,
-                    pkL,
-                    cpathL,
+                    node_budget,
+                    pk,
+                    cpath,
                     active_features,
                     launched_by_anytime
                 );
-            } else {
-                left_node = construct_trie(
-                    Lmask,
-                    depth - 1,
-                    left_budget,
-                    pkL,
-                    cpathL,
-                    active_features
-                );
             }
-        } else {
-            left_node = nullptr;
-        }
 
-        int min_left =
-            left_node ? left_node->min_objective : numeric_limits<int>::max();
+            return construct_trie(
+                mask,
+                depth - 1,
+                node_budget,
+                pk,
+                cpath,
+                active_features
+            );
+        };
 
-        int right_budget =
-            (min_left == numeric_limits<int>::max()) ? -1 : budget - min_left;
+        auto solve_ordered = [&](
+            shared_ptr<TreeTrieNode>& first_node,
+            shared_ptr<TreeTrieNode>& second_node,
+            const Packed& first_mask,
+            const Packed& second_mask,
+            int first_loss,
+            int second_loss,
+            const PathKey& first_pk,
+            const PathKey& second_pk,
+            const ContinuousPath& first_cpath,
+            const ContinuousPath& second_cpath
+        ) {
+            int first_budget = first_node
+                ? first_node->budget
+                : std::numeric_limits<int>::min();
 
-        if (right_budget >= 0) {
-            if (right_node) {
-                right_node = construct_trie_extend(
-                    right_node,
-                    Rmask,
-                    depth - 1,
-                    right_budget,
-                    pkR,
-                    cpathR,
-                    active_features,
-                    launched_by_anytime
+            int second_budget = second_node
+                ? second_node->budget
+                : std::numeric_limits<int>::min();
+
+            int new_first_budget = budget - second_loss;
+
+            while (new_first_budget > first_budget) {
+                first_budget = new_first_budget;
+
+                first_node = solve_or_extend(
+                    first_node,
+                    first_mask,
+                    first_budget,
+                    first_pk,
+                    first_cpath
                 );
-            } else {
-                right_node = construct_trie(
-                    Rmask,
-                    depth - 1,
-                    right_budget,
-                    pkR,
-                    cpathR,
-                    active_features
-                );
-            }
-        } else {
-            right_node = nullptr;
-        }
 
-        int min_right =
-            right_node ? right_node->min_objective : numeric_limits<int>::max();
+                if (!first_node) {
+                    return;
+                }
 
-        while (true) {
-            bool changed = false;
+                const int new_second_budget =
+                    budget - first_node->min_objective;
 
-            const int new_left_budget =
-                (min_right == numeric_limits<int>::max())
-                    ? -1
-                    : budget - min_right;
+                if (new_second_budget > second_budget) {
+                    second_budget = new_second_budget;
 
-            if (new_left_budget > left_budget) {
-                left_budget = new_left_budget;
+                    second_node = solve_or_extend(
+                        second_node,
+                        second_mask,
+                        second_budget,
+                        second_pk,
+                        second_cpath
+                    );
 
-                if (left_budget >= 0) {
-                    if (left_node) {
-                        left_node = construct_trie_extend(
-                            left_node,
-                            Lmask,
-                            depth - 1,
-                            left_budget,
-                            pkL,
-                            cpathL,
-                            active_features,
-                            launched_by_anytime
-                        );
-                    } else {
-                        left_node = construct_trie(
-                            Lmask,
-                            depth - 1,
-                            left_budget,
-                            pkL,
-                            cpathL,
-                            active_features
-                        );
+                    if (!second_node) {
+                        return;
                     }
 
-                    const int new_min_left = left_node
-                        ? left_node->min_objective
-                        : numeric_limits<int>::max();
-
-                    if (new_min_left < min_left) {
-                        min_left = new_min_left;
-                        changed = true;
-                    }
+                    new_first_budget =
+                        budget - second_node->min_objective;
+                } else {
+                    break;
                 }
             }
+        };
 
-            const int new_right_budget =
-                (min_left == numeric_limits<int>::max())
-                    ? -1
-                    : budget - min_left;
+        const bool both_empty = (!left_node && !right_node);
+        const bool both_nonempty = (left_node && right_node);
 
-            if (new_right_budget > right_budget) {
-                right_budget = new_right_budget;
+        if (both_empty) {
+            solve_ordered(
+                left_node,
+                right_node,
+                Lmask,
+                Rmask,
+                loss_l,
+                loss_r,
+                pkL,
+                pkR,
+                cpathL,
+                cpathR
+            );
 
-                if (right_budget >= 0) {
-                    if (right_node) {
-                        right_node = construct_trie_extend(
-                            right_node,
-                            Rmask,
-                            depth - 1,
-                            right_budget,
-                            pkR,
-                            cpathR,
-                            active_features,
-                            launched_by_anytime
-                        );
-                    } else {
-                        right_node = construct_trie(
-                            Rmask,
-                            depth - 1,
-                            right_budget,
-                            pkR,
-                            cpathR,
-                            active_features
-                        );
-                    }
+            return {left_node, right_node};
+        }
 
-                    const int new_min_right = right_node
-                        ? right_node->min_objective
-                        : numeric_limits<int>::max();
+        if (!both_nonempty) {
+            return {nullptr, nullptr};
+        }
 
-                    if (new_min_right < min_right) {
-                        min_right = new_min_right;
-                        changed = true;
-                    }
-                }
-            }
+        const int left_budget = left_node->budget;
+        const int right_budget = right_node->budget;
 
-            if (!changed) {
-                break;
-            }
+        const int best_left_estimate =
+            std::min(loss_l, left_node->min_objective);
+
+        const int best_right_estimate =
+            std::min(loss_r, right_node->min_objective);
+
+        const int new_left_budget =
+            budget - best_right_estimate;
+
+        const int new_right_budget =
+            budget - best_left_estimate;
+
+        if (new_left_budget <= left_budget &&
+            new_right_budget <= right_budget) {
+            return {left_node, right_node};
+        }
+
+        if (new_left_budget > left_budget) {
+            solve_ordered(
+                left_node,
+                right_node,
+                Lmask,
+                Rmask,
+                best_left_estimate,
+                best_right_estimate,
+                pkL,
+                pkR,
+                cpathL,
+                cpathR
+            );
+        } else {
+            solve_ordered(
+                right_node,
+                left_node,
+                Rmask,
+                Lmask,
+                best_right_estimate,
+                best_left_estimate,
+                pkR,
+                pkL,
+                cpathR,
+                cpathL
+            );
         }
 
         return {left_node, right_node};
     }
 
+
+    
     shared_ptr<TreeTrieNode> construct_trie_extend(shared_ptr<TreeTrieNode> node, const Packed& mask, int8_t depth, int budget, const PathKey& pk, const ContinuousPath& cpath = empty_continuous_path(), const std::vector<int>* active_features = nullptr, bool launched_by_anytime = false) {
         if (!node) {
             return construct_trie(mask, depth, budget, pk, cpath,  active_features);
@@ -4912,13 +5096,21 @@ private:
                     cpathR_local
                 );
 
-                const int lossL = it->left
-                    ? it->left->min_objective
-                    : std::numeric_limits<int>::max();
+                const int lossL = proxy_completion_objective_(
+                    L,
+                    depth - 1,
+                    k_here,
+                    *pkLp,
+                    *cpathLp
+                );
 
-                const int lossR = it->right
-                    ? it->right->min_objective
-                    : std::numeric_limits<int>::max();
+                const int lossR = proxy_completion_objective_(
+                    R,
+                    depth - 1,
+                    k_here,
+                    *pkRp,
+                    *cpathRp
+                );
 
                 auto LR = solve_siblings_extend(
                     it->left,
@@ -5117,6 +5309,8 @@ private:
         // successful splits are stored persistently by node->add_split(feat, ...).
         // std::map<int, std::pair<int,int>> evaluated;
 
+        ContinuousPath q_cpath = materialize_continuous_path_(cpath);
+
         std::deque<std::pair<int,int>> Q;
         Q.push_back({start_idx, end_idx - 1});
 
@@ -5184,7 +5378,7 @@ private:
 
                         make_child_continuous_paths_if_needed_(
                             feat,
-                            cpath,
+                            q_cpath,
                             cpathLp,
                             cpathRp,
                             cpathL_local,
@@ -5247,12 +5441,14 @@ private:
 
             if (left_empty || right_empty) {
                 if (left_empty && !right_empty) {
+                    constrain_continuous_false_branch_(q_cpath, feat);
                     // threshold too low: all thresholds <= feat also have empty left.
                     // only higher thresholds can become valid.
                     if (feat + 1 <= j) {
                         Q.push_back({feat + 1, j});
                     }
                 } else if (!left_empty && right_empty) {
+                    constrain_continuous_true_branch_(q_cpath, feat);
                     // threshold too high: all thresholds >= feat also have empty right.
                     // only lower thresholds can become valid.
                     if (i <= feat - 1) {
@@ -5286,7 +5482,7 @@ private:
 
             make_child_continuous_paths_if_needed_(
                 feat,
-                cpath,
+                q_cpath,
                 cpathLp,
                 cpathRp,
                 cpathL_local,
@@ -5809,28 +6005,34 @@ private:
         int end_idx,
         const ContinuousPath& cpath
     ) const {
-        int lo = start_idx;
-        int hi = end_idx; // [lo, hi), by that i mean we have the first threshold of the feature, and the first threshold of the next feature
-
-        for (const auto& e : cpath) {
-            const int t = e.threshold_index;
-
-            if (t < start_idx || t >= end_idx) {
-                continue; // decision belongs to another continuous feature group
-            }
-
-            if (e.went_true) {
-                // we are in the x <= threshold branch.
-                // for nested <= thresholds, all thresholds >= t are now all-true
-                // on this subproblem, so they cannot produce a valid split.
-                hi = std::min(hi, t);
-            } else {
-                // we are in the x > threshold branch.
-                // all thresholds <= t are now all-false on this subproblem,
-                // so they cannot produce a valid split.
-                lo = std::max(lo, t + 1);
-            }
+        if (cpath.empty()) {
+            return {start_idx, end_idx};
         }
+
+        auto it = std::lower_bound(
+            continuous_starts.begin(),
+            continuous_starts.end(),
+            start_idx
+        );
+
+        if (it == continuous_starts.end() || *it != start_idx) {
+            return {start_idx, end_idx};
+        }
+
+        const int g = (int)std::distance(continuous_starts.begin(), it);
+
+        if (g < 0 || g >= (int)cpath.size()) {
+            return {start_idx, end_idx};
+        }
+
+        const ContinuousPathEntry& b = cpath[(std::size_t)g];
+
+        if (b.lo < 0 || b.hi < 0) {
+            return {start_idx, end_idx};
+        }
+
+        const int lo = std::max(start_idx, b.lo);
+        const int hi = std::min(end_idx, b.hi);
 
         return {lo, hi};
     }
@@ -5850,11 +6052,11 @@ private:
             return;
         }
 
-        cpathL_local = cpath;
-        cpathR_local = cpath;
+        cpathL_local = materialize_continuous_path_(cpath);
+        cpathR_local = cpathL_local;
 
-        cpathL_local.push_back(ContinuousPathEntry{feat, true});
-        cpathR_local.push_back(ContinuousPathEntry{feat, false});
+        constrain_continuous_true_branch_(cpathL_local, feat);
+        constrain_continuous_false_branch_(cpathR_local, feat);
 
         cpathLp = &cpathL_local;
         cpathRp = &cpathR_local;
@@ -5884,6 +6086,84 @@ private:
         return (cont_pos + 1 < (int)continuous_starts.size())
             ? continuous_starts[(size_t)(cont_pos + 1)]
             : n_features;
+    }
+
+    inline int continuous_group_pos_for_threshold_(int feat) const {
+        if (!is_continuous_threshold_feature_(feat)) {
+            return -1;
+        }
+
+        auto it = std::upper_bound(
+            continuous_starts.begin(),
+            continuous_starts.end(),
+            feat
+        );
+
+        if (it == continuous_starts.begin()) {
+            return -1;
+        }
+
+        const int g = (int)std::distance(continuous_starts.begin(), it) - 1;
+        const int end = continuous_group_end_(g);
+
+        if (feat < continuous_starts[(std::size_t)g] || feat >= end) {
+            return -1;
+        }
+
+        return g;
+    }
+
+    inline void initialize_continuous_path_(ContinuousPath& cpath) const {
+        cpath.resize((std::size_t)continuous_starts.size());
+
+        for (int g = 0; g < (int)continuous_starts.size(); ++g) {
+            cpath[(std::size_t)g].lo = continuous_starts[(std::size_t)g];
+            cpath[(std::size_t)g].hi = continuous_group_end_(g);
+        }
+    }
+
+    inline ContinuousPath materialize_continuous_path_(
+        const ContinuousPath& cpath
+    ) const {
+        if ((int)cpath.size() == (int)continuous_starts.size()) {
+            return cpath;
+        }
+
+        ContinuousPath out;
+        initialize_continuous_path_(out);
+        return out;
+    }
+
+    inline void constrain_continuous_true_branch_(
+        ContinuousPath& cpath,
+        int feat
+    ) const {
+        const int g = continuous_group_pos_for_threshold_(feat);
+        if (g < 0) return;
+
+        if ((int)cpath.size() != (int)continuous_starts.size()) {
+            initialize_continuous_path_(cpath);
+        }
+
+        // x <= feat, so thresholds >= feat are all-true on this child.
+        cpath[(std::size_t)g].hi =
+            std::min(cpath[(std::size_t)g].hi, feat);
+    }
+
+    inline void constrain_continuous_false_branch_(
+        ContinuousPath& cpath,
+        int feat
+    ) const {
+        const int g = continuous_group_pos_for_threshold_(feat);
+        if (g < 0) return;
+
+        if ((int)cpath.size() != (int)continuous_starts.size()) {
+            initialize_continuous_path_(cpath);
+        }
+
+        // x > feat, so thresholds <= feat are all-false on this child.
+        cpath[(std::size_t)g].lo =
+            std::max(cpath[(std::size_t)g].lo, feat + 1);
     }
 
     // best-search mode: equality is not useful, because we only need strict improvement.
@@ -6019,6 +6299,8 @@ private:
         
         std::map<int, std::pair<int,int>> evaluated;
 
+        ContinuousPath q_cpath = materialize_continuous_path_(cpath);
+
         std::deque<std::pair<int,int>> Q;
         Q.push_back({start_idx, end_idx - 1});
 
@@ -6057,10 +6339,12 @@ private:
 
             if (left_empty || right_empty) {
                 if (left_empty && !right_empty) {
+                    constrain_continuous_false_branch_(q_cpath, feat);
                     if (feat + 1 <= j) {
                         Q.push_back({feat + 1, j});
                     }
                 } else if (!left_empty && right_empty) {
+                    constrain_continuous_true_branch_(q_cpath, feat);
                     if (i <= feat - 1) {
                         Q.push_back({i, feat - 1});
                     }
@@ -6091,7 +6375,7 @@ private:
 
             make_child_continuous_paths_if_needed_(
                 feat,
-                cpath,
+                q_cpath,
                 cpathLp,
                 cpathRp,
                 cpathL_local,
