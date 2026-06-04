@@ -245,7 +245,7 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
     out.cdf_p.assign(V, {});
 
     // for each feature j, we aggregate a weighted empirical distribution of delta_correct = correct_orig - correct_scrambled
-    std::vector<std::unordered_map<int, double>> mass_by_delta(V); // maps feature, delta to mass
+    std::vector<std::unordered_map<double, double>> mass_by_delta(V); // maps feature, delta to mass
 
     for (int b = 0; b < n_bootstraps; ++b) {
         std::vector<int> idx;
@@ -296,11 +296,14 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
         cout << "Finished RID bootstrap: " << (b + 1) << " / " << n_bootstraps << " with " << T << " trees\n";
 
         // pre-sample permutations for each feature (one scramble per feature per bootstrap)
-        std::vector<std::vector<int>> perms((size_t)V);
-        for (int v = 0; v < V; ++v) make_permutation(n, rng, perms[(size_t)v]);
+        // std::vector<std::vector<int>> perms((size_t)V);
+        // for (int v = 0; v < V; ++v) make_permutation(n, rng, perms[(size_t)v]);
 
         // reuse buffer for column/block scrambling
         std::vector<std::vector<uint8_t>> saved_cols;
+
+        // hardcoded number of random scrambles per variable per bootstrap
+        const int n_scrambles_per_var = 5;
 
         const int budget_override = (int)llround((1.0 + rashomon_mult) * (double)model.result->min_objective);
         auto orig = model.get_all_predictions_packed_trie(Xb, budget_override);
@@ -322,20 +325,42 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
         
         for (int v = 0; v < V; ++v) {
             const std::vector<int>& cols = var_cols[(size_t)v];
-            scramble_block_inplace(Xb, cols, perms[(size_t)v], saved_cols);
 
-            auto scr = model.get_all_predictions_packed_trie(Xb, budget_override);
-            const uint64_t Tuse = Tvec;
+            // delta_sum_by_tree[t] accumulates correct_orig[t] - correct_scrambled[t]
+            // over multiple independent scrambles of the same variable.
+            std::vector<double> delta_sum_by_tree((size_t)Tvec, 0.0);
 
-            for (uint64_t t = 0; t < Tuse; ++t) {
-                const int correct_scr = count_correct_packed_multi(scr[(size_t)t].pred, y_bits, n_words, tail_mask);
-                const int delta_correct = correct_orig[(size_t)t] - correct_scr;
+            for (int s = 0; s < n_scrambles_per_var; ++s) {
+                std::vector<int> perm;
+                make_permutation(n, rng, perm);
 
-                out.mean_sub_mr[v] += wt_tree * ((double)delta_correct / (double)n);
-                mass_by_delta[v][delta_correct] += wt_tree;
+                scramble_block_inplace(Xb, cols, perm, saved_cols);
+
+                auto scr = model.get_all_predictions_packed_trie(Xb, budget_override);
+                const uint64_t Tuse = Tvec;
+
+                for (uint64_t t = 0; t < Tuse; ++t) {
+                    const int correct_scr = count_correct_packed_multi(
+                        scr[(size_t)t].pred,
+                        y_bits,
+                        n_words,
+                        tail_mask
+                    );
+
+                    delta_sum_by_tree[(size_t)t] +=
+                        (double)(correct_orig[(size_t)t] - correct_scr);
+                }
+
+                restore_block_inplace(Xb, cols, saved_cols);
             }
 
-            restore_block_inplace(Xb, cols, saved_cols);
+            for (uint64_t t = 0; t < Tvec; ++t) {
+                const double avg_delta_correct =
+                    delta_sum_by_tree[(size_t)t] / (double)n_scrambles_per_var;
+
+                out.mean_sub_mr[v] += wt_tree * (avg_delta_correct / (double)n);
+                mass_by_delta[v][avg_delta_correct] += wt_tree;
+            }
         }
 
         
