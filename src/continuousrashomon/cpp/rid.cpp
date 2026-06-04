@@ -367,10 +367,8 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
     }
 
     // build weighted CDF for each feature from the mass map
-    const double denom = (double)n_full;
-
     for (int v = 0; v < V; ++v) {
-        std::vector<std::pair<int, double>> items;
+        std::vector<std::pair<double, double>> items;
         items.reserve(mass_by_delta[v].size());
         for (const auto& kv : mass_by_delta[v]) items.push_back(kv);
 
@@ -382,7 +380,7 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
 
         double cum = 0.0;
         for (const auto& kv : items) {
-            const int delta = kv.first;
+            const double delta = kv.first;
             const double w = kv.second;
             cum += w;
             out.cdf_x[v].push_back((double)delta / (double)n_full);
