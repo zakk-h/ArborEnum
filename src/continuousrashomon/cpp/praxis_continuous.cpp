@@ -6724,15 +6724,22 @@ private:
             return leaf_objective(mask);
         }
 
+        const bool depthd_mode_matches_lickety = !use_restricted_depthd_exact_proxy_();
+
         if (depth_budget == 1) {
-            return depthd_exact_proxy_objective_(mask, 1, pk, cpath);
+            if (depthd_mode_matches_lickety) {
+                return depthd_exact_proxy_objective_(mask, 1, pk, cpath);
+            }
+
+            return greedy_proxy_objective_(mask, 1, pk, cpath);
         }
+
 
         if (k > depth_budget - 1) {
             k = depth_budget - 1;
         }
 
-        if (k == depth_budget - 1) {
+        if (k == depth_budget - 1 && depthd_mode_matches_lickety) {
             return depthd_exact_proxy_objective_(mask, depth_budget, pk, cpath);
         }
 
@@ -10941,10 +10948,22 @@ private:
     int lickety_split_k1(const Packed& mask, int8_t depth_budget, const PathKey& pk)
     {
         if (depth_budget == 0) return leaf_objective(mask);
-        if (depth_budget == 1) return depthd_exact_proxy_objective_(mask, 1, pk);
-        if (depth_budget == 2) return depthd_exact_proxy_objective_(mask, 2, pk);
+        const bool depthd_mode_matches_lickety = use_restricted_depthd_exact_proxy_();
 
-        // ---- caching (k=1 => use K2 cache) ----
+        if (depth_budget == 1) {
+            if (depthd_mode_matches_lickety) {
+                return depthd_exact_proxy_objective_(mask, 1, pk);
+            }
+
+            return greedy_proxy_objective_(mask, 1, pk);
+        }
+
+        if (depth_budget == 2 && depthd_mode_matches_lickety) {
+                return depthd_exact_proxy_objective_(mask, 2, pk);
+        }
+
+        // TODO, this is an isue with anytime, we need to use K3 if we're going to do anytime
+        // (k=1 so use K2 cache)
         uint64_t kmask = 0;
         K2 key2{0, depth_budget};
 
@@ -11031,15 +11050,25 @@ private:
             return lickety_split_k1(mask, depth_budget, pk);
         }
 
+        const bool depthd_mode_matches_lickety = use_restricted_depthd_exact_proxy_();
+
         if (depth_budget == 0) {
             return leaf_objective(mask);
         }
-        if (depth_budget == 1) return depthd_exact_proxy_objective_(mask, 1, pk);
+
+        if (depth_budget == 1) {
+            if (depthd_mode_matches_lickety) {
+                return depthd_exact_proxy_objective_(mask, 1, pk);
+            }
+
+            return greedy_proxy_objective_(mask, 1, pk);
+        }
+       
 
         if (k > depth_budget - 1) k = depth_budget - 1;
 
-        if (depth_budget == 2 && k == 1) return depthd_exact_proxy_objective_(mask, 2, pk);
-        if (k == depth_budget - 1) {
+        if (depth_budget == 2 && k == 1 && depthd_mode_matches_lickety) return depthd_exact_proxy_objective_(mask, 2, pk);
+        if (k == depth_budget - 1 && depthd_mode_matches_lickety) {
             return depthd_exact_proxy_objective_(mask, depth_budget, pk);
         }
 
