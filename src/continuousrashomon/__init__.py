@@ -3,7 +3,11 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import FancyBboxPatch, Circle
 from matplotlib.lines import Line2D
 from matplotlib.cm import get_cmap
-from ._core import PRAXIS as _PRAXISCore, rid_subtractive_model_reliance as _rid_subtractive_core
+from ._core import (
+    PRAXIS as _PRAXISCore,
+    rid_subtractive_model_reliance as _rid_subtractive_core,
+    rid_subtractive_model_reliance_continuous as _rid_subtractive_continuous_core,
+)
 from ._threshold_guessing import ThresholdGuessBinarizer
 
 __all__ = ["PRAXIS", "ThresholdGuessBinarizer"]
@@ -513,6 +517,13 @@ class PRAXIS:
     def count_trees(self):
         return self._model.count_trees()
 
+    def count_distinct_or_nodes(self):
+        return self._model.count_distinct_or_nodes()
+
+    def count_graph_features(self):
+        return self._model.count_graph_features()
+
+
     def get_min_objective(self):
         return self._model.get_min_objective()
 
@@ -856,6 +867,79 @@ class PRAXIS:
             bool(memory_efficient),
             binning_map,
         )
+        return self._rid_out
+
+    def compute_rid_continuous(
+        self,
+        X_num,
+        y,
+        X_bin=None,
+        X_active=None,
+        n_boot=10,
+        lambda_reg=0.01,
+        depth_budget=5,
+        rashomon_mult=0.03,
+        lookahead_k=1,
+        seed=0,
+        memory_efficient=False,
+        use_anytime_fit=False,
+        refinement_width=1,
+        max_refinement_rounds=-1,
+    ):
+        X_num = np.asarray(X_num, dtype=np.float64)
+        y = np.asarray(y, dtype=int)
+
+        if X_num.ndim != 2:
+            raise ValueError(f"X_num must be 2D, got shape {X_num.shape}")
+        if y.ndim != 1:
+            raise ValueError(f"y must be 1D, got shape {y.shape}")
+
+        n = X_num.shape[0]
+        if y.shape[0] != n:
+            raise ValueError(
+                f"y length must match X_num rows: got len(y)={y.shape[0]}, "
+                f"X_num rows={n}"
+            )
+
+        if X_bin is None:
+            X_bin = np.empty((n, 0), dtype=np.uint8)
+        else:
+            X_bin = np.asarray(X_bin, dtype=np.uint8)
+            if X_bin.ndim != 2:
+                raise ValueError(f"X_bin must be 2D, got shape {X_bin.shape}")
+            if X_bin.shape[0] != n:
+                raise ValueError(
+                    f"X_bin rows must match X_num rows: got {X_bin.shape[0]} vs {n}"
+                )
+
+        if X_active is None:
+            X_active = np.empty((n, 0), dtype=np.uint8)
+        else:
+            X_active = np.asarray(X_active, dtype=np.uint8)
+            if X_active.ndim != 2:
+                raise ValueError(f"X_active must be 2D, got shape {X_active.shape}")
+            if X_active.shape[0] != n:
+                raise ValueError(
+                    f"X_active rows must match X_num rows: got {X_active.shape[0]} vs {n}"
+                )
+
+        self._rid_out = _rid_subtractive_continuous_core(
+            X_num,
+            X_bin,
+            y,
+            X_active,
+            int(n_boot),
+            float(lambda_reg),
+            int(depth_budget),
+            float(rashomon_mult),
+            int(lookahead_k),
+            int(seed),
+            bool(memory_efficient),
+            bool(use_anytime_fit),
+            int(refinement_width),
+            int(max_refinement_rounds),
+        )
+
         return self._rid_out
     
     def _require_rid(self):

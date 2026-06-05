@@ -88,6 +88,54 @@ numpy_int_1d_to_vector(
     return std::vector<int>(ptr, ptr + n);
 }
 
+static int
+find_closest_full_binary_column(
+    const std::vector<std::vector<uint8_t>>& X_full,
+    const std::vector<uint8_t>& active_col
+) {
+    const int n = (int)X_full.size();
+    if (n == 0) {
+        throw std::runtime_error("X_full has zero rows.");
+    }
+
+    const int d = (int)X_full[0].size();
+    if ((int)active_col.size() != n) {
+        throw std::runtime_error("active_col length does not match X_full rows.");
+    }
+
+    int best_idx = -1;
+    int best_dist = std::numeric_limits<int>::max();
+
+    for (int f = 0; f < d; ++f) {
+        int dist = 0;
+
+        for (int i = 0; i < n; ++i) {
+            const uint8_t a = active_col[(std::size_t)i] ? 1 : 0;
+            const uint8_t b = X_full[(std::size_t)i][(std::size_t)f] ? 1 : 0;
+            dist += (a != b);
+        }
+
+        if (dist < best_dist) {
+            best_dist = dist;
+            best_idx = f;
+
+            if (best_dist == 0) break;
+        }
+    }
+
+    if (best_idx < 0) {
+        throw std::runtime_error("Failed to snap active feature to full binarized feature.");
+    }
+
+    return best_idx;
+}
+
+static void
+sort_unique_ints(std::vector<int>& xs) {
+    std::sort(xs.begin(), xs.end());
+    xs.erase(std::unique(xs.begin(), xs.end()), xs.end());
+}
+
 static PRAXIS::KeyMode
 parse_key_mode(const std::string& key_mode_str) {
     if (key_mode_str == "exact" || key_mode_str == "bitvector") {
@@ -567,6 +615,16 @@ PYBIND11_MODULE(_core, m) {
                  return self.result ? self.result->count_trees() : 0ULL;
              })
 
+        .def("count_distinct_or_nodes",
+             [](const PRAXIS &self) {
+                 return self.count_distinct_or_nodes();
+             })
+
+        .def("count_graph_features",
+             [](const PRAXIS &self) {
+                 return self.count_graph_features();
+             })
+
         .def("get_min_objective",
              [](PRAXIS &self) {
                  return self.result
@@ -833,6 +891,224 @@ PYBIND11_MODULE(_core, m) {
         py::arg("seed") = 0,
         py::arg("memory_efficient") = false,
         py::arg("binning_map") = py::none()
+    );
+
+    m.def(
+        "rid_subtractive_model_reliance_continuous",
+        [](py::array_t<double,  py::array::c_style | py::array::forcecast> X_num,
+        py::array_t<uint8_t, py::array::c_style | py::array::forcecast> X_bin,
+        py::array_t<int,     py::array::c_style | py::array::forcecast> y,
+        py::array_t<uint8_t, py::array::c_style | py::array::forcecast> X_active,
+        int n_boot,
+        double lambda_reg,
+        int depth_budget,
+        double rashomon_mult,
+        int lookahead_k,
+        std::uint64_t seed,
+        bool memory_efficient,
+        bool use_anytime_fit,
+        int refinement_width,
+        int max_refinement_rounds) {
+
+            py::buffer_info num_info = X_num.request();
+            py::buffer_info bin_info = X_bin.request();
+            py::buffer_info yinfo = y.request();
+            py::buffer_info active_info = X_active.request();
+
+            if (num_info.ndim != 2) throw std::runtime_error("X_num must be 2D.");
+            if (bin_info.ndim != 2) throw std::runtime_error("X_bin must be 2D.");
+            if (yinfo.ndim != 1) throw std::runtime_error("y must be 1D.");
+            if (active_info.ndim != 2) throw std::runtime_error("X_active must be 2D.");
+
+            const int n_num = static_cast<int>(num_info.shape[0]);
+            const int p_num = static_cast<int>(num_info.shape[1]);
+
+            const int n_bin = static_cast<int>(bin_info.shape[0]);
+            const int p_bin = static_cast<int>(bin_info.shape[1]);
+
+            const int n_active = static_cast<int>(active_info.shape[0]);
+            const int p_active = static_cast<int>(active_info.shape[1]);
+
+            const int n_y = static_cast<int>(yinfo.shape[0]);
+
+            if (n_num != n_bin) {
+                throw std::runtime_error("X_num and X_bin must have the same number of rows.");
+            }
+            if (n_active != n_num) {
+                throw std::runtime_error("X_active and X_num must have the same number of rows.");
+            }
+            if (n_y != n_num) {
+                throw std::runtime_error("y length must match X_num/X_bin rows.");
+            }
+
+            const int n = n_num;
+
+            auto* num_ptr = static_cast<double*>(num_info.ptr);
+            auto* bin_ptr = static_cast<uint8_t*>(bin_info.ptr);
+            auto* y_ptr = static_cast<int*>(yinfo.ptr);
+            auto* active_ptr = static_cast<uint8_t*>(active_info.ptr);
+
+            std::vector<int> y_vec(y_ptr, y_ptr + n);
+
+            std::vector<std::vector<uint8_t>> X_full(
+                (std::size_t)n,
+                std::vector<uint8_t>{}
+            );
+
+            for (int i = 0; i < n; ++i) {
+                X_full[(std::size_t)i].reserve(
+                    (std::size_t)(p_bin + p_num * 8)
+                );
+            }
+
+            std::vector<std::vector<int>> groups;
+            groups.reserve((std::size_t)(p_bin + p_num));
+
+            std::vector<int> continuous_starts;
+
+            // ordinary binary features.
+            for (int j = 0; j < p_bin; ++j) {
+                const int col_idx = (int)X_full[0].size();
+                groups.push_back(std::vector<int>{col_idx});
+
+                for (int i = 0; i < n; ++i) {
+                    const uint8_t v =
+                        bin_ptr[
+                            (std::size_t)i * (std::size_t)p_bin +
+                            (std::size_t)j
+                        ];
+
+                    X_full[(std::size_t)i].push_back(v ? 1 : 0);
+                }
+            }
+
+            // fully threshold-binarize numerical features.
+            for (int j = 0; j < p_num; ++j) {
+                std::vector<double> vals;
+                vals.reserve((std::size_t)n);
+
+                for (int i = 0; i < n; ++i) {
+                    vals.push_back(
+                        num_ptr[
+                            (std::size_t)i * (std::size_t)p_num +
+                            (std::size_t)j
+                        ]
+                    );
+                }
+
+                std::sort(vals.begin(), vals.end());
+                vals.erase(std::unique(vals.begin(), vals.end()), vals.end());
+
+                // constant numeric feature has no nontrivial threshold column.
+                if (vals.size() <= 1) {
+                    continue;
+                }
+
+                const int group_start = (int)X_full[0].size();
+                continuous_starts.push_back(group_start);
+
+                std::vector<int> this_group;
+                this_group.reserve(vals.size() - 1);
+
+                // thresholds are x <= unique_value for every unique value except the max one (last)
+                for (std::size_t q = 0; q + 1 < vals.size(); ++q) {
+                    const double thr = vals[q];
+                    const int col_idx = (int)X_full[0].size();
+
+                    this_group.push_back(col_idx);
+
+                    for (int i = 0; i < n; ++i) {
+                        const double xij =
+                            num_ptr[
+                                (std::size_t)i * (std::size_t)p_num +
+                                (std::size_t)j
+                            ];
+
+                        X_full[(std::size_t)i].push_back(xij <= thr ? 1 : 0);
+                    }
+                }
+
+                groups.push_back(std::move(this_group));
+            }
+
+            if (X_full.empty() || X_full[0].empty()) {
+                throw std::runtime_error(
+                    "Continuous RID produced zero binary features."
+                );
+            }
+
+            // snap user-provided active/proxy columns to the full binarized columns.
+            std::vector<int> proxy_threshold_features;
+            proxy_threshold_features.reserve((std::size_t)p_active);
+
+            for (int a = 0; a < p_active; ++a) {
+                std::vector<uint8_t> active_col((std::size_t)n, 0);
+
+                for (int i = 0; i < n; ++i) {
+                    active_col[(std::size_t)i] =
+                        active_ptr[
+                            (std::size_t)i * (std::size_t)p_active +
+                            (std::size_t)a
+                        ] ? 1 : 0;
+                }
+
+                const int snapped =
+                    find_closest_full_binary_column(X_full, active_col);
+
+                proxy_threshold_features.push_back(snapped);
+            }
+
+            sort_unique_ints(proxy_threshold_features);
+
+            if (use_anytime_fit &&
+                !continuous_starts.empty() &&
+                proxy_threshold_features.empty()) {
+                throw std::runtime_error(
+                    "Anytime continuous RID requires nonempty X_active so proxy features can be snapped."
+                );
+            }
+
+            RIDResult r = compute_rid_subtractive_mr_bootstrap(
+                X_full,
+                y_vec,
+                n_boot,
+                lambda_reg,
+                depth_budget,
+                rashomon_mult,
+                lookahead_k,
+                seed,
+                memory_efficient,
+                groups,
+                continuous_starts,
+                use_anytime_fit,
+                proxy_threshold_features,
+                refinement_width,
+                max_refinement_rounds
+            );
+
+            py::dict out;
+            out["mean_sub_mr"] = r.mean_sub_mr;
+            out["cdf_x"] = r.cdf_x;
+            out["cdf_p"] = r.cdf_p;
+            out["proxy_threshold_features"] = proxy_threshold_features;
+            out["continuous_starts"] = continuous_starts;
+            out["binning_map"] = groups;
+            return out;
+        },
+        py::arg("X_num"),
+        py::arg("X_bin"),
+        py::arg("y"),
+        py::arg("X_active"),
+        py::arg("n_boot") = 10,
+        py::arg("lambda_reg") = 0.01,
+        py::arg("depth_budget") = 5,
+        py::arg("rashomon_mult") = 0.05,
+        py::arg("lookahead_k") = 1,
+        py::arg("seed") = 0,
+        py::arg("memory_efficient") = false,
+        py::arg("use_anytime_fit") = false,
+        py::arg("refinement_width") = 1,
+        py::arg("max_refinement_rounds") = -1
     );
 
 

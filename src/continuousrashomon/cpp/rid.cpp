@@ -220,7 +220,12 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
     int lookahead_k,
     uint64_t seed,
     bool memory_efficient,
-    const std::vector<std::vector<int>>& binning_map_vars = {}
+    const std::vector<std::vector<int>>& binning_map_vars = {},
+    const std::vector<int>& continuous_starts = {},
+    bool use_anytime_fit = false,
+    const std::vector<int>& proxy_threshold_features = {},
+    int refinement_width = 1,
+    int max_refinement_rounds = -1
 ) {
     const int n_full = (int)X_row_major.size();
     const int d = (int)X_row_major[0].size();
@@ -269,27 +274,58 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
         rowmajor_to_colmajor_bool(Xb, Xcol);
 
         PRAXIS model;
-        model.fit(
-            Xcol,
-            yb,
-            lambda,
-            depth_budget,
-            rashomon_mult,
-            lookahead_k,
-            -1,                    // root_budget
-            true,                  // use_multipass
-            false,                 // rule_list_mode
-            0,                     // proxy_style
-            false,                 // majority_leaf_only
-            false,                 // cache_cheap_subproblems
-            true,                  // proxy_caching
-            std::vector<int>{},    // allowed_proxy_features: empty means all features
-            false,                 // restrict_proxy_in_lickety
-            false,                 // restrict_proxy_in_depthd_exact
-            false,                 // restrict_proxy_in_greedy
-            true,                  // rashomon_mode
-            std::vector<int>{}     // continuous_starts
-        );
+
+        if (use_anytime_fit) {
+            if (!continuous_starts.empty() && proxy_threshold_features.empty()) {
+                throw std::runtime_error(
+                    "Anytime RID needs nonempty proxy_threshold_features. "
+                    "Pass X_active to the continuous RID wrapper so active columns can be snapped."
+                );
+            }
+
+            model.fit_anytime(
+                Xcol,
+                yb,
+                lambda,
+                static_cast<int8_t>(depth_budget),
+                rashomon_mult,
+                static_cast<int8_t>(lookahead_k),
+                true,                         // use_multipass
+                false,                        // rule_list_mode
+                0,                            // proxy_style
+                false,                        // majority_leaf_only
+                false,                        // cache_cheap_subproblems
+                true,                         // proxy_caching
+                proxy_threshold_features,      // snapped active proxy thresholds
+                refinement_width,
+                max_refinement_rounds,
+                false,                        // increase_proxy_anytime
+                continuous_starts
+            );
+        } else {
+            model.fit(
+                Xcol,
+                yb,
+                lambda,
+                depth_budget,
+                rashomon_mult,
+                lookahead_k,
+                -1,                           // root_budget
+                true,                         // use_multipass
+                false,                        // rule_list_mode
+                0,                            // proxy_style
+                false,                        // majority_leaf_only
+                false,                        // cache_cheap_subproblems
+                true,                         // proxy_caching
+                proxy_threshold_features,           // allowed_proxy_features
+                !proxy_threshold_features.empty(),                        // restrict_proxy_in_lickety
+                !proxy_threshold_features.empty(),                        // restrict_proxy_in_depthd_exact
+                !proxy_threshold_features.empty(),                        // restrict_proxy_in_greedy
+                true,                         // rashomon_mode
+                continuous_starts
+            );
+        }
+
         const uint64_t T64 = model.result ? model.result->count_trees() : 0ULL;
         const int T = (int)T64;
         if (T == 0) continue;
@@ -306,11 +342,95 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
         const int n_scrambles_per_var = 5;
 
         const int budget_override = (int)llround((1.0 + rashomon_mult) * (double)model.result->min_objective);
+        if (memory_efficient) {
+            // memory-efficient method:
+            // use only trees within budget_override. if there are too many,
+            // uniformly sample 1000 objective-sorted tree indices from [0, T_budget - 1].
+
+            const uint64_t T_budget =
+                model.result ? model.result->count_leq(budget_override) : 0ULL;
+
+            if (T_budget == 0) continue;
+
+            std::vector<uint64_t> tree_indices;
+
+            if (T_budget <= 1000ULL) {
+                tree_indices.reserve((size_t)T_budget);
+                for (uint64_t t = 0; t < T_budget; ++t) {
+                    tree_indices.push_back(t);
+                }
+            } else {
+                tree_indices.reserve(1000);
+
+                std::unordered_set<uint64_t> seen;
+                seen.reserve(2048);
+
+                std::uniform_int_distribution<uint64_t> unif_tree(0ULL, T_budget - 1ULL);
+
+                while (tree_indices.size() < 1000) {
+                    const uint64_t t = unif_tree(rng);
+                    if (seen.insert(t).second) {
+                        tree_indices.push_back(t);
+                    }
+                }
+
+                std::sort(tree_indices.begin(), tree_indices.end());
+            }
+
+            const uint64_t Tvec = (uint64_t)tree_indices.size();
+
+            std::vector<int> correct_orig;
+            correct_orig.reserve((size_t)Tvec);
+
+            for (uint64_t k = 0; k < Tvec; ++k) {
+                const uint64_t t = tree_indices[(size_t)k];
+                const auto preds_orig = model.get_predictions(t, Xb);
+                correct_orig.push_back(count_correct(preds_orig, yb));
+            }
+
+            const double wt_tree = 1.0 / ((double)n_bootstraps * (double)Tvec);
+
+            for (int v = 0; v < V; ++v) {
+                const std::vector<int>& cols = var_cols[(size_t)v];
+
+                std::vector<double> delta_sum_by_tree((size_t)Tvec, 0.0);
+
+                for (int s = 0; s < n_scrambles_per_var; ++s) {
+                    std::vector<int> perm;
+                    make_permutation(n, rng, perm);
+
+                    scramble_block_inplace(Xb, cols, perm, saved_cols);
+
+                    for (uint64_t k = 0; k < Tvec; ++k) {
+                        const uint64_t t = tree_indices[(size_t)k];
+
+                        const auto preds_scr = model.get_predictions(t, Xb);
+                        const int correct_scr = count_correct(preds_scr, yb);
+
+                        delta_sum_by_tree[(size_t)k] +=
+                            (double)(correct_orig[(size_t)k] - correct_scr);
+                    }
+
+                    restore_block_inplace(Xb, cols, saved_cols);
+                }
+
+                for (uint64_t k = 0; k < Tvec; ++k) {
+                    const double avg_delta_correct =
+                        delta_sum_by_tree[(size_t)k] / (double)n_scrambles_per_var;
+
+                    out.mean_sub_mr[v] += wt_tree * (avg_delta_correct / (double)n);
+                    mass_by_delta[v][avg_delta_correct] += wt_tree;
+                }
+            }
+
+            continue;
+        }
+
         auto orig = model.get_all_predictions_packed_trie(Xb, budget_override);
         const uint64_t Tvec = (uint64_t)orig.size();
 
         if (Tvec == 0) continue;
-        
+
         // weight per tree per bootstrap
         const double wt_tree = 1.0 / ((double)n_bootstraps * (double)Tvec); // we may return more trees than we use (within new budget), so Tvec here
 

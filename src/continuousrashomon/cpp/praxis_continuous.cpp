@@ -103,9 +103,11 @@ static inline int popcount_and_words(
     return (int)total;
 #else
     int total = 0;
+
     for (int i = 0; i < n_words; ++i) {
         total += popcnt64(a[i] & b[i]);
     }
+
     return total;
 #endif
 }
@@ -1036,6 +1038,182 @@ private:
         return H;
     }
 
+        int canonical_graph_feature_id_(int feat) const {
+        if (feat < 0 || feat >= n_features) {
+            throw std::runtime_error("canonical_graph_feature_id_ got out-of-range feature.");
+        }
+
+        const int first_cont = first_continuous_feature_();
+
+        // ordinary binary feature.
+        if (feat < first_cont) {
+            return feat;
+        }
+
+        // continuous threshold feature: map every threshold in the same
+        // continuous group to one canonical id.
+        auto it = std::upper_bound(
+            continuous_starts.begin(),
+            continuous_starts.end(),
+            feat
+        );
+
+        if (it == continuous_starts.begin()) {
+            // should not happen
+            return feat;
+        }
+
+        const int cont_pos = (int)std::distance(
+            continuous_starts.begin(),
+            it - 1
+        );
+
+        const int group_start = continuous_starts[(size_t)cont_pos];
+        const int group_end = continuous_group_end_(cont_pos);
+
+        if (feat >= group_start && feat < group_end) {
+            // Put pontinuous-group ids after ordinary binary-feature ids.
+            return first_cont + cont_pos;
+        }
+
+        // should not happen
+        return feat;
+    }
+
+    void collect_graph_feature_ids_(
+        const std::shared_ptr<TreeTrieNode>& node,
+        std::unordered_set<int>& seen
+    ) const {
+        if (!node) return;
+
+        for (const auto& s : node->splits) {
+            seen.insert(canonical_graph_feature_id_(s.feature));
+
+            collect_graph_feature_ids_(s.left, seen);
+            collect_graph_feature_ids_(s.right, seen);
+        }
+    }
+
+    struct ExactMaskDepthKey {
+        std::string bytes;
+        int depth;
+
+        bool operator==(const ExactMaskDepthKey& o) const {
+            return depth == o.depth && bytes == o.bytes;
+        }
+
+        struct Hash {
+            size_t operator()(const ExactMaskDepthKey& x) const noexcept {
+                size_t h = std::hash<std::string>{}(x.bytes);
+                size_t d = (size_t)x.depth;
+                h ^= d + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+                return h;
+            }
+        };
+    };
+
+    ExactMaskDepthKey exact_mask_depth_key_(
+        const Packed& mask,
+        int depth
+    ) const {
+        ExactMaskDepthKey key;
+        key.depth = depth;
+
+        const size_t bytes = (size_t)n_words * sizeof(uint64_t);
+        key.bytes.resize(bytes);
+
+        for (int i = 0; i < n_words; ++i) {
+            uint64_t x = mask.w[(size_t)i];
+            if (i == n_words - 1) {
+                x &= tail_mask;
+            }
+
+            std::memcpy(
+                &key.bytes[(size_t)i * sizeof(uint64_t)],
+                &x,
+                sizeof(uint64_t)
+            );
+        }
+
+        return key;
+    }
+
+    void collect_graph_subproblem_depth_pairs_(
+        const std::shared_ptr<TreeTrieNode>& node,
+        const Packed& mask,
+        int depth,
+        std::unordered_set<
+            ExactMaskDepthKey,
+            ExactMaskDepthKey::Hash
+        >& seen
+    ) const {
+        if (!node) return;
+
+        seen.insert(exact_mask_depth_key_(mask, depth));
+
+        if (depth <= 0) return;
+
+        Packed L(n_words), R(n_words);
+
+        for (const auto& s : node->splits) {
+            and_bits(mask, X_bits[(size_t)s.feature], L);
+            andnot_bits(mask, X_bits[(size_t)s.feature], R);
+
+            collect_graph_subproblem_depth_pairs_(
+                s.left,
+                L,
+                depth - 1,
+                seen
+            );
+
+            collect_graph_subproblem_depth_pairs_(
+                s.right,
+                R,
+                depth - 1,
+                seen
+            );
+        }
+    }
+
+        void collect_distinct_or_nodes_(
+            const std::shared_ptr<TreeTrieNode>& node,
+            std::unordered_set<const TreeTrieNode*>& seen
+        ) const {
+            if (!node) return;
+
+            const TreeTrieNode* ptr = node.get();
+
+            // already counted this OR node through another parent/path.
+            if (seen.find(ptr) != seen.end()) {
+                return;
+            }
+
+            // a TreeTrieNode is an OR node: it stores leaf options and split options.
+            if (!node->leaves.empty() || !node->splits.empty()) {
+                seen.insert(ptr);
+            }
+
+            for (const auto& s : node->splits) {
+                collect_distinct_or_nodes_(s.left, seen);
+                collect_distinct_or_nodes_(s.right, seen);
+            }
+        }
+
+    Packed root_mask_() const {
+        Packed root(n_words);
+
+        if (n_words <= 0) {
+            return root;
+        }
+
+        for (int i = 0; i < n_words - 1; ++i) {
+            root.w[(size_t)i] = ~0ULL;
+        }
+
+        root.w[(size_t)(n_words - 1)] = tail_mask;
+        return root;
+    }
+
 
     // count the distinct subproblems/bitvectors/literals/fingerprints, not considering depth or greedy/lickety
     size_t count_distinct_subproblems_union() const {
@@ -1124,6 +1302,56 @@ public:
 
     int get_greedy_continuous_mode() const {
         return greedy_continuous_mode == GreedyContinuousMode::BINARY ? 0 : 1;
+    }
+
+    size_t count_graph_features() const {
+        if (!result) {
+            return 0;
+        }
+
+        std::unordered_set<int> seen;
+        seen.reserve(128);
+
+        collect_graph_feature_ids_(result, seen);
+
+        return seen.size();
+    }
+
+    size_t count_graph_subproblem_depth_pairs() const {
+        if (!result) {
+            return 0;
+        }
+
+        Packed root = root_mask_();
+
+        std::unordered_set<
+            ExactMaskDepthKey,
+            ExactMaskDepthKey::Hash
+        > seen;
+
+        seen.reserve(1024);
+
+        collect_graph_subproblem_depth_pairs_(
+            result,
+            root,
+            trained_depth_budget,
+            seen
+        );
+
+        return seen.size();
+    }
+
+    size_t count_distinct_or_nodes() const {
+        if (!result) {
+            return 0;
+        }
+
+        std::unordered_set<const TreeTrieNode*> seen;
+        seen.reserve(1024);
+
+        collect_distinct_or_nodes_(result, seen);
+
+        return seen.size();
     }
 
     void prepare_continuous_data(
