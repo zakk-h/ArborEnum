@@ -812,7 +812,10 @@ private:
     unordered_map<K2, int, K2::Hash> greedy_cache;
     unordered_map<K2,  int, K2::Hash>  lickety_cache_k2; // used when lookahead_init <= 1
     unordered_map<KLA, int, KLA::Hash>  lickety_cache_kla; // used when lookahead_init > 1
+
     unordered_map<K2, GreedyObjFirstSplit, K2::Hash> greedy_first_split_cache;
+    unordered_map<K2, int, K2::Hash> anytime_lickety_first_split_cache;
+    bool anytime_mode_active_ = false;
 
     // unordered_map<K3, shared_ptr<TreeTrieNode>, K3::Hash> trie_cache; // if trie_cache_enabled is on
     unordered_map<K2, shared_ptr<TreeTrieNode>, K2::Hash> trie_cache; // canonical node per (subproblem, depth)
@@ -916,6 +919,36 @@ private:
         return !use_restricted_lickety_proxy_()
             && use_restricted_greedy_proxy_()
             && use_restricted_depthd_exact_proxy_();
+    }
+
+    inline bool anytime_continuous_lickety_k1_first_split_enabled_() const {
+        return anytime_mode_active_
+            && lookahead_init == 1
+            && proxy_style == 0
+            && !use_restricted_lickety_proxy_();
+    }
+
+    inline int lookup_anytime_lickety_first_split_(
+        const Packed& mask,
+        int8_t depth,
+        const PathKey& pk
+    ) const {
+        if (!anytime_continuous_lickety_k1_first_split_enabled_()) {
+            return -1;
+        }
+
+        const uint64_t k = key_of_subproblem(mask, pk);
+        auto it = anytime_lickety_first_split_cache.find(K2{k, depth});
+
+        if (it == anytime_lickety_first_split_cache.end()) {
+            return -1;
+        }
+
+        return it->second;
+    }
+
+    inline bool feature_in_sorted_vector_(const std::vector<int>& xs, int f) const {
+        return std::binary_search(xs.begin(), xs.end(), f);
     }
 
     // inline int greedy_proxy_objective_(
@@ -1846,6 +1879,9 @@ public:
         int refinement_width,
         int max_refinement_rounds,
         bool increase_proxy_anytime,
+        bool continuous_proxy_in_lickety,
+        bool continuous_proxy_in_depthd_exact,
+        bool continuous_proxy_in_greedy,
         const std::vector<int>& continuous_starts_in
     ) {
         clear_fit_state_();
@@ -1971,7 +2007,10 @@ public:
             proxy_threshold_features,
             refinement_width,
             max_refinement_rounds,
-            increase_proxy_anytime
+            increase_proxy_anytime,
+            continuous_proxy_in_lickety,
+            continuous_proxy_in_depthd_exact,
+            continuous_proxy_in_greedy
         );
 
         cout << "Anytime minimum objective: " << result->min_objective << "\n";
@@ -1997,7 +2036,10 @@ public:
         const std::vector<int>& proxy_threshold_features,
         int refinement_width,
         int max_refinement_rounds = -1,
-        bool increase_proxy_anytime = false
+        bool increase_proxy_anytime = false,
+        bool continuous_proxy_in_lickety = false,
+        bool continuous_proxy_in_depthd_exact = false,
+        bool continuous_proxy_in_greedy = false
     ) {
         if (!has_prepared_data) {
             throw std::runtime_error(
@@ -2035,6 +2077,9 @@ public:
             refinement_width,
             max_refinement_rounds,
             increase_proxy_anytime,
+            continuous_proxy_in_lickety,
+            continuous_proxy_in_depthd_exact,
+            continuous_proxy_in_greedy,
             prepared_continuous_starts
         );
     }
@@ -2249,7 +2294,10 @@ public:
         const std::vector<int>& proxy_threshold_features,
         int refinement_width,
         int max_refinement_rounds = -1,
-        bool increase_proxy_anytime = false
+        bool increase_proxy_anytime = false,
+        bool continuous_proxy_in_lickety = false,
+        bool continuous_proxy_in_depthd_exact = false,
+        bool continuous_proxy_in_greedy = false
     ) {
         if (n_samples <= 0 || n_features <= 0 || n_words <= 0) {
             throw std::runtime_error(
@@ -2310,9 +2358,13 @@ public:
         const bool old_restrict_greedy = restrict_proxy_in_greedy;
 
         allowed_proxy_features = B_proxy;
-        restrict_proxy_in_lickety = true;
-        restrict_proxy_in_depthd_exact = true;
-        restrict_proxy_in_greedy = true;
+
+        restrict_proxy_in_lickety = !continuous_proxy_in_lickety;
+        restrict_proxy_in_depthd_exact = !continuous_proxy_in_depthd_exact;
+        restrict_proxy_in_greedy = !continuous_proxy_in_greedy;
+
+        anytime_mode_active_ = true;
+        anytime_lickety_first_split_cache.clear();
 
         int P_root;
 
@@ -2385,6 +2437,12 @@ public:
             ++refinement_round;
         }
 
+        // done using continuous Lickety's k=1 first-split suggestions to augment
+        // the active threshold set. from here on, the active set is fixed and
+        // lookahead may increase, so the first-split cache should be disabled.
+        anytime_mode_active_ = false;
+        anytime_lickety_first_split_cache.clear();
+
         // after all active-threshold refinement is done, optionally increase the
         // proxy lookahead. This can recover splits that were previously pruned by
         // a weaker proxy. The root graph G_min is kept and extended in place.
@@ -2452,6 +2510,7 @@ public:
         restrict_proxy_in_lickety = old_restrict_lickety;
         restrict_proxy_in_depthd_exact = old_restrict_depthd;
         restrict_proxy_in_greedy = old_restrict_greedy;
+        anytime_mode_active_ = false;
 
         result = G_min;
         obj_bound = eps_abs;
@@ -2614,8 +2673,11 @@ private:
         lickety_cache_kla.clear();
         trie_cache.clear();
         greedy_first_split_cache.clear();
+        anytime_lickety_first_split_cache.clear();
+        anytime_mode_active_ = false;
 
         continuous_proxy_completion_cache.clear();
+        
 
         mask_ids = MaskIdTable();
         lit_ids = LitIdTable();
@@ -3285,18 +3347,33 @@ private:
     ) {
         if (!node || !active_features || start_idx >= end_idx) return;
 
-        std::vector<int> active_thresholds;
+        // for (int f : *active_features) {
+        //     if (f >= start_idx && f < end_idx) {
+        //         active_thresholds.push_back(f);
+        //     }
+        // }
 
-        // TODO can make this a binary search for start and end since sorted
-        for (int f : *active_features) {
-            if (f >= start_idx && f < end_idx) {
-                active_thresholds.push_back(f);
-            }
+        const auto active_lo = std::lower_bound(
+            active_features->begin(),
+            active_features->end(),
+            start_idx
+        );
+
+        const auto active_hi = std::lower_bound(
+            active_features->begin(),
+            active_features->end(),
+            end_idx
+        );
+
+        const bool have_active_thresholds = active_lo != active_hi;
+
+        std::span<const int> active_thresholds;
+        if (have_active_thresholds) {
+            active_thresholds = std::span<const int>(
+                &(*active_lo),
+                (std::size_t)std::distance(active_lo, active_hi)
+            );
         }
-
-        sort_unique_ints_inplace_(active_thresholds);
-
-        if (active_thresholds.empty()) return;
 
         const int raw_start_idx = raw_continuous_start_for_threshold_(start_idx);
 
@@ -3307,6 +3384,17 @@ private:
             continuous_proxy_completion_cache[cache_key];
 
         ContinuousPath q_cpath = materialize_continuous_path_(cpath);
+
+        const int anytime_lk1_feat =
+            lookup_anytime_lickety_first_split_(mask, depth, pk);
+
+        const bool anytime_lk1_feat_in_this_group =
+            anytime_lk1_feat >= start_idx && anytime_lk1_feat < end_idx;
+
+        const bool anytime_lk1_feat_already_active =
+            anytime_lk1_feat_in_this_group &&
+            feature_in_sorted_vector_(*active_features, anytime_lk1_feat);
+            
 
         std::deque<std::pair<int,int>> Q;
 
@@ -3440,6 +3528,79 @@ private:
 
             return true;
         };
+
+        // if continuous Lickety k=1 chose a threshold outside the active set,
+        // try to add/extend that exact split. 
+        if (anytime_lk1_feat_in_this_group && !anytime_lk1_feat_already_active) {
+            const int feat = anytime_lk1_feat;
+
+            split_threshold_bits_(mask, feat, L, R);
+
+            if (L.any() && R.any()) {
+                const PathKey* pkLp = &empty_pk();
+                const PathKey* pkRp = &empty_pk();
+
+                PathKey pkL_local;
+                PathKey pkR_local;
+
+                make_child_pks_if_needed_(
+                    feat,
+                    pk,
+                    pkLp,
+                    pkRp,
+                    pkL_local,
+                    pkR_local
+                );
+
+                const ContinuousPath* cpathLp = &cpath;
+                const ContinuousPath* cpathRp = &cpath;
+
+                ContinuousPath cpathL_local;
+                ContinuousPath cpathR_local;
+
+                make_child_continuous_paths_if_needed_(
+                    feat,
+                    q_cpath,
+                    cpathLp,
+                    cpathRp,
+                    cpathL_local,
+                    cpathR_local
+                );
+
+                const int lossL = proxy_completion_objective_(
+                    L,
+                    depth - 1,
+                    k_here,
+                    *pkLp,
+                    *cpathLp
+                );
+
+                const int lossR = proxy_completion_objective_(
+                    R,
+                    depth - 1,
+                    k_here,
+                    *pkRp,
+                    *cpathRp
+                );
+
+                evaluated[feat] = {lossL, lossR};
+
+                const int total_proxy = lossL + lossR;
+
+                const bool feasible =
+                    !rule_list_mode
+                        ? (total_proxy <= budget)
+                        : !(lossL > budget - gamma && lossR > budget - gamma);
+
+                if (feasible) {
+                    resolve_threshold(feat, lossL, lossR);
+                }
+            }
+        }
+
+        if (active_thresholds.empty()) {
+            return;
+        }
 
         std::map<int,int> pruned_intervals;
 
@@ -3815,6 +3976,13 @@ private:
                 ? k_at_depth[depth - 1]
                 : lookahead_init;
 
+        const int anytime_lk1_feat =
+            lookup_anytime_lickety_first_split_(mask, depth, pk);
+
+        const bool anytime_lk1_feat_missing_from_active =
+            anytime_lk1_feat >= 0 &&
+            !feature_in_sorted_vector_(B_active, anytime_lk1_feat);
+
         const std::size_t split_count_before = G->splits.size();
 
         // post-order: first refine children of the splits that already existed.
@@ -3885,7 +4053,14 @@ private:
 
             // for binary features, we need to do one of the things that enumerate_continuous_feature_for_trie_extend_restricted does for continuous
             // we need to resolve thresholds after we refined them with iterative budget refinement, because of what is below
-            if (s.feature < first_continuous_feature_()) {
+            const bool is_binary_feature =
+                s.feature < first_continuous_feature_();
+
+            const bool is_missing_anytime_lk1_feature =
+                anytime_lk1_feat_missing_from_active &&
+                s.feature == anytime_lk1_feat;
+
+            if (is_binary_feature || is_missing_anytime_lk1_feature) {
                 const int lossL = proxy_completion_objective_(
                     L,
                     depth - 1,
@@ -7030,6 +7205,10 @@ private:
 
             ans = std::min(ans, left_loss + right_loss);
             ans = std::min(ans, best_sum);
+        }
+
+        if (anytime_continuous_lickety_k1_first_split_enabled_() && k == 1 && best_feat >= 0) {
+            anytime_lickety_first_split_cache[key2] = best_feat;
         }
 
         if (proxy_caching_enabled) {

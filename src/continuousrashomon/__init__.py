@@ -264,6 +264,10 @@ class PRAXIS:
         proxy_threshold_features=None,
         refinement_width=1,
         max_refinement_rounds=-1,
+        increase_proxy_anytime=False,
+        continuous_proxy_in_lickety=False,
+        continuous_proxy_in_depthd_exact=False,
+        continuous_proxy_in_greedy=False,
         continuous_starts=None,
         trie_cache_enabled=True,
     ):
@@ -337,6 +341,9 @@ class PRAXIS:
             int(refinement_width),
             int(max_refinement_rounds),
             bool(increase_proxy_anytime),
+            bool(continuous_proxy_in_lickety),
+            bool(continuous_proxy_in_depthd_exact),
+            bool(continuous_proxy_in_greedy),
             continuous_starts_vec,
         )
 
@@ -473,6 +480,9 @@ class PRAXIS:
         refinement_width=1,
         max_refinement_rounds=-1,
         increase_proxy_anytime=False,
+        continuous_proxy_in_lickety=False,
+        continuous_proxy_in_depthd_exact=False,
+        continuous_proxy_in_greedy=False,
         trie_cache_enabled=True,
     ):
         proxy_style_int = parse_proxy_style(proxy_style)
@@ -505,6 +515,9 @@ class PRAXIS:
             int(refinement_width),
             int(max_refinement_rounds),
             bool(increase_proxy_anytime),
+            bool(continuous_proxy_in_lickety),
+            bool(continuous_proxy_in_depthd_exact),
+            bool(continuous_proxy_in_greedy),
         )
 
         return self

@@ -300,6 +300,9 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
                 refinement_width,
                 max_refinement_rounds,
                 false,                        // increase_proxy_anytime
+                true, // continuous proxy use (1/3)
+                true,
+                true,
                 continuous_starts
             );
         } else {
