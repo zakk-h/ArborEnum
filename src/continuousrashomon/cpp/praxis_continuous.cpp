@@ -10864,23 +10864,35 @@ private:
     }
 
     int depth1_exact_solver_cached(const Packed& mask, const PathKey& pk) {
-        // const uint64_t kmask = key_of_subproblem(mask, pk);
-        // constexpr int DEPTH = 1;
-        // constexpr int KTAG  = 0;
-
-        // int cached;
-        // if (try_get_lickety_cached_(kmask, DEPTH, KTAG, cached)) return cached;
-
         constexpr int8_t DEPTH = 1;
         constexpr int8_t KTAG  = 0;
+
+        const bool use_greedy_cache_for_depth1 =
+            should_route_continuous_lickety_depth1_to_binary_greedy_();
 
         uint64_t kmask = 0;
         int cached;
 
         if (proxy_caching_enabled) {
             kmask = key_of_subproblem(mask, pk);
-            if (try_get_lickety_cached_(kmask, DEPTH, KTAG, cached)) return cached;
+
+            if (use_greedy_cache_for_depth1) {
+                auto it = greedy_cache.find(K2{kmask, DEPTH});
+                if (it != greedy_cache.end()) return it->second;
+            } else {
+                if (try_get_lickety_cached_(kmask, DEPTH, KTAG, cached)) return cached;
+            }
         }
+
+        auto cache_depth1 = [&](int val, bool allow_cache) {
+            if (!proxy_caching_enabled || !allow_cache) return;
+
+            if (use_greedy_cache_for_depth1) {
+                greedy_cache.emplace(K2{kmask, DEPTH}, val);
+            } else {
+                cache_lickety_if_true_(kmask, DEPTH, KTAG, val, /*allow_cache=*/true);
+            }
+        };
 
         if (num_classes == 2) {
             int n_sub, pos_total;
@@ -10890,9 +10902,7 @@ private:
 
             // only cache cheap subproblems if flag enabled
             if (leaf_loss <= 2 * gamma) {
-                if (proxy_caching_enabled) {
-                    cache_lickety_if_true_(kmask, DEPTH, KTAG, leaf_loss,/*allow_cache=*/cache_cheap_subproblems);
-                }
+                cache_depth1(leaf_loss, cache_cheap_subproblems);
                 return leaf_loss;
             }
 
@@ -10933,9 +10943,11 @@ private:
             }
 
             int ans = leaf_loss;
-            if (best_sum != std::numeric_limits<int>::max()) ans = std::min(ans, best_sum);
+            if (best_sum != std::numeric_limits<int>::max()) {
+                ans = std::min(ans, best_sum);
+            }
 
-            if (proxy_caching_enabled) cache_lickety_if_true_(kmask, DEPTH, KTAG, ans, /*allow_cache=*/true);
+            cache_depth1(ans, /*allow_cache=*/true);
             return ans;
         }
 
@@ -10943,9 +10955,7 @@ private:
 
         // only cache cheap subproblems if flag enabled
         if (leaf_loss <= 2 * gamma) {
-            if (proxy_caching_enabled) {
-                cache_lickety_if_true_(kmask, DEPTH, KTAG, leaf_loss,/*allow_cache=*/cache_cheap_subproblems);
-            }
+            cache_depth1(leaf_loss, cache_cheap_subproblems);
             return leaf_loss;
         }
 
@@ -10970,9 +10980,11 @@ private:
         }
 
         int ans = leaf_loss;
-        if (best_sum != std::numeric_limits<int>::max()) ans = std::min(ans, best_sum);
+        if (best_sum != std::numeric_limits<int>::max()) {
+            ans = std::min(ans, best_sum);
+        }
 
-        if (proxy_caching_enabled) cache_lickety_if_true_(kmask, DEPTH, KTAG, ans, /*allow_cache=*/true);
+        cache_depth1(ans, /*allow_cache=*/true);
         return ans;
     }
 
