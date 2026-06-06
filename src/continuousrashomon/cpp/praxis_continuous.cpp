@@ -513,6 +513,12 @@ struct KLA {
     };
 };
 
+struct GreedyObjFirstSplit {
+    int obj = std::numeric_limits<int>::max();
+    int first_feat = -1;
+};
+
+
 struct KContProxy {
     uint64_t k; // 64-bit fingerprint or interning id
     int depth;
@@ -806,6 +812,7 @@ private:
     unordered_map<K2, int, K2::Hash> greedy_cache;
     unordered_map<K2,  int, K2::Hash>  lickety_cache_k2; // used when lookahead_init <= 1
     unordered_map<KLA, int, KLA::Hash>  lickety_cache_kla; // used when lookahead_init > 1
+    unordered_map<K2, GreedyObjFirstSplit, K2::Hash> greedy_first_split_cache;
 
     // unordered_map<K3, shared_ptr<TreeTrieNode>, K3::Hash> trie_cache; // if trie_cache_enabled is on
     unordered_map<K2, shared_ptr<TreeTrieNode>, K2::Hash> trie_cache; // canonical node per (subproblem, depth)
@@ -899,6 +906,18 @@ private:
         return !allowed_proxy_features.empty() && restrict_proxy_in_lickety;
     }
 
+    inline bool should_add_continuous_greedy_split_to_binary_lickety_() const {
+        return use_restricted_lickety_proxy_()
+            && !restrict_proxy_in_greedy
+            && greedy_continuous_mode == GreedyContinuousMode::BINARY;
+    }
+
+    inline bool should_route_continuous_lickety_depth1_to_binary_greedy_() const {
+        return !use_restricted_lickety_proxy_()
+            && use_restricted_greedy_proxy_()
+            && use_restricted_depthd_exact_proxy_();
+    }
+
     // inline int greedy_proxy_objective_(
     //     const Packed& mask,
     //     int8_t depth,
@@ -943,10 +962,23 @@ private:
             return train_greedy(mask, depth_budget, pk);
         }
 
-        // unrestricted greedy: choose how continuous features are evaluated.
         if (greedy_continuous_mode == GreedyContinuousMode::BINARY) {
+            if (should_add_continuous_greedy_split_to_binary_lickety_()) {
+                return train_greedy_continuous_with_first_split_(
+                    mask,
+                    depth_budget,
+                    pk,
+                    cpath
+                ).obj;
+            }
+
             // scan fully binarized threshold columns by continuous group.
-            return train_greedy_continuous(mask, depth_budget, pk, cpath);
+            return train_greedy_continuous(
+                mask,
+                depth_budget,
+                pk,
+                cpath
+            );
         }
 
         // use raw numerical sorted lists for continuous features.
@@ -961,6 +993,14 @@ private:
     ) {
         if (use_restricted_depthd_exact_proxy_()) {
             return depthd_exact_solver_cached(mask, depth, pk);
+        }
+
+        if (depth == 1 && should_add_continuous_greedy_split_to_binary_lickety_()) {
+            return depth1_exact_solver_cached_continuous_with_first_split_(
+                mask,
+                pk,
+                cpath
+            ).obj;
         }
  
         return depthd_exact_solver_cached_continuous(mask, depth, pk, cpath);
@@ -1298,6 +1338,7 @@ public:
         }
 
         greedy_cache.clear();
+        greedy_first_split_cache.clear();
     }
 
     int get_greedy_continuous_mode() const {
@@ -2572,6 +2613,7 @@ private:
         lickety_cache_k2.clear();
         lickety_cache_kla.clear();
         trie_cache.clear();
+        greedy_first_split_cache.clear();
 
         continuous_proxy_completion_cache.clear();
 
@@ -6480,6 +6522,43 @@ private:
         return {i, j};
     }
 
+    template <typename EvalFeatureFn>
+    void maybe_eval_continuous_greedy_suggested_split_(
+        const Packed& mask,
+        int8_t depth_budget,
+        const PathKey& pk,
+        const std::vector<int>& feats,
+        EvalFeatureFn&& eval_feature
+    ) {
+        if (!should_add_continuous_greedy_split_to_binary_lickety_()) {
+            return;
+        }
+
+        if (feats.empty()) {
+            return; // already scanning all features
+        }
+
+        const GreedyObjFirstSplit g =
+            train_greedy_continuous_with_first_split_(
+                mask,
+                depth_budget,
+                pk,
+                empty_continuous_path()
+            );
+
+        const int gf = g.first_feat;
+
+        if (gf < 0 || gf >= n_features) {
+            return;
+        }
+
+        if (std::binary_search(feats.begin(), feats.end(), gf)) {
+            return; // already evaluated by binary Lickety
+        }
+
+        eval_feature(gf);
+    }
+
     int eval_with_lookahead_continuous(
         const Packed& mask,
         int8_t depth_budget,
@@ -6725,8 +6804,9 @@ private:
         }
 
         const bool depthd_mode_matches_lickety = !use_restricted_depthd_exact_proxy_();
+        const bool not_greedy_opt_binarized = !should_route_continuous_lickety_depth1_to_binary_greedy_();
 
-        if (depth_budget == 1) {
+        if (depth_budget == 1 && not_greedy_opt_binarized) {
             if (depthd_mode_matches_lickety) {
                 return depthd_exact_proxy_objective_(mask, 1, pk, cpath);
             }
@@ -6739,7 +6819,7 @@ private:
             k = depth_budget - 1;
         }
 
-        if (k == depth_budget - 1 && depthd_mode_matches_lickety) {
+        if (k == depth_budget - 1 && depthd_mode_matches_lickety && not_greedy_opt_binarized) {
             return depthd_exact_proxy_objective_(mask, depth_budget, pk, cpath);
         }
 
@@ -8646,6 +8726,130 @@ private:
         return ans;
     }
 
+    GreedyObjFirstSplit depth1_exact_solver_cached_continuous_with_first_split_(
+        const Packed& mask,
+        const PathKey& pk,
+        const ContinuousPath& cpath = empty_continuous_path()
+    ) {
+        constexpr int8_t depth_budget = 1;
+
+        K2 key{0, depth_budget};
+
+        if (proxy_caching_enabled) {
+            key.k = key_of_subproblem(mask, pk);
+
+            if (auto it = greedy_first_split_cache.find(key);
+                it != greedy_first_split_cache.end()) {
+                return it->second;
+            }
+        }
+
+        int n_sub = 0;
+        int pos = 0;
+        int leaf_loss = 0;
+
+        if (num_classes == 2) {
+            count_total_pos_binary(mask, n_sub, pos);
+            leaf_loss = leaf_objective_binary_from_counts(n_sub, pos);
+        } else {
+            n_sub = count_total(mask);
+            leaf_loss = leaf_objective(mask);
+        }
+
+        if (leaf_loss <= 2 * gamma) {
+            GreedyObjFirstSplit out{leaf_loss, -1};
+
+            if (proxy_caching_enabled) {
+                greedy_first_split_cache.emplace(key, out);
+            }
+
+            return out;
+        }
+
+        int best_sum = leaf_loss;
+        int best_feat = -1;
+
+        Packed L(n_words), R(n_words);
+
+        const int F = n_features;
+        const int first_cont = first_continuous_feature_();
+
+        // ordinary binary features
+        for (int f = 0; f < first_cont; ++f) {
+            if (num_classes == 2) {
+                int left_n = 0;
+                split_bits_count_left(mask, X_bits[f], L, R, left_n);
+
+                if (left_n == 0 || left_n == n_sub) {
+                    continue;
+                }
+            } else {
+                and_bits(mask, X_bits[f], L);
+                andnot_bits(mask, X_bits[f], R);
+
+                if (!L.any() || !R.any()) {
+                    continue;
+                }
+            }
+
+            const int sum = leaf_objective(L) + leaf_objective(R);
+
+            if (sum < best_sum) {
+                best_sum = sum;
+                best_feat = f;
+            }
+        }
+
+        // continuous threshold groups
+        for (int cont_pos = 0;
+            cont_pos < (int)continuous_starts.size();
+            ++cont_pos) {
+            const int raw_start = continuous_starts[(size_t)cont_pos];
+            const int raw_end = continuous_group_end_(cont_pos);
+
+            if (raw_start >= F) {
+                continue;
+            }
+
+            auto [start_idx, end_idx] =
+                tighten_continuous_interval_from_path_(
+                    raw_start,
+                    std::min(raw_end, F),
+                    cpath
+                );
+
+            if (start_idx >= end_idx) {
+                continue;
+            }
+
+            ContinuousBestSplitResult cres =
+                search_continuous_feature_for_best_split_continuous_(
+                    mask,
+                    /*depth_budget=*/1,
+                    /*child_k=*/-1,
+                    pk,
+                    cpath,
+                    start_idx,
+                    end_idx,
+                    best_sum,
+                    ContinuousEvalMode::Exact
+                );
+
+            if (cres.best_feat >= 0 && cres.best_sum < best_sum) {
+                best_sum = cres.best_sum;
+                best_feat = cres.best_feat;
+            }
+        }
+
+        GreedyObjFirstSplit out{best_sum, best_feat};
+
+        if (proxy_caching_enabled) {
+            greedy_first_split_cache.emplace(key, out);
+        }
+
+        return out;
+    }
+
     struct GainSplitResult {
         double score = -std::numeric_limits<double>::infinity();
         int feat = -1;
@@ -10303,6 +10507,250 @@ private:
         return ans;
     }
 
+    GreedyObjFirstSplit train_greedy_continuous_with_first_split_(
+        const Packed& mask,
+        int8_t depth_budget,
+        const PathKey& pk,
+        const ContinuousPath& cpath = empty_continuous_path()
+    ) {
+        if (depth_budget <= 0) {
+            return GreedyObjFirstSplit{leaf_objective(mask), -1};
+        }
+
+        // last split level: use exact stump optimization, continuous version
+        if (depth_budget == 1 && (greedy_split_mode == 1 || greedy_split_mode == 2)) {
+            return depth1_exact_solver_cached_continuous_with_first_split_(
+                mask,
+                pk,
+                cpath
+            );
+        }
+
+        uint64_t kmask = 0;
+        K2 key{0, depth_budget};
+
+        if (proxy_caching_enabled) {
+            kmask = key_of_subproblem(mask, pk);
+            key.k = kmask;
+
+            if (auto it = greedy_first_split_cache.find(key);
+                it != greedy_first_split_cache.end()) {
+                return it->second;
+            }
+        }
+
+        int n_sub = 0;
+        int pos = 0;
+        int leaf_loss = 0;
+
+        std::vector<int> parent_counts;
+
+        if (num_classes == 2) {
+            count_total_pos_binary(mask, n_sub, pos);
+            leaf_loss = leaf_objective_binary_from_counts(n_sub, pos);
+        } else {
+            n_sub = count_total(mask);
+            count_per_class(mask, parent_counts);
+            leaf_loss = leaf_objective(mask);
+        }
+
+        if (leaf_loss <= 2 * gamma) {
+            GreedyObjFirstSplit out{leaf_loss, -1};
+            if (cache_cheap_subproblems && proxy_caching_enabled) {
+                greedy_first_split_cache.emplace(key, out);
+            }
+
+            return out;
+        }
+
+        GainSplitResult best;
+        best.score = -std::numeric_limits<double>::infinity();
+        best.feat = -1;
+
+        const int F = n_features;
+        const int first_cont = first_continuous_feature_();
+
+        // prdinary binary features.
+        if (num_classes == 2) {
+            GainSplitResult bres = best_binary_score_split_(
+                mask,
+                /*first_feat=*/0,
+                /*end_feat=*/first_cont,
+                n_sub,
+                pos
+            );
+
+            if (bres.feat >= 0 && bres.score > best.score) {
+                best = bres;
+            }
+        } else {
+            GainSplitResult bres = best_binary_score_split_multiclass_(
+                mask,
+                /*first_feat=*/0,
+                /*end_feat=*/first_cont,
+                n_sub,
+                parent_counts
+            );
+
+            if (bres.feat >= 0 && bres.score > best.score) {
+                best = bres;
+            }
+        }
+
+        // continuous threshold groups
+        for (int cont_pos = 0; cont_pos < (int)continuous_starts.size(); ++cont_pos) {
+            const int raw_start = continuous_starts[(size_t)cont_pos];
+            const int raw_end = continuous_group_end_(cont_pos);
+
+            if (raw_start >= F) continue;
+
+            auto [start_idx, end_idx] =
+                tighten_continuous_interval_from_path_(
+                    raw_start,
+                    std::min(raw_end, F),
+                    cpath
+                );
+
+            if (start_idx >= end_idx) continue;
+
+            GainSplitResult cres;
+
+            if (num_classes == 2) {
+                cres = best_continuous_score_split_(
+                    mask,
+                    start_idx,
+                    end_idx,
+                    n_sub,
+                    pos
+                );
+            } else {
+                cres = best_continuous_score_split_multiclass_(
+                    mask,
+                    start_idx,
+                    end_idx,
+                    n_sub,
+                    parent_counts
+                );
+            }
+
+            if (cres.feat >= 0 && cres.score > best.score) {
+                best = cres;
+            }
+        }
+
+        if (best.feat < 0) {
+            GreedyObjFirstSplit out{leaf_loss, -1};
+            if (proxy_caching_enabled) {
+                greedy_first_split_cache.emplace(key, out);
+            }
+
+            return out;
+        }
+
+        Packed L(n_words), R(n_words);
+        split_threshold_bits_(mask, best.feat, L, R);
+
+        if (!L.any() || !R.any()) {
+            GreedyObjFirstSplit out{leaf_loss, -1};
+            if (proxy_caching_enabled) {
+                greedy_first_split_cache.emplace(key, out);
+            }
+
+            return out;
+        }
+
+        // special greedy depth-2 case:
+        // greedy already chose the root split best.feat.
+        // now solve the two depth-1 child problems simultaneously.
+        // if (depth_budget == 2) {
+        //     const PathKey* pkLp = &empty_pk();
+        //     const PathKey* pkRp = &empty_pk();
+
+        //     PathKey pkL_local;
+        //     PathKey pkR_local;
+
+        //     make_child_pks_if_needed_(
+        //         best.feat,
+        //         pk,
+        //         pkLp,
+        //         pkRp,
+        //         pkL_local,
+        //         pkR_local
+        //     );
+
+        //     const int split_loss =
+        //         special_depth2_fixed_root_split_sum_bitvector_(
+        //             L,
+        //             R,
+        //             *pkLp,
+        //             *pkRp,
+        //             leaf_loss
+        //         );
+
+        //     const int ans = std::min(leaf_loss, split_loss);
+
+        //     if (proxy_caching_enabled) {
+        //         greedy_cache.emplace(key, ans);
+        //     }
+
+        //     return ans;
+        // }
+
+        const PathKey* pkLp = &empty_pk();
+        const PathKey* pkRp = &empty_pk();
+
+        PathKey pkL_local;
+        PathKey pkR_local;
+
+        make_child_pks_if_needed_(
+            best.feat,
+            pk,
+            pkLp,
+            pkRp,
+            pkL_local,
+            pkR_local
+        );
+
+        const ContinuousPath* cpathLp = &cpath;
+        const ContinuousPath* cpathRp = &cpath;
+
+        ContinuousPath cpathL_local;
+        ContinuousPath cpathR_local;
+
+        make_child_continuous_paths_if_needed_(
+            best.feat,
+            cpath,
+            cpathLp,
+            cpathRp,
+            cpathL_local,
+            cpathR_local
+        );
+
+        const int left_loss = train_greedy_continuous_with_first_split_(
+            L,
+            depth_budget - 1,
+            *pkLp,
+            *cpathLp
+        ).obj;
+
+        const int right_loss = train_greedy_continuous_with_first_split_(
+            R,
+            depth_budget - 1,
+            *pkRp,
+            *cpathRp
+        ).obj;
+
+        const int split_loss = left_loss + right_loss;
+        const int ans = std::min(leaf_loss, split_loss);
+
+        GreedyObjFirstSplit out{ans, best.feat};
+        if (proxy_caching_enabled) {
+            greedy_first_split_cache.emplace(key, out); 
+        }
+
+        return out;
+    }
+
     // end continuous land
 
     
@@ -10950,12 +11398,8 @@ private:
         if (depth_budget == 0) return leaf_objective(mask);
         const bool depthd_mode_matches_lickety = use_restricted_depthd_exact_proxy_();
 
-        if (depth_budget == 1) {
-            if (depthd_mode_matches_lickety) {
+        if (depth_budget == 1 && depthd_mode_matches_lickety) {
                 return depthd_exact_proxy_objective_(mask, 1, pk);
-            }
-
-            return greedy_proxy_objective_(mask, 1, pk);
         }
 
         if (depth_budget == 2 && depthd_mode_matches_lickety) {
@@ -11015,9 +11459,21 @@ private:
         };
 
         if (feats.empty()) {
-            for (int f = 0; f < n_features; ++f) eval_feature(f);
+            for (int f = 0; f < n_features; ++f) {
+                eval_feature(f);
+            }
         } else {
-            for (int f : feats) eval_feature(f);
+            for (int f : feats) {
+                eval_feature(f);
+            }
+
+            maybe_eval_continuous_greedy_suggested_split_(
+                mask,
+                depth_budget,
+                pk,
+                feats,
+                eval_feature
+            );
         }
 
         int ans = leaf_loss;
@@ -11056,12 +11512,8 @@ private:
             return leaf_objective(mask);
         }
 
-        if (depth_budget == 1) {
-            if (depthd_mode_matches_lickety) {
-                return depthd_exact_proxy_objective_(mask, 1, pk);
-            }
-
-            return greedy_proxy_objective_(mask, 1, pk);
+        if (depth_budget == 1 && depthd_mode_matches_lickety) {
+            return depthd_exact_proxy_objective_(mask, 1, pk); // if this operates over continuous, at least as good as binarized. if it is binarized, same thing. either way is good.
         }
        
 
@@ -11131,9 +11583,21 @@ private:
         };
 
         if (feats.empty()) {
-            for (int f = 0; f < n_features; ++f) eval_feature(f);
+            for (int f = 0; f < n_features; ++f) {
+                eval_feature(f);
+            }
         } else {
-            for (int f : feats) eval_feature(f);
+            for (int f : feats) {
+                eval_feature(f);
+            }
+
+            maybe_eval_continuous_greedy_suggested_split_(
+                mask,
+                depth_budget,
+                pk,
+                feats,
+                eval_feature
+            );
         }
 
         if (best_feat >= 0) {
