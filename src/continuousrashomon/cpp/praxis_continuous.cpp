@@ -1388,7 +1388,57 @@ private:
         return seen.size();
     }
 
-    
+    std::vector<double> threshold_values_for_numeric_feature_(
+        const std::vector<double>& sorted_unique_vals,
+        int max_number_thresholds_per_feature
+    ) const {
+        if (sorted_unique_vals.size() <= 1) {
+            return {};
+        }
+
+        const int candidate_count =
+            static_cast<int>(sorted_unique_vals.size()) - 1;
+
+        if (
+            max_number_thresholds_per_feature <= 0 ||
+            candidate_count <= max_number_thresholds_per_feature
+        ) {
+            return std::vector<double>(
+                sorted_unique_vals.begin(),
+                sorted_unique_vals.end() - 1
+            );
+        }
+
+        std::vector<double> thresholds;
+        thresholds.reserve(
+            static_cast<std::size_t>(max_number_thresholds_per_feature)
+        );
+
+        // quantile-spaced over the valid split candidates:
+        // sorted_unique_vals[0], ..., sorted_unique_vals[end - 2].
+        // sorted_unique_vals.back() is excluded because x <= max is trivial.
+        for (int j = 1; j <= max_number_thresholds_per_feature; ++j) {
+            int idx = static_cast<int>(
+                std::floor(
+                    (static_cast<double>(j) * candidate_count) /
+                    static_cast<double>(max_number_thresholds_per_feature + 1)
+                )
+            );
+
+            if (idx < 0) idx = 0;
+            if (idx >= candidate_count) idx = candidate_count - 1;
+
+            thresholds.push_back(sorted_unique_vals[(std::size_t)idx]);
+        }
+
+        thresholds.erase(
+            std::unique(thresholds.begin(), thresholds.end()),
+            thresholds.end()
+        );
+
+        return thresholds;
+    }    
+
 
 public:
     shared_ptr<TreeTrieNode> result;
@@ -1507,7 +1557,8 @@ public:
         const std::vector<std::vector<double>>& X_num_row_major,
         const std::vector<std::vector<uint8_t>>& X_bin_row_major,
         const std::vector<int>& y,
-        const std::vector<std::vector<uint8_t>>& X_active_row_major
+        const std::vector<std::vector<uint8_t>>& X_active_row_major,
+        int max_number_thresholds_per_feature = -1
     ) {
         validate_rectangular_matrix_(X_num_row_major, "X_num_row_major");
         validate_rectangular_matrix_(X_bin_row_major, "X_bin_row_major");
@@ -1570,13 +1621,23 @@ public:
             // constant numeric feature contributes no threshold columns.
             if (vals.size() <= 1) continue;
 
+            std::vector<double> threshold_vals =
+                threshold_values_for_numeric_feature_(
+                    vals,
+                    max_number_thresholds_per_feature
+                );
+
+            if (threshold_vals.empty()) continue;
+
             const int group_start = (int)X_cols.size();
             cont_starts.push_back(group_start);
 
-            // vals[q] corresponds to threshold column group_start + q,
-            // for q = 0, ..., vals.size() - 2.
-            // vals.back() has no threshold column because x <= max is trivial.
-            numerical_unique_values_for_greedy_local.push_back(vals);
+            // numerical_unique_values_for_greedy_local must stay aligned with
+            // the actual threshold columns. Each value except the last
+            // corresponds to one threshold column; the last is a sentinel max.
+            std::vector<double> stored_vals = threshold_vals;
+            stored_vals.push_back(vals.back());
+            numerical_unique_values_for_greedy_local.push_back(std::move(stored_vals));
 
             // store the raw numerical column corresponding to this continuous group.
             std::vector<double> col_num((std::size_t)n);
@@ -1604,10 +1665,9 @@ public:
             numerical_cols_for_greedy.push_back(std::move(col_num));
             numerical_global_sorted_idx_local.push_back(std::move(order));
 
-            // use every unique value except the last as a <= threshold.
-            for (std::size_t t = 0; t + 1 < vals.size(); ++t) {
-                const double thr = vals[t];
-
+            // use either exhaustive thresholds or quantile-spaced thresholds,
+            // depending on max_number_thresholds_per_feature.
+            for (double thr : threshold_vals) {
                 std::vector<bool> col((std::size_t)n, false);
                 for (int i = 0; i < n; ++i) {
                     col[(std::size_t)i] =

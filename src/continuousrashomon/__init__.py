@@ -408,11 +408,16 @@ class PRAXIS:
         y,
         X_bin=None,
         X_active=None,
+        max_number_thresholds_per_feature=None,
     ):
-       # X_num: Row-major numeric matrix, shape (n_samples, n_numeric_features). These columns are fully threshold-binarized in C++.
-       # y: Labels, shape (n_samples,).
-       # X_bin: Optional row-major already-binary matrix, shape (n_samples, n_binary_features). These columns are included as ordinary binary features before the continuous threshold groups.
-       # X_active: Optional row-major binary matrix to use in proxies, shape (n_samples, n_active_features). Each column is mapped in C++ to the nearest full binarized feature by Hamming distance, producing allowed_proxy_features.
+        # X_num: Row-major numeric matrix, shape (n_samples, n_numeric_features).
+        # by default, these columns are exhaustively threshold-binarized in C++.
+        # if max_number_thresholds_per_feature is set, features with more than that
+        # many candidate thresholds use quantile-spaced thresholds instead.
+        # y: labels, shape (n_samples,).
+        # X_bin: optional row-major already-binary matrix, shape (n_samples, n_binary_features).
+        # X_active: optional row-major binary matrix to use in proxies, shape (n_samples, n_active_features).
+        # each X_active column is mapped in C++ to the nearest full binarized feature by Hamming distance.
 
         X_num = np.asarray(X_num, dtype=np.float64)
         y = np.asarray(y, dtype=int)
@@ -451,11 +456,21 @@ class PRAXIS:
                     f"X_active rows must match X_num rows: got {X_active.shape[0]} vs {n}"
                 )
 
+        if max_number_thresholds_per_feature is None:
+            max_thresholds = -1
+        else:
+            max_thresholds = int(max_number_thresholds_per_feature)
+            if max_thresholds <= 0:
+                raise ValueError(
+                    "max_number_thresholds_per_feature must be positive or None."
+                )
+
         self._model.prepare_continuous_data(
             X_num,
             X_bin,
             y,
             X_active,
+            max_thresholds,
         )
 
     def fit_prepared(

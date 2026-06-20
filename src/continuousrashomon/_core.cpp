@@ -478,7 +478,8 @@ PYBIND11_MODULE(_core, m) {
                py::array_t<double,  py::array::c_style | py::array::forcecast> X_num,
                py::array_t<uint8_t, py::array::c_style | py::array::forcecast> X_bin,
                py::array_t<int,     py::array::c_style | py::array::forcecast> y,
-               py::array_t<uint8_t, py::array::c_style | py::array::forcecast> X_active
+               py::array_t<uint8_t, py::array::c_style | py::array::forcecast> X_active,
+               int max_number_thresholds_per_feature
             ) {
                 auto X_num_vec = numpy_double_2d_to_row_major(X_num, "X_num");
                 auto X_bin_vec = numpy_uint8_2d_to_row_major(X_bin, "X_bin");
@@ -489,13 +490,15 @@ PYBIND11_MODULE(_core, m) {
                     X_num_vec,
                     X_bin_vec,
                     y_vec,
-                    X_active_vec
+                    X_active_vec,
+                    max_number_thresholds_per_feature
                 );
             },
             py::arg("X_num"),
             py::arg("X_bin"),
             py::arg("y"),
-            py::arg("X_active")
+            py::arg("X_active"),
+            py::arg("max_number_thresholds_per_feature") = -1
         )
 
         .def(
