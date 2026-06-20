@@ -358,6 +358,65 @@ static inline uint64_t hash_mask64(const uint64_t* w, int n_words, uint64_t tail
     return h;
 }
 
+struct Key128 {
+    uint64_t hi = 0;
+    uint64_t lo = 0;
+
+    bool operator==(const Key128& o) const {
+        return hi == o.hi && lo == o.lo;
+    }
+
+    struct Hash {
+        size_t operator()(const Key128& x) const noexcept {
+            uint64_t h = x.lo;
+            h ^= x.hi + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+            return static_cast<size_t>(h);
+        }
+    };
+};
+
+static inline Key128 hash_mask128(
+    const uint64_t* w,
+    int n_words,
+    uint64_t tail_mask
+) {
+    uint64_t h1 = 0x9e3779b97f4a7c15ULL;
+    uint64_t h2 = 0xbf58476d1ce4e5b9ULL;
+
+    for (int i = 0; i < n_words; ++i) {
+        uint64_t x = w[i];
+        if (i == n_words - 1) x &= tail_mask;
+
+        const uint64_t m1 = mix64(x ^ 0x9e3779b97f4a7c15ULL);
+        const uint64_t m2 = mix64(x ^ 0xbf58476d1ce4e5b9ULL);
+
+        h1 ^= m1 + 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2);
+        h2 ^= m2 + 0xbf58476d1ce4e5b9ULL + (h2 << 6) + (h2 >> 2);
+    }
+
+    return Key128{h1, h2};
+}
+
+class Fingerprint128IdTable {
+public:
+    uint64_t intern(Key128 fp) {
+        auto it = table.find(fp);
+        if (it != table.end()) return it->second;
+
+        const uint64_t id = next_id++;
+        table.emplace(fp, id);
+        return id;
+    }
+
+    size_t size() const {
+        return table.size();
+    }
+
+private:
+    std::unordered_map<Key128, uint64_t, Key128::Hash> table;
+    uint64_t next_id = 0;
+};
+
 // 2*feat + sign
 static inline Lit enc_lit(int feat, int sign01) {
     if (feat < 0) {
@@ -750,7 +809,7 @@ struct EvalCtx {
 
 class PRAXIS {
 public:
-    enum class KeyMode { HASH64, EXACT, LITS_EXACT };
+    enum class KeyMode { HASH64, HASH128, EXACT, LITS_EXACT };
 
     enum class GreedyContinuousMode {
         BINARY = 0,
@@ -789,6 +848,7 @@ private:
     bool proxy_caching_enabled = true;
     mutable MaskIdTable mask_ids; // used only if in exact mode
     mutable LitIdTable lit_ids; // for itemset mode
+    mutable Fingerprint128IdTable fingerprint128_ids; // used only in hash128 mode
 
     int lookahead_init = 1; // will be changed later
     bool use_multipass = true; // sim
@@ -797,6 +857,7 @@ private:
     bool cache_cheap_subproblems = false;
     bool evaluated_use_min_objectives = false;
     int greedy_split_mode = 1;
+    bool stronger_rollout = false;
     // int num_proxy_features = -1; // <=0 means use all feature. positive for feature selection
     
     // empty means unrestricted / all features.
@@ -840,31 +901,43 @@ private:
 
     inline uint64_t key_of_mask(const Packed& mask) const {
         if (key_mode == KeyMode::LITS_EXACT) {
-            throw std::runtime_error("key_of_mask called in LITS_EXACT mode; use key_of_state(mask, pk)");
+            throw std::runtime_error(
+                "key_of_mask called in LITS_EXACT mode; use key_of_state(mask, pk)"
+            );
         }
         return key_of_state(mask, empty_pk());
     }
-
-
 
     inline uint64_t key_of_state(const Packed& mask, const PathKey& pk) const {
         switch (key_mode) {
             case KeyMode::HASH64:
                 return hash_mask64(mask.w.data(), n_words, tail_mask);
+
+            case KeyMode::HASH128:
+                return fingerprint128_ids.intern(
+                    hash_mask128(mask.w.data(), n_words, tail_mask)
+                );
+
             case KeyMode::EXACT:
-                return (uint64_t)mask_ids.intern(mask, n_words, tail_mask); // cast 32->64
+                return static_cast<uint64_t>(
+                    mask_ids.intern(mask, n_words, tail_mask)
+                );
+
             case KeyMode::LITS_EXACT:
-                return (uint64_t)lit_ids.intern(pk);
+                return static_cast<uint64_t>(
+                    lit_ids.intern(pk)
+                );
         }
+
         return 0;
     }
 
     inline uint64_t key_of_subproblem(const Packed& mask, const PathKey& pk) const {
         if (key_mode == KeyMode::LITS_EXACT) {
             return key_of_state(mask, pk); // interns pk
-        } else {
-            return key_of_mask(mask); 
         }
+
+        return key_of_mask(mask);
     }
 
     // inline int proxy_feat_count_() const {
@@ -1319,8 +1392,9 @@ private:
 
 public:
     shared_ptr<TreeTrieNode> result;
-
     void set_key_mode(KeyMode m) { key_mode = m; }
+    void set_fingerprint_bits(int bits) { key_mode = (bits == 128) ? KeyMode::HASH128 : KeyMode::HASH64; }
+    void set_use_128bit_fingerprint(bool on) { key_mode = on ? KeyMode::HASH128 : KeyMode::HASH64; }
     void set_trie_cache_enabled(bool on) { trie_cache_enabled = on; }
     void set_multiplicative_slack(double s) { multiplicative_slack = s; }
     void set_use_multipass(bool on) { use_multipass = on; }
@@ -1330,6 +1404,7 @@ public:
     void set_greedy_split_mode(int m) { greedy_split_mode = m; }
     void set_proxy_caching_enabled(bool on) { proxy_caching_enabled = on; }
     void set_evaluated_use_min_objectives(bool on) { evaluated_use_min_objectives = on; }
+    void set_stronger_rollout(bool on) { stronger_rollout = on; }
 
     void set_allowed_proxy_features(const std::vector<int>& feats) {
         allowed_proxy_features.clear();
@@ -1622,7 +1697,8 @@ public:
         bool restrict_proxy_in_lickety_in,
         bool restrict_proxy_in_depthd_exact_in,
         bool restrict_proxy_in_greedy_in,
-        bool rashomon_mode
+        bool rashomon_mode,
+        bool stronger_rollout_flag=false
     ) {
         if (!has_prepared_data) {
             throw std::runtime_error("No prepared data. Call prepare_continuous_data(...) before fit_prepared(...).");
@@ -1647,7 +1723,8 @@ public:
             restrict_proxy_in_depthd_exact_in,
             restrict_proxy_in_greedy_in,
             rashomon_mode,
-            prepared_continuous_starts
+            prepared_continuous_starts,
+            stronger_rollout_flag
         );
     }
 
@@ -1680,7 +1757,8 @@ public:
              bool restrict_proxy_in_depthd_exact_in,
              bool restrict_proxy_in_greedy_in,
              bool rashomon_mode,
-             const std::vector<int>& continuous_starts_in
+             const std::vector<int>& continuous_starts_in,
+             bool stronger_rollout_flag=false
             ) {
 
         clear_fit_state_();
@@ -1717,6 +1795,7 @@ public:
         cache_cheap_subproblems = cache_cheap_subproblems_flag;
         proxy_style = proxy_style_in;
         proxy_caching_enabled = proxy_caching_flag;
+        stronger_rollout = stronger_rollout_flag;
         if (!rashomon_mode) { // force proxy caching on in single-tree mode - required for this codebase
             proxy_caching_enabled = true;
             cache_cheap_subproblems = true;
@@ -1849,8 +1928,11 @@ public:
         // cout << "Found " << result->count_trees() << " trees\n"; // we'll let the user compute this query if they want it because it is somewhat expensive
         cout << "Minimum objective: " << result->min_objective << "\n";
         cout << "Cache sizes - Greedy: " << greedy_cache.size()
-            << ", Lickety: " << (use_kla_cache() ? lickety_cache_kla.size() : lickety_cache_k2.size())
-            << ", Trie: " << trie_cache.size();
+            << ", Lickety: "
+            << (use_kla_cache() ? lickety_cache_kla.size() : lickety_cache_k2.size())
+            << ", Trie: " << trie_cache.size()
+            << ", Trie cache: " << (trie_cache_enabled ? "ON" : "OFF")
+            << "\n";
         // cout << ", Distinct subproblems (greedy U lickety): " << count_distinct_subproblems_union();
         // if (key_mode == KeyMode::EXACT) {
         //     cout << ", Unique masks: " << mask_ids.size();
@@ -1858,8 +1940,6 @@ public:
         // if (key_mode == KeyMode::LITS_EXACT) {
         //     cout << ", Unique literal subproblems: " << lit_ids.size();
         // }
-        cout << ", Trie cache: " << (trie_cache_enabled ? "ON" : "OFF");
-        cout << "\n";
     }
 
     void fit_anytime(
@@ -2017,8 +2097,13 @@ public:
         cout << "Cache sizes - Greedy: " << greedy_cache.size()
             << ", Lickety: "
             << (use_kla_cache() ? lickety_cache_kla.size() : lickety_cache_k2.size())
-            << ", Trie: " << trie_cache.size()
-            << ", Trie cache: " << (trie_cache_enabled ? "ON" : "OFF")
+            << ", Trie: " << trie_cache.size();
+
+        if (key_mode == KeyMode::HASH128) {
+            cout << ", Fingerprint128 IDs: " << fingerprint128_ids.size();
+        }
+
+        cout << ", Trie cache: " << (trie_cache_enabled ? "ON" : "OFF")
             << "\n";
     }
 
@@ -2521,6 +2606,68 @@ public:
     }
 
 private:
+
+    static inline uint8_t pred_to_mask_(int pred) {
+        if (pred == 0) return uint8_t(1);
+        if (pred == 1) return uint8_t(2);
+
+        if (pred >= 0 && pred < 8) {
+            return uint8_t(1u << pred);
+        }
+
+        throw std::runtime_error("Prediction label too large for uint8_t mask.");
+    }
+
+    bool training_value_(int sample_idx, int feat) const {
+        if (sample_idx < 0 || sample_idx >= n_samples) {
+            throw std::runtime_error("training_value_ got out-of-range sample index.");
+        }
+        if (feat < 0 || feat >= n_features) {
+            throw std::runtime_error("training_value_ got out-of-range feature index.");
+        }
+
+        const uint64_t bit = 1ULL << (sample_idx & 63);
+        return (X_bits[(size_t)feat].w[(size_t)(sample_idx >> 6)] & bit) != 0;
+    }
+
+    uint8_t reachable_prediction_mask_for_training_sample_rec_(
+        const std::shared_ptr<TreeTrieNode>& node,
+        int sample_idx
+    ) const {
+        if (!node) return 0;
+
+        uint8_t mask = 0;
+
+        // any leaf option at this OR node is reachable.
+        for (const auto& leaf : node->leaves) {
+            mask |= pred_to_mask_(leaf.prediction);
+
+            // early exit for binary case.
+            if ((mask & uint8_t(1)) && (mask & uint8_t(2))) {
+                return mask;
+            }
+        }
+
+        // for every split option, path this sample down the branch it follows.
+        for (const auto& s : node->splits) {
+            const bool go_left = training_value_(sample_idx, s.feature);
+
+            const std::shared_ptr<TreeTrieNode>& child =
+                go_left ? s.left : s.right;
+
+            mask |= reachable_prediction_mask_for_training_sample_rec_(
+                child,
+                sample_idx
+            );
+
+            if ((mask & uint8_t(1)) && (mask & uint8_t(2))) {
+                return mask;
+            }
+        }
+
+        return mask;
+    }
+
     bool active_contains_all_threshold_columns_(
         const std::vector<int>& B_active
     ) const {
@@ -2681,6 +2828,7 @@ private:
 
         mask_ids = MaskIdTable();
         lit_ids = LitIdTable();
+        fingerprint128_ids = Fingerprint128IdTable();
 
         n_samples = 0;
         n_features = 0;
@@ -6519,8 +6667,9 @@ private:
     };
 
     struct ContinuousBestSplitResult {
-        int best_sum = std::numeric_limits<int>::max();
-        int best_feat = -1; // actual threshold-column feature index
+        int best_sum = std::numeric_limits<int>::max();          // feature-selection score
+        int best_cached_sum = std::numeric_limits<int>::max();   // objective-only candidate
+        int best_feat = -1;
     };
 
     inline int first_continuous_feature_() const {
@@ -6760,6 +6909,7 @@ private:
         const Packed& mask,
         int8_t depth_budget,
         int8_t child_k,
+        int8_t cache_lookup_k,
         const PathKey& pk,
         const ContinuousPath& cpath,
         int start_idx,
@@ -6770,6 +6920,7 @@ private:
         // unlike rashomon, if we are just current best at best, can prune. can also update current best
         ContinuousBestSplitResult out;
         out.best_sum = current_best;
+        out.best_cached_sum = std::numeric_limits<int>::max();
         out.best_feat = -1;
 
         auto tightened = tighten_continuous_interval_from_path_(start_idx, end_idx, cpath);
@@ -6913,6 +7064,18 @@ private:
                 out.best_feat = feat;
             }
 
+            update_cached_rollout_sum_if_available_(
+                out.best_cached_sum,
+                L,
+                R,
+                (int8_t)(depth_budget - 1),
+                cache_lookup_k,
+                *pkLp,
+                *pkRp,
+                lossL,
+                lossR
+            );
+
             // one-sided pure-side cutoffs.
             // if the left side is already at minimum possible leaf penalty,
             // farther-left thresholds cannot improve the left side.
@@ -7036,6 +7199,7 @@ private:
 
         int best_feat = -1;
         int best_sum = leaf_loss;
+        int best_cached_sum = std::numeric_limits<int>::max();
 
         Packed L(n_words), R(n_words), bestL(n_words), bestR(n_words);
 
@@ -7090,6 +7254,18 @@ private:
                 best_sum = sum;
                 best_feat = f;
             }
+
+            update_cached_rollout_sum_if_available_(
+                best_cached_sum,
+                L,
+                R,
+                (int8_t)(depth_budget - 1),
+                /*lookup_k=*/k,
+                *pkLp,
+                *pkRp,
+                left_loss,
+                right_loss
+            );
         }
 
         // continuous groups.
@@ -7113,6 +7289,7 @@ private:
                     mask,
                     depth_budget,
                     child_k,
+                    /*cache_lookup_k=*/k,
                     pk,
                     cpath,
                     start_idx,
@@ -7125,11 +7302,23 @@ private:
                 best_sum = cres.best_sum;
                 best_feat = cres.best_feat;
             }
+
+            if (cres.best_cached_sum < best_cached_sum) {
+                best_cached_sum = cres.best_cached_sum;
+            }
         }
 
         int ans = leaf_loss;
 
         int8_t k_recurse;
+
+        ans = std::min(ans, best_sum);
+
+        if (best_cached_sum != std::numeric_limits<int>::max()) {
+            ans = std::min(ans, best_cached_sum);
+        }
+
+        tighten_with_trie_min_if_available_(ans, kmask, depth_budget);
 
         if (proxy_style == 0) {
             // style 0: constant k.
@@ -8773,6 +8962,7 @@ private:
         // }
 
         int best_sum = leaf_loss;
+        int best_cached_sum = std::numeric_limits<int>::max();
 
         Packed L(n_words), R(n_words);
 
@@ -8854,6 +9044,18 @@ private:
             if (sum < best_sum) {
                 best_sum = sum;
             }
+
+            update_cached_rollout_sum_if_available_(
+                best_cached_sum,
+                L,
+                R,
+                (int8_t)(depth_budget - 1),
+                (int8_t)std::max(0, (int)depth_budget - 2),
+                *pkLp,
+                *pkRp,
+                left_best,
+                right_best
+            );
         }
 
         // continuous groups
@@ -8877,6 +9079,7 @@ private:
                     mask,
                     depth_budget,
                     /*child_k=*/depth_budget - 2,
+                    /*cache_lookup_k=*/depth_budget - 2,
                     pk,
                     cpath,
                     start_idx,
@@ -8888,9 +9091,19 @@ private:
             if (cres.best_feat >= 0 && cres.best_sum < best_sum) {
                 best_sum = cres.best_sum;
             }
+
+            if (cres.best_cached_sum < best_cached_sum) {
+                best_cached_sum = cres.best_cached_sum;
+            }
         }
 
-        const int ans = best_sum;
+        int ans = best_sum;
+
+        if (best_cached_sum != std::numeric_limits<int>::max()) {
+            ans = std::min(ans, best_cached_sum);
+        }
+
+        tighten_with_trie_min_if_available_(ans, kmask, depth_budget);
 
         if (proxy_caching_enabled) {
             cache_lickety_if_true_(
@@ -9006,6 +9219,7 @@ private:
                     mask,
                     /*depth_budget=*/1,
                     /*child_k=*/-1,
+                    /*cache_lookup_k=*/(int8_t)std::max(0, (int)depth_budget - 2),
                     pk,
                     cpath,
                     start_idx,
@@ -11520,6 +11734,7 @@ private:
         }
 
         int best_sum = std::numeric_limits<int>::max();
+        int best_cached_sum = std::numeric_limits<int>::max();
 
         Packed L(n_words), R(n_words);
         const auto& feats = proxy_features_for_(ProxyLoopKind::DepthDExact);
@@ -11545,6 +11760,18 @@ private:
 
             const int sum = left_best + right_best;
             if (sum < best_sum) best_sum = sum;
+
+            update_cached_rollout_sum_if_available_(
+                best_cached_sum,
+                L,
+                R,
+                (int8_t)(depth_budget - 1),
+                (int8_t)std::max(0, (int)depth_budget - 2),
+                *pkLp,
+                *pkRp,
+                left_best,
+                right_best
+            );
         };
 
         if (feats.empty()) {
@@ -11555,6 +11782,12 @@ private:
 
         int ans = leaf_loss;
         if (best_sum != std::numeric_limits<int>::max()) ans = std::min(ans, best_sum);
+
+        if (best_cached_sum != std::numeric_limits<int>::max()) {
+            ans = std::min(ans, best_cached_sum);
+        }
+
+        tighten_with_trie_min_if_available_(ans, kmask, depth_budget);
 
         if (proxy_caching_enabled) cache_lickety_if_true_(kmask, depth_budget, KTAG, ans, /*allow_cache=*/true);
         return ans;
@@ -11583,6 +11816,97 @@ private:
         }
     }
 
+    inline bool try_get_trie_min_objective_(
+        uint64_t kmask,
+        int8_t depth_budget,
+        int& out_val
+    ) const {
+        if (!trie_cache_enabled) return false;
+
+        auto it = trie_cache.find(K2{kmask, depth_budget});
+        if (it == trie_cache.end()) return false;
+        if (!it->second) return false;
+
+        const int v = it->second->min_objective;
+        if (v == std::numeric_limits<int>::max()) return false;
+
+        out_val = v;
+        return true;
+    }
+
+    inline void tighten_with_trie_min_if_available_(
+        int& ans,
+        uint64_t kmask,
+        int8_t depth_budget
+    ) const {
+        if (!stronger_rollout) return;
+
+        int trie_min = 0;
+        if (try_get_trie_min_objective_(kmask, depth_budget, trie_min)) {
+            ans = std::min(ans, trie_min);
+        }
+    }
+
+    inline void tighten_with_child_lickety_cache_sum_(
+        int& best_sum,
+        const Packed& L,
+        const Packed& R,
+        int8_t child_depth,
+        int8_t lookup_k,
+        const PathKey& pkL,
+        const PathKey& pkR,
+        int fallback_left,
+        int fallback_right
+    ) const {
+        if (!stronger_rollout || !proxy_caching_enabled) return;
+
+        int left_val = fallback_left;
+        int right_val = fallback_right;
+
+        bool have_left = false;
+        bool have_right = false;
+
+        const uint64_t kL = key_of_subproblem(L, pkL);
+        const uint64_t kR = key_of_subproblem(R, pkR);
+
+        have_left = try_get_lickety_cached_(kL, child_depth, lookup_k, left_val);
+        have_right = try_get_lickety_cached_(kR, child_depth, lookup_k, right_val);
+
+        if (have_left || have_right) {
+            best_sum = std::min(best_sum, left_val + right_val);
+        }
+    }
+
+    inline void update_cached_rollout_sum_if_available_(
+        int& best_cached_sum,
+        const Packed& L,
+        const Packed& R,
+        int8_t child_depth,
+        int8_t lookup_k,
+        const PathKey& pkL,
+        const PathKey& pkR,
+        int fallback_left,
+        int fallback_right
+    ) const {
+        if (!stronger_rollout || !proxy_caching_enabled) return;
+
+        int left_val = fallback_left;
+        int right_val = fallback_right;
+
+        bool have_left = false;
+        bool have_right = false;
+
+        const uint64_t kL = key_of_subproblem(L, pkL);
+        const uint64_t kR = key_of_subproblem(R, pkR);
+
+        have_left  = try_get_lickety_cached_(kL, child_depth, lookup_k, left_val);
+        have_right = try_get_lickety_cached_(kR, child_depth, lookup_k, right_val);
+
+        if (have_left || have_right) {
+            best_cached_sum = std::min(best_cached_sum, left_val + right_val);
+        }
+    }
+
     // our modified lickety_split algorithm that is O(nk^2d^2). 
     int lickety_split_k1(const Packed& mask, int8_t depth_budget, const PathKey& pk)
     {
@@ -11597,7 +11921,7 @@ private:
                 return depthd_exact_proxy_objective_(mask, 2, pk);
         }
 
-        // TODO, this is an isue with anytime, we need to use K3 if we're going to do anytime
+        // TODO, this is an issue with anytime, we need to use K3 if we're going to do anytime
         // (k=1 so use K2 cache)
         uint64_t kmask = 0;
         K2 key2{0, depth_budget};
@@ -11620,6 +11944,7 @@ private:
 
         int best_feat = -1;
         int best_sum  = std::numeric_limits<int>::max();
+        int best_cached_sum = std::numeric_limits<int>::max();
 
         Packed L(n_words), R(n_words);
         Packed bestL(n_words), bestR(n_words);
@@ -11637,9 +11962,13 @@ private:
             PathKey pkL_local, pkR_local;
             make_child_pks_if_needed_(f, pk, pkLp, pkRp, pkL_local, pkR_local);
 
-            const int sum =
-                greedy_proxy_objective_(L, child_depth, *pkLp) +
+            const int left_greedy =
+                greedy_proxy_objective_(L, child_depth, *pkLp);
+
+            const int right_greedy =
                 greedy_proxy_objective_(R, child_depth, *pkRp);
+
+            const int sum = left_greedy + right_greedy;
 
             if (sum < best_sum) {
                 best_sum = sum;
@@ -11647,6 +11976,18 @@ private:
                 bestL.w = L.w;
                 bestR.w = R.w;
             }
+
+            update_cached_rollout_sum_if_available_(
+                best_cached_sum,
+                L,
+                R,
+                child_depth,
+                /*lookup_k=*/1,
+                *pkLp,
+                *pkRp,
+                left_greedy,
+                right_greedy
+            );
         };
 
         if (feats.empty()) {
@@ -11669,6 +12010,10 @@ private:
 
         int ans = leaf_loss;
 
+        if (best_cached_sum != std::numeric_limits<int>::max()) {
+            ans = std::min(ans, best_cached_sum);
+        }
+
         // recurse with constant k=1 (proxy_style=0 behavior)
         if (best_feat >= 0) {
             const int8_t next_depth = (int8_t)(depth_budget - 1);
@@ -11685,6 +12030,8 @@ private:
             ans = std::min(ans, best_sum);
         }
 
+        tighten_with_trie_min_if_available_(ans, kmask, depth_budget);
+
         if (proxy_caching_enabled) {
             lickety_cache_k2.emplace(key2, ans);
         }
@@ -11693,6 +12040,7 @@ private:
 
     // a generalized lickety_split algorithm with a lookahead parameter k. we also support other proxy styles here (such as recursively applying split) that have the same flavor.
     int generalized_lickety_split(const Packed& mask, int8_t depth_budget, int8_t k, const PathKey& pk) {
+        // TODO only do this call if also anytime is false
         if (k == 1 && lookahead_init == 1 && proxy_style == 0) {
             return lickety_split_k1(mask, depth_budget, pk);
         }
@@ -11746,6 +12094,7 @@ private:
 
         int best_feat = -1;
         int best_sum  = numeric_limits<int>::max();
+        int best_cached_sum = numeric_limits<int>::max();
 
         Packed L(n_words), R(n_words), bestL(n_words), bestR(n_words);
 
@@ -11762,15 +12111,31 @@ private:
             PathKey pkL_local, pkR_local;
             make_child_pks_if_needed_(f, pk, pkLp, pkRp, pkL_local, pkR_local);
 
-            const int sum =
-                eval_with_lookahead(L, depth_budget - 1, child_k, *pkLp)
-                +
+            const int left_loss =
+                eval_with_lookahead(L, depth_budget - 1, child_k, *pkLp);
+
+            const int right_loss =
                 eval_with_lookahead(R, depth_budget - 1, child_k, *pkRp);
+
+            const int sum = left_loss + right_loss;
 
             if (sum < best_sum) {
                 best_sum = sum;
                 best_feat = f;
             }
+
+            update_cached_rollout_sum_if_available_(
+                best_cached_sum,
+                L,
+                R,
+                (int8_t)(depth_budget - 1),
+                /*lookup_k=*/k,
+                *pkLp,
+                *pkRp,
+                left_loss,
+                right_loss
+            );
+            
         };
 
         if (feats.empty()) {
@@ -11796,14 +12161,20 @@ private:
             andnot_bits(mask, X_bits[best_feat], bestR);
         }
 
-        int ans = leaf_loss; 
+        int ans = leaf_loss;
+
+        if (best_cached_sum != std::numeric_limits<int>::max()) {
+            ans = std::min(ans, best_cached_sum);
+        }
 
         int8_t k_recurse;
+
         if (proxy_style == 0) {
             // style 0: constant k (recursively choosing based on lower tier LicketySPLIT)
             k_recurse = k;
         } else if (proxy_style == 3) {
             // style 3: if we're running SPLIT without postprocessing, we don't need to do further recursive calls (the tree is fully determined).
+            tighten_with_trie_min_if_available_(ans, kmask, depth_budget);
             ans = std::min(ans, best_sum);
             if (proxy_caching_enabled) {
                 if (use_kla) lickety_cache_kla.emplace(keyla, ans);
@@ -11832,6 +12203,9 @@ private:
             ans = std::min(ans, best_sum); // if greedy is allowed more features, or heuristic pruning happens, we never want to be worse than greedy
 
         }
+
+        tighten_with_trie_min_if_available_(ans, kmask, depth_budget);
+
         if (proxy_caching_enabled) {
             if (use_kla) lickety_cache_kla.emplace(keyla, ans);
             else lickety_cache_k2.emplace(key2,  ans);
@@ -12934,6 +13308,47 @@ private:
     }
 
 public:
+
+    uint8_t reachable_prediction_mask_for_training_sample(int sample_idx) const {
+        if (!result) {
+            throw std::runtime_error(
+                "No Rashomon trie has been constructed. Call fit(..., rashomon_mode=true) first."
+            );
+        }
+        if (sample_idx < 0 || sample_idx >= n_samples) {
+            throw std::runtime_error("sample_idx is out of range.");
+        }
+
+        return reachable_prediction_mask_for_training_sample_rec_(
+            result,
+            sample_idx
+        );
+    }
+
+    bool training_sample_has_multiple_reachable_predictions(int sample_idx) const {
+        const uint8_t mask =
+            reachable_prediction_mask_for_training_sample(sample_idx);
+
+        return (mask & uint8_t(1)) && (mask & uint8_t(2));
+    }
+
+    std::vector<int> training_samples_with_multiple_reachable_predictions() const {
+        if (!result) {
+            throw std::runtime_error(
+                "No Rashomon trie has been constructed. Call fit(..., rashomon_mode=true) first."
+            );
+        }
+
+        std::vector<int> out;
+
+        for (int i = 0; i < n_samples; ++i) {
+            if (training_sample_has_multiple_reachable_predictions(i)) {
+                out.push_back(i);
+            }
+        }
+
+        return out;
+    }
     // main entry: enumerate ALL valid trees under the trie root (or budget_override if >=0),
     // returning (training_objective, prediction vector on evaluation dataset) for each tree.
     // NOTE: this can be extremely large in memory if the Rashomon set is huge.

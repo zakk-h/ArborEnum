@@ -48,6 +48,55 @@ _PROXY_STYLE_MAP = {
     "split": 3,
 }
 
+_KEY_MODE_MAP = {
+    "hash": "hash",
+    "hash64": "hash",
+    "hash_64": "hash",
+    "64": "hash",
+    "64bit": "hash",
+    "64_bit": "hash",
+    "fingerprint64": "hash",
+    "fingerprint_64": "hash",
+
+    "hash128": "hash128",
+    "hash_128": "hash128",
+    "128": "hash128",
+    "128bit": "hash128",
+    "128_bit": "hash128",
+    "fingerprint128": "hash128",
+    "fingerprint_128": "hash128",
+
+    "exact": "exact",
+    "bitvector": "exact",
+    "bit_vector": "exact",
+
+    "literal": "lits_exact",
+    "lits": "lits_exact",
+    "lits_exact": "lits_exact",
+    "itemset": "lits_exact",
+}
+
+
+def parse_key_mode(key_mode):
+    if isinstance(key_mode, (int, np.integer)):
+        v = int(key_mode)
+        if v == 64:
+            return "hash"
+        if v == 128:
+            return "hash128"
+        raise ValueError("key_mode as an integer must be 64 or 128.")
+
+    key = _normalize_key(key_mode)
+    if key in _KEY_MODE_MAP:
+        return _KEY_MODE_MAP[key]
+
+    allowed = sorted(set(_KEY_MODE_MAP.keys()))
+    raise ValueError(
+        f"Unknown key_mode='{key_mode}'. "
+        f"Supported: 64, 128, 'hash', 'hash128', 'exact', or 'lits_exact'. "
+        f"Aliases: {allowed}"
+    )
+
 
 def parse_proxy_style(proxy_style):
     # accepts int or string
@@ -175,9 +224,9 @@ class PRAXIS:
         restrict_proxy_in_depthd_exact=False,
         restrict_proxy_in_greedy=False,
         rashomon_mode=True,
-        increase_proxy_anytime=False,
         continuous_starts=None,
         trie_cache_enabled=True,
+        stronger_rollout=False,
     ):
         X = np.asarray(X, dtype=np.uint8)
         y = np.asarray(y, dtype=int)
@@ -216,6 +265,8 @@ class PRAXIS:
             root_budget_int = -1
         else:
             root_budget_int = int(root_budget)
+
+        key_mode_parsed = parse_key_mode(key_mode)
         self._model.fit(
             X,
             y,
@@ -223,7 +274,7 @@ class PRAXIS:
             depth_budget,
             rashomon_mult,
             multiplicative_slack,
-            key_mode,
+            key_mode_parsed,
             bool(trie_cache_enabled),
             lookahead_k,
             root_budget_int,
@@ -241,6 +292,7 @@ class PRAXIS:
             bool(restrict_proxy_in_greedy),
             bool(rashomon_mode),
             continuous_starts_vec,
+            bool(stronger_rollout),
         )
 
     def fit_anytime(
@@ -319,6 +371,7 @@ class PRAXIS:
         greedy_heur_int = parse_heuristic_for_greedy(heuristic_for_greedy)
         greedy_cont_mode = parse_greedy_continuous_mode(greedy_continuous_mode)
 
+        key_mode_parsed = parse_key_mode(key_mode)
         self._model.fit_anytime(
             X,
             y,
@@ -326,7 +379,7 @@ class PRAXIS:
             int(depth_budget),
             float(rashomon_mult),
             float(multiplicative_slack),
-            str(key_mode),
+            key_mode_parsed,
             bool(trie_cache_enabled),
             int(lookahead_k),
             bool(use_budget_refinement),
@@ -427,6 +480,7 @@ class PRAXIS:
         restrict_proxy_in_greedy=False,
         rashomon_mode=True,
         trie_cache_enabled=True,
+        stronger_rollout=False,
     ):
         proxy_style_int = parse_proxy_style(proxy_style)
         greedy_heur_int = parse_heuristic_for_greedy(heuristic_for_greedy)
@@ -437,12 +491,13 @@ class PRAXIS:
         else:
             root_budget_int = int(root_budget)
 
+        key_mode_parsed = parse_key_mode(key_mode)
         self._model.fit_prepared(
             float(lambda_reg),
             int(depth_budget),
             float(rashomon_mult),
             float(multiplicative_slack),
-            str(key_mode),
+            key_mode_parsed,
             bool(trie_cache_enabled),
             int(lookahead_k),
             int(root_budget_int),
@@ -458,6 +513,7 @@ class PRAXIS:
             bool(restrict_proxy_in_depthd_exact),
             bool(restrict_proxy_in_greedy),
             bool(rashomon_mode),
+            bool(stronger_rollout),
         )
 
     def fit_prepared_anytime(
@@ -495,12 +551,13 @@ class PRAXIS:
             proxy_threshold_features_vec = [int(v) for v in proxy_threshold_features]
             proxy_threshold_features_vec = sorted(set(proxy_threshold_features_vec))
 
+        key_mode_parsed = parse_key_mode(key_mode)
         self._model.fit_prepared_anytime(
             float(lambda_reg),
             int(depth_budget),
             float(rashomon_mult),
             float(multiplicative_slack),
-            str(key_mode),
+            key_mode_parsed,
             bool(trie_cache_enabled),
             int(lookahead_k),
             bool(use_budget_refinement),
@@ -851,6 +908,15 @@ class PRAXIS:
 
     def root_lickety_objective_lookahead1(self, depth_budget: int):
         return int(self._model.root_lickety_objective_lookahead1(int(depth_budget)))
+
+    def reachable_prediction_mask_for_training_sample(self, sample_idx: int):
+        return self._model.reachable_prediction_mask_for_training_sample(int(sample_idx))
+
+    def training_sample_has_multiple_reachable_predictions(self, sample_idx: int):
+        return self._model.training_sample_has_multiple_reachable_predictions(int(sample_idx))
+
+    def training_samples_with_multiple_reachable_predictions(self):
+        return self._model.training_samples_with_multiple_reachable_predictions()
 
     def compute_rid(
         self,

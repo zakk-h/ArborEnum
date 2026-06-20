@@ -138,17 +138,45 @@ sort_unique_ints(std::vector<int>& xs) {
 
 static PRAXIS::KeyMode
 parse_key_mode(const std::string& key_mode_str) {
-    if (key_mode_str == "exact" || key_mode_str == "bitvector") {
+    std::string s = key_mode_str;
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+
+    std::replace(s.begin(), s.end(), '-', '_');
+    std::replace(s.begin(), s.end(), ' ', '_');
+
+    if (
+        s == "exact" ||
+        s == "bitvector" ||
+        s == "bit_vector"
+    ) {
         return PRAXIS::KeyMode::EXACT;
     }
+
     if (
-        key_mode_str == "literal" ||
-        key_mode_str == "lits" ||
-        key_mode_str == "lits_exact" ||
-        key_mode_str == "itemset"
+        s == "literal" ||
+        s == "lits" ||
+        s == "lits_exact" ||
+        s == "itemset"
     ) {
         return PRAXIS::KeyMode::LITS_EXACT;
     }
+
+    if (
+        s == "128" ||
+        s == "hash128" ||
+        s == "hash_128" ||
+        s == "fingerprint128" ||
+        s == "fingerprint_128" ||
+        s == "128bit" ||
+        s == "128_bit" ||
+        s == "hash128bit" ||
+        s == "hash_128_bit"
+    ) {
+        return PRAXIS::KeyMode::HASH128;
+    }
+
     return PRAXIS::KeyMode::HASH64;
 }
 
@@ -208,7 +236,8 @@ PYBIND11_MODULE(_core, m) {
                bool restrict_proxy_in_depthd_exact,
                bool restrict_proxy_in_greedy,
                bool rashomon_mode,
-               std::vector<int> continuous_starts
+               std::vector<int> continuous_starts,
+               bool stronger_rollout
             ) {
 
                 py::buffer_info xinfo = X.request();
@@ -259,6 +288,7 @@ PYBIND11_MODULE(_core, m) {
                 self.set_greedy_continuous_mode(parse_greedy_continuous_mode(greedy_continuous_mode));
                 self.set_majority_leaf_only(majority_leaf_only);
                 self.set_proxy_caching_enabled(proxy_caching);
+                self.set_stronger_rollout(stronger_rollout);
 
                 self.fit(
                     X_col_major,
@@ -279,7 +309,8 @@ PYBIND11_MODULE(_core, m) {
                     restrict_proxy_in_depthd_exact,
                     restrict_proxy_in_greedy,
                     rashomon_mode,
-                    continuous_starts
+                    continuous_starts,
+                    stronger_rollout
                 );
             },
             py::arg("X"),
@@ -305,7 +336,8 @@ PYBIND11_MODULE(_core, m) {
             py::arg("restrict_proxy_in_depthd_exact") = false,
             py::arg("restrict_proxy_in_greedy") = false,
             py::arg("rashomon_mode") = true,
-            py::arg("continuous_starts") = std::vector<int>{}
+            py::arg("continuous_starts") = std::vector<int>{},
+            py::arg("stronger_rollout") = false
         )
 
         .def(
@@ -573,7 +605,8 @@ PYBIND11_MODULE(_core, m) {
                bool restrict_proxy_in_lickety,
                bool restrict_proxy_in_depthd_exact,
                bool restrict_proxy_in_greedy,
-               bool rashomon_mode
+               bool rashomon_mode,
+               bool stronger_rollout
             ) {
                 PRAXIS::KeyMode km = parse_key_mode(key_mode_str);
 
@@ -587,6 +620,7 @@ PYBIND11_MODULE(_core, m) {
                 self.set_greedy_continuous_mode(parse_greedy_continuous_mode(greedy_continuous_mode));
                 self.set_majority_leaf_only(majority_leaf_only);
                 self.set_proxy_caching_enabled(proxy_caching);
+                self.set_stronger_rollout(stronger_rollout);
 
                 self.fit_prepared(
                     lambda_reg,
@@ -603,7 +637,8 @@ PYBIND11_MODULE(_core, m) {
                     restrict_proxy_in_lickety,
                     restrict_proxy_in_depthd_exact,
                     restrict_proxy_in_greedy,
-                    rashomon_mode
+                    rashomon_mode,
+                    stronger_rollout
                 );
             },
             py::arg("lambda_reg") = 0.01,
@@ -625,7 +660,8 @@ PYBIND11_MODULE(_core, m) {
             py::arg("restrict_proxy_in_lickety") = false,
             py::arg("restrict_proxy_in_depthd_exact") = false,
             py::arg("restrict_proxy_in_greedy") = false,
-            py::arg("rashomon_mode") = true
+            py::arg("rashomon_mode") = true,
+            py::arg("stronger_rollout") = false
         )
 
         .def("count_trees",
@@ -814,12 +850,35 @@ PYBIND11_MODULE(_core, m) {
             py::arg("tree_index")
         )
 
-        .def(
+                .def(
             "root_lickety_objective_lookahead1",
             [](PRAXIS &self, int depth_budget) {
                 return self.root_lickety_objective_lookahead1(depth_budget);
             },
             py::arg("depth_budget")
+        )
+
+        .def(
+            "reachable_prediction_mask_for_training_sample",
+            [](const PRAXIS &self, int sample_idx) {
+                return self.reachable_prediction_mask_for_training_sample(sample_idx);
+            },
+            py::arg("sample_idx")
+        )
+
+        .def(
+            "training_sample_has_multiple_reachable_predictions",
+            [](const PRAXIS &self, int sample_idx) {
+                return self.training_sample_has_multiple_reachable_predictions(sample_idx);
+            },
+            py::arg("sample_idx")
+        )
+
+        .def(
+            "training_samples_with_multiple_reachable_predictions",
+            [](const PRAXIS &self) {
+                return self.training_samples_with_multiple_reachable_predictions();
+            }
         );
 
     m.def(
