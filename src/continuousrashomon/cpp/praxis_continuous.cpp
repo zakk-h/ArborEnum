@@ -1389,6 +1389,7 @@ private:
     }
 
     std::vector<double> threshold_values_for_numeric_feature_(
+        const std::vector<double>& raw_values,
         const std::vector<double>& sorted_unique_vals,
         int max_number_thresholds_per_feature
     ) const {
@@ -1399,6 +1400,7 @@ private:
         const int candidate_count =
             static_cast<int>(sorted_unique_vals.size()) - 1;
 
+        // exhaustive default: every unique value except max.
         if (
             max_number_thresholds_per_feature <= 0 ||
             candidate_count <= max_number_thresholds_per_feature
@@ -1409,35 +1411,63 @@ private:
             );
         }
 
+        std::vector<double> sorted_vals;
+        sorted_vals.reserve(raw_values.size());
+
+        for (double x : raw_values) {
+            if (std::isfinite(x)) {
+                sorted_vals.push_back(x);
+            }
+        }
+
+        if (sorted_vals.empty()) {
+            return {};
+        }
+
+        std::sort(sorted_vals.begin(), sorted_vals.end());
+
         std::vector<double> thresholds;
         thresholds.reserve(
             static_cast<std::size_t>(max_number_thresholds_per_feature)
         );
 
-        // quantile-spaced over the valid split candidates:
-        // sorted_unique_vals[0], ..., sorted_unique_vals[end - 2].
-        // sorted_unique_vals.back() is excluded because x <= max is trivial.
+        const int n = static_cast<int>(sorted_vals.size());
+
+        // probabilities 1/(m+1), ..., m/(m+1), with linear interpolation.
         for (int j = 1; j <= max_number_thresholds_per_feature; ++j) {
-            int idx = static_cast<int>(
-                std::floor(
-                    (static_cast<double>(j) * candidate_count) /
-                    static_cast<double>(max_number_thresholds_per_feature + 1)
-                )
-            );
+            const double q =
+                static_cast<double>(j) /
+                static_cast<double>(max_number_thresholds_per_feature + 1);
 
-            if (idx < 0) idx = 0;
-            if (idx >= candidate_count) idx = candidate_count - 1;
+            const double pos = q * static_cast<double>(n - 1);
+            int lo = static_cast<int>(std::floor(pos));
+            int hi = static_cast<int>(std::ceil(pos));
 
-            thresholds.push_back(sorted_unique_vals[(std::size_t)idx]);
+            if (lo < 0) lo = 0;
+            if (hi < 0) hi = 0;
+            if (lo >= n) lo = n - 1;
+            if (hi >= n) hi = n - 1;
+
+            const double frac = pos - static_cast<double>(lo);
+            const double thr =
+                sorted_vals[(std::size_t)lo] * (1.0 - frac) +
+                sorted_vals[(std::size_t)hi] * frac;
+
+            if (std::isfinite(thr) &&
+                thr >= sorted_unique_vals.front() &&
+                thr < sorted_unique_vals.back()) {
+                thresholds.push_back(thr);
+            }
         }
 
+        std::sort(thresholds.begin(), thresholds.end());
         thresholds.erase(
             std::unique(thresholds.begin(), thresholds.end()),
             thresholds.end()
         );
 
         return thresholds;
-    }    
+    }
 
 
 public:
@@ -1621,8 +1651,16 @@ public:
             // constant numeric feature contributes no threshold columns.
             if (vals.size() <= 1) continue;
 
+            // store the raw numerical column corresponding to this continuous group.
+            std::vector<double> col_num((std::size_t)n);
+            for (int i = 0; i < n; ++i) {
+                col_num[(std::size_t)i] =
+                    X_num_row_major[(std::size_t)i][(std::size_t)f];
+            }
+
             std::vector<double> threshold_vals =
                 threshold_values_for_numeric_feature_(
+                    col_num,
                     vals,
                     max_number_thresholds_per_feature
                 );
@@ -1638,13 +1676,6 @@ public:
             std::vector<double> stored_vals = threshold_vals;
             stored_vals.push_back(vals.back());
             numerical_unique_values_for_greedy_local.push_back(std::move(stored_vals));
-
-            // store the raw numerical column corresponding to this continuous group.
-            std::vector<double> col_num((std::size_t)n);
-            for (int i = 0; i < n; ++i) {
-                col_num[(std::size_t)i] =
-                    X_num_row_major[(std::size_t)i][(std::size_t)f];
-            }
 
             // store globally sorted row indices for this numerical feature.
             std::vector<int> order((std::size_t)n);
