@@ -5500,8 +5500,11 @@ private:
                     return;
                 }
 
+                const int first_cert =
+                    std::min(first_loss, first_node->min_objective);
+
                 const int new_second_budget =
-                    budget - first_node->min_objective;
+                    budget - first_cert;
 
                 if (new_second_budget > second_budget) {
                     second_budget = new_second_budget;
@@ -5518,8 +5521,11 @@ private:
                         return;
                     }
 
+                    const int second_cert =
+                        std::min(second_loss, second_node->min_objective);
+
                     new_first_budget =
-                        budget - second_node->min_objective;
+                        budget - second_cert;
                 } else {
                     break;
                 }
