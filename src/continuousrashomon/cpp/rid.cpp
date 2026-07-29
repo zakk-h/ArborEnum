@@ -296,7 +296,8 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
                 false,                        // majority_leaf_only
                 false,                        // cache_cheap_subproblems
                 true,                         // proxy_caching
-                proxy_threshold_features,      // snapped active proxy thresholds
+                proxy_threshold_features,     // snapped active proxy thresholds
+                proxy_threshold_features,     // initial enumeration featues
                 refinement_width,
                 max_refinement_rounds,
                 false,                        // increase_proxy_anytime

@@ -840,6 +840,7 @@ private:
     std::vector<std::vector<bool>> prepared_X_col_major;
     std::vector<int> prepared_y;
     std::vector<int> prepared_continuous_starts;
+    std::vector<int> prepared_initial_active_features;
     std::vector<int> prepared_allowed_proxy_features;
 
     KeyMode key_mode = KeyMode::HASH64; // will change later in fit
@@ -1587,16 +1588,18 @@ public:
         const std::vector<std::vector<double>>& X_num_row_major,
         const std::vector<std::vector<uint8_t>>& X_bin_row_major,
         const std::vector<int>& y,
-        const std::vector<std::vector<uint8_t>>& X_active_row_major,
+        const std::vector<std::vector<uint8_t>>& X_initial_active_row_major,
+        const std::vector<std::vector<uint8_t>>& X_proxy_active_row_major,
         int max_number_thresholds_per_feature = -1
     ) {
         validate_rectangular_matrix_(X_num_row_major, "X_num_row_major");
         validate_rectangular_matrix_(X_bin_row_major, "X_bin_row_major");
-        validate_rectangular_matrix_(X_active_row_major, "X_active_row_major");
-
+        validate_rectangular_matrix_(X_initial_active_row_major, "X_initial_active_row_major");
+        validate_rectangular_matrix_(X_proxy_active_row_major, "X_proxy_active_row_major");
         const int n_num = (int)X_num_row_major.size();
         const int n_bin = (int)X_bin_row_major.size();
-        const int n_active = (int)X_active_row_major.size();
+        const int n_initial_active = (int)X_initial_active_row_major.size();
+        const int n_proxy_active = (int)X_proxy_active_row_major.size();
 
         int n = -1;
 
@@ -1605,13 +1608,28 @@ public:
             if (n < 0) n = n_bin;
             else if (n_bin != n) throw std::runtime_error("X_bin_row_major row count does not match X_num_row_major.");
         }
-        if (n_active > 0) {
-            if (n < 0) n = n_active;
-            else if (n_active != n) throw std::runtime_error("X_active_row_major row count does not match X_num_row_major.");
+        if (n_initial_active > 0) {
+            if (n < 0) {
+                n = n_initial_active;
+            } else if (n_initial_active != n) {
+                throw std::runtime_error(
+                    "X_initial_active_row_major row count mismatch."
+                );
+            }
+        }
+
+        if (n_proxy_active > 0) {
+            if (n < 0) {
+                n = n_proxy_active;
+            } else if (n_proxy_active != n) {
+                throw std::runtime_error(
+                    "X_proxy_active_row_major row count mismatch."
+                );
+            }
         }
 
         if (n < 0) {
-            throw std::runtime_error("At least one of X_num_row_major, X_bin_row_major, or X_active_row_major must be nonempty.");
+            throw std::runtime_error("At least one of X_num_row_major, X_bin_row_major, or X_initial_active_row_major or X_proxy_active_row_major must be nonempty.");
         }
 
         if ((int)y.size() != n) {
@@ -1620,7 +1638,6 @@ public:
 
         const int p_num = (n_num > 0) ? (int)X_num_row_major[0].size() : 0;
         const int p_bin = (n_bin > 0) ? (int)X_bin_row_major[0].size() : 0;
-        const int p_active = (n_active > 0) ? (int)X_active_row_major[0].size() : 0;
 
         std::vector<std::vector<bool>> X_cols;
         std::vector<int> cont_starts;
@@ -1714,48 +1731,127 @@ public:
         }
 
         // map active binary columns to closest columns in the full binarized X.
-        std::vector<int> active_features;
-        active_features.reserve((std::size_t)p_active);
+        // for (int a = 0; a < p_active; ++a) {
+        //     std::vector<uint8_t> active_col((std::size_t)n, 0);
 
-        for (int a = 0; a < p_active; ++a) {
-            std::vector<uint8_t> active_col((std::size_t)n, 0);
+        //     for (int i = 0; i < n; ++i) {
+        //         active_col[(std::size_t)i] =
+        //             X_active_row_major[(std::size_t)i][(std::size_t)a] ? 1 : 0;
+        //     }
 
-            for (int i = 0; i < n; ++i) {
-                active_col[(std::size_t)i] =
-                    X_active_row_major[(std::size_t)i][(std::size_t)a] ? 1 : 0;
-            }
+        //     int best_idx = -1;
+        //     int best_dist = std::numeric_limits<int>::max();
 
-            int best_idx = -1;
-            int best_dist = std::numeric_limits<int>::max();
+        //     for (int f = 0; f < (int)X_cols.size(); ++f) {
+        //         const int d = hamming_distance_binary_column_(
+        //             X_cols[(std::size_t)f],
+        //             active_col
+        //         );
 
-            for (int f = 0; f < (int)X_cols.size(); ++f) {
-                const int d = hamming_distance_binary_column_(
-                    X_cols[(std::size_t)f],
-                    active_col
-                );
+        //         if (d < best_dist) {
+        //             best_dist = d;
+        //             best_idx = f;
 
-                if (d < best_dist) {
-                    best_dist = d;
-                    best_idx = f;
+        //             // Perfect match. Cannot improve.
+        //             if (best_dist == 0) break;
+        //         }
+        //     }
 
-                    // Perfect match. Cannot improve.
-                    if (best_dist == 0) break;
+        //     if (best_idx < 0) {
+        //         throw std::runtime_error("Failed to map active binary feature to full binarized feature.");
+        //     }
+
+        //     active_features.push_back(best_idx);
+        // }
+
+        auto map_columns_to_full_features =
+            [&](
+                const std::vector<std::vector<uint8_t>>& X_selected,
+                int first_candidate_feature
+            ) -> std::vector<int>
+        {
+            const int n_selected = (int)X_selected.size();
+            const int p_selected =
+                n_selected > 0
+                    ? (int)X_selected[0].size()
+                    : 0;
+
+            std::vector<int> selected_features;
+            selected_features.reserve((std::size_t)p_selected);
+
+            for (int a = 0; a < p_selected; ++a) {
+                std::vector<uint8_t> selected_col((std::size_t)n, 0);
+
+                for (int i = 0; i < n; ++i) {
+                    selected_col[(std::size_t)i] =
+                        X_selected[(std::size_t)i][(std::size_t)a]
+                            ? 1
+                            : 0;
                 }
+
+                int best_idx = -1;
+                int best_dist = std::numeric_limits<int>::max();
+
+                for (
+                    int f = first_candidate_feature;
+                    f < (int)X_cols.size();
+                    ++f
+                ) {
+                    const int d = hamming_distance_binary_column_(
+                        X_cols[(std::size_t)f],
+                        selected_col
+                    );
+
+                    if (d < best_dist) {
+                        best_dist = d;
+                        best_idx = f;
+
+                        if (best_dist == 0) {
+                            break;
+                        }
+                    }
+                }
+
+                if (best_idx < 0) {
+                    throw std::runtime_error(
+                        "Failed to map selected binary feature "
+                        "to a candidate full feature."
+                    );
+                }
+
+                selected_features.push_back(best_idx);
             }
 
-            if (best_idx < 0) {
-                throw std::runtime_error("Failed to map active binary feature to full binarized feature.");
-            }
+            sort_unique_ints_inplace_(selected_features);
+            return selected_features;
+        };
 
-            active_features.push_back(best_idx);
-        }
+        const int first_continuous_feature =
+            cont_starts.empty()
+                ? static_cast<int>(X_cols.size())
+                : cont_starts.front();
 
-        sort_unique_ints_inplace_(active_features);
+        std::vector<int> initial_active_features =
+            map_columns_to_full_features(
+                X_initial_active_row_major,
+                first_continuous_feature
+            );
+
+        std::vector<int> proxy_active_features =
+            map_columns_to_full_features(
+                X_proxy_active_row_major,
+                0
+            );
 
         prepared_X_col_major = std::move(X_cols);
         prepared_y = y;
         prepared_continuous_starts = std::move(cont_starts);
-        prepared_allowed_proxy_features = std::move(active_features);
+
+        prepared_initial_active_features =
+            std::move(initial_active_features);
+
+        prepared_allowed_proxy_features =
+            std::move(proxy_active_features);
 
         numerical_X_cols_for_greedy = std::move(numerical_cols_for_greedy);
         numerical_global_sorted_idx = std::move(numerical_global_sorted_idx_local);
@@ -2033,6 +2129,297 @@ public:
         // }
     }
 
+    shared_ptr<TreeTrieNode> fit_then_extend(
+        const std::vector<std::vector<bool>>& X_col_major,
+        const std::vector<int>& y,
+        double lambda,
+        int8_t depth_budget,
+        double first_rashomon_mult,
+        double second_rashomon_mult,
+        int8_t lookahead_k,
+        bool use_multipass_flag,
+        bool rule_list_mode_flag,
+        int proxy_style_in,
+        bool majority_leaf_only_flag,
+        bool cache_cheap_subproblems_flag,
+        bool proxy_caching_flag,
+        const std::vector<int>& allowed_proxy_features_in,
+        bool restrict_proxy_in_lickety_in,
+        bool restrict_proxy_in_depthd_exact_in,
+        bool restrict_proxy_in_greedy_in,
+        const std::vector<int>& continuous_starts_in,
+        bool stronger_rollout_flag = false
+    ) {
+        if (
+            first_rashomon_mult < 0.0 ||
+            second_rashomon_mult < 0.0
+        ) {
+            throw std::runtime_error(
+                "Rashomon multipliers must be nonnegative."
+            );
+        }
+
+        // stage 1: ordinary solve using the first multiplier.
+        fit(
+            X_col_major,
+            y,
+            lambda,
+            depth_budget,
+            first_rashomon_mult,
+            lookahead_k,
+            /*root_budget=*/-1,
+            use_multipass_flag,
+            rule_list_mode_flag,
+            proxy_style_in,
+            majority_leaf_only_flag,
+            cache_cheap_subproblems_flag,
+            proxy_caching_flag,
+            allowed_proxy_features_in,
+            restrict_proxy_in_lickety_in,
+            restrict_proxy_in_depthd_exact_in,
+            restrict_proxy_in_greedy_in,
+            /*rashomon_mode=*/true,
+            continuous_starts_in,
+            stronger_rollout_flag
+        );
+
+        if (!result) {
+            throw std::runtime_error(
+                "The first-stage fit did not construct a Rashomon graph."
+            );
+        }
+
+        const int first_budget = obj_bound;
+        int current_budget = first_budget;
+
+        Packed root = root_mask_();
+
+        const PathKey& root_pk = empty_pk();
+        const ContinuousPath& root_cpath =
+            empty_continuous_path();
+
+        std::vector<int> all_features =
+            all_feature_indices_();
+
+        constexpr double multiplier_tolerance = 1e-12;
+
+        const bool same_multiplier =
+            std::abs(
+                second_rashomon_mult -
+                first_rashomon_mult
+            ) <= multiplier_tolerance;
+
+        const bool smaller_multiplier =
+            second_rashomon_mult <
+            first_rashomon_mult -
+            multiplier_tolerance;
+
+        std::cout
+            << "First objective bound: "
+            << first_budget
+            << "\n";
+
+        // mode 1: equal multipliers.
+        // repeatedly inspect split-level proxy/minimum ratios.
+        // after every extension, recompute them on the larger graph.
+        // stop when the candidate budget is not larger.
+        if (same_multiplier) {
+            int round = 0;
+
+            while (true) {
+                ++round;
+
+                std::cout
+                    << "Split-gap extension round "
+                    << round
+                    << "\n";
+
+                const int candidate_budget =
+                    split_gap_extension_budget_(
+                        result,
+                        root,
+                        depth_budget,
+                        first_budget,
+                        current_budget,
+                        root_pk,
+                        root_cpath
+                    );
+
+                if (candidate_budget <= current_budget) {
+                    std::cout
+                        << "Split-gap extension converged at budget "
+                        << current_budget
+                        << "\n";
+                    break;
+                }
+
+                std::cout
+                    << "Extending from objective bound "
+                    << current_budget
+                    << " to "
+                    << candidate_budget
+                    << "\n";
+
+                extend_result_to_budget_(
+                    depth_budget,
+                    candidate_budget,
+                    root,
+                    root_pk,
+                    root_cpath,
+                    all_features
+                );
+
+                current_budget = candidate_budget;
+            }
+
+            obj_bound = current_budget;
+            return result;
+        }
+
+        // mode 2: second multiplier is smaller.
+        // the smaller multiplier is a mode selector. it is not used
+        // as a smaller target budget. repeatedly inspect each
+        // treetrienode's own proxy/minimum ratio.
+        if (smaller_multiplier) {
+            int round = 0;
+
+            while (true) {
+                ++round;
+
+                std::cout
+                    << "Trie-node-gap extension round "
+                    << round
+                    << "\n";
+
+                const int candidate_budget =
+                    trie_node_gap_extension_budget_(
+                        result,
+                        root,
+                        depth_budget,
+                        first_budget,
+                        current_budget,
+                        root_pk,
+                        root_cpath
+                    );
+
+                if (candidate_budget <= current_budget) {
+                    std::cout
+                        << "Trie-node-gap extension converged at budget "
+                        << current_budget
+                        << "\n";
+                    break;
+                }
+
+                std::cout
+                    << "Extending from objective bound "
+                    << current_budget
+                    << " to "
+                    << candidate_budget
+                    << "\n";
+
+                extend_result_to_budget_(
+                    depth_budget,
+                    candidate_budget,
+                    root,
+                    root_pk,
+                    root_cpath,
+                    all_features
+                );
+
+                current_budget = candidate_budget;
+            }
+
+            obj_bound = current_budget;
+            return result;
+        }
+
+        // mode 3: second multiplier is larger.
+        // do expected behavior of extending to it
+        const int explicit_second_budget =
+            static_cast<int>(
+                std::llround(
+                    static_cast<double>(best_objective) *
+                    (1.0 + second_rashomon_mult) *
+                    (1.0 + multiplicative_slack)
+                )
+            );
+
+        if (explicit_second_budget < first_budget) {
+            throw std::logic_error(
+                "The explicit second objective bound is unexpectedly "
+                "smaller than the first objective bound."
+            );
+        }
+
+        std::cout
+            << "Explicitly extending to objective bound: "
+            << explicit_second_budget
+            << "\n";
+
+        if (explicit_second_budget == first_budget) {
+            obj_bound = first_budget;
+            return result;
+        }
+
+        extend_result_to_budget_(
+            depth_budget,
+            explicit_second_budget,
+            root,
+            root_pk,
+            root_cpath,
+            all_features
+        );
+
+        return result;
+    }
+
+    shared_ptr<TreeTrieNode> fit_prepared_then_extend(
+        double lambda,
+        int8_t depth_budget,
+        double first_rashomon_mult,
+        double second_rashomon_mult,
+        int8_t lookahead_k,
+        bool use_multipass_flag,
+        bool rule_list_mode_flag,
+        int proxy_style_in,
+        bool majority_leaf_only_flag,
+        bool cache_cheap_subproblems_flag,
+        bool proxy_caching_flag,
+        bool restrict_proxy_in_lickety_in,
+        bool restrict_proxy_in_depthd_exact_in,
+        bool restrict_proxy_in_greedy_in,
+        bool stronger_rollout_flag = false
+    ) {
+        if (!has_prepared_data) {
+            throw std::runtime_error(
+                "No prepared data. Call prepare_continuous_data(...) "
+                "before fit_prepared_then_extend(...)."
+            );
+        }
+
+        return fit_then_extend(
+            prepared_X_col_major,
+            prepared_y,
+            lambda,
+            depth_budget,
+            first_rashomon_mult,
+            second_rashomon_mult,
+            lookahead_k,
+            use_multipass_flag,
+            rule_list_mode_flag,
+            proxy_style_in,
+            majority_leaf_only_flag,
+            cache_cheap_subproblems_flag,
+            proxy_caching_flag,
+            prepared_allowed_proxy_features,
+            restrict_proxy_in_lickety_in,
+            restrict_proxy_in_depthd_exact_in,
+            restrict_proxy_in_greedy_in,
+            prepared_continuous_starts,
+            stronger_rollout_flag
+        );
+    }
+
     void fit_anytime(
         const std::vector<std::vector<bool>>& X_col_major,
         const std::vector<int>& y,
@@ -2047,6 +2434,7 @@ public:
         bool cache_cheap_subproblems_flag,
         bool proxy_caching_flag,
         const std::vector<int>& proxy_threshold_features,
+        const std::vector<int>& initial_active_threshold_features,
         int refinement_width,
         int max_refinement_rounds,
         bool increase_proxy_anytime,
@@ -2176,6 +2564,7 @@ public:
             depth_budget,
             rashomon_mult,
             proxy_threshold_features,
+            initial_active_threshold_features,
             refinement_width,
             max_refinement_rounds,
             increase_proxy_anytime,
@@ -2210,6 +2599,7 @@ public:
         bool cache_cheap_subproblems_flag,
         bool proxy_caching_flag,
         const std::vector<int>& proxy_threshold_features,
+        const std::vector<int>& initial_active_threshold_features,
         int refinement_width,
         int max_refinement_rounds = -1,
         bool increase_proxy_anytime = false,
@@ -2228,11 +2618,16 @@ public:
                 ? prepared_allowed_proxy_features
                 : proxy_threshold_features;
 
-        if (proxy_feats.empty() && !prepared_continuous_starts.empty()) {
+        std::vector<int> initial_feats =
+            initial_active_threshold_features.empty()
+                ? prepared_initial_active_features
+                : initial_active_threshold_features;
+
+        if (initial_feats.empty() &&
+            !prepared_continuous_starts.empty()) {
             throw std::runtime_error(
-                "fit_prepared_anytime needs either X_active in prepare_continuous_data(...) "
-                "or nonempty proxy_threshold_features, because otherwise there are no initial "
-                "continuous threshold anchors."
+                "Anytime enumeration needs at least one "
+                "initial continuous threshold anchor."
             );
         }
 
@@ -2250,6 +2645,7 @@ public:
             cache_cheap_subproblems_flag,
             proxy_caching_flag,
             proxy_feats,
+            initial_feats,
             refinement_width,
             max_refinement_rounds,
             increase_proxy_anytime,
@@ -2468,6 +2864,7 @@ public:
         int8_t depth_budget,
         double rashomon_mult,
         const std::vector<int>& proxy_threshold_features,
+        const std::vector<int>& initial_active_threshold_features,
         int refinement_width,
         int max_refinement_rounds = -1,
         bool increase_proxy_anytime = false,
@@ -2495,25 +2892,39 @@ public:
             B_bin.push_back(f);
         }
 
-        // B_proxy = user-selected proxy threshold features.
-        std::vector<int> B_proxy = proxy_threshold_features;
+        std::vector<int> B_proxy =
+            proxy_threshold_features;
+
+        std::vector<int> B_initial =
+            initial_active_threshold_features;
 
         for (int f : B_proxy) {
             if (f < 0 || f >= n_features) {
                 throw std::runtime_error(
-                    "proxy_threshold_features contains out-of-range feature index."
+                    "proxy_threshold_features contains "
+                    "an out-of-range feature index."
+                );
+            }
+        }
+
+        for (int f : B_initial) {
+            if (f < 0 || f >= n_features) {
+                throw std::runtime_error(
+                    "initial_active_threshold_features contains "
+                    "an out-of-range feature index."
                 );
             }
         }
 
         sort_unique_ints_inplace_(B_proxy);
+        sort_unique_ints_inplace_(B_initial);
 
         // B_active = B_bin union B_proxy.
         std::vector<int> B_active;
-        B_active.reserve(B_bin.size() + B_proxy.size());
+        B_active.reserve(B_bin.size() + B_initial.size());
 
         B_active.insert(B_active.end(), B_bin.begin(), B_bin.end());
-        B_active.insert(B_active.end(), B_proxy.begin(), B_proxy.end());
+        B_active.insert(B_active.end(), B_initial.begin(), B_initial.end());
 
         sort_unique_ints_inplace_(B_active);
 
@@ -2601,13 +3012,19 @@ public:
             // do not trust old (subproblem, depth) trie-cache hits.
             trie_cache.clear();
 
+            // one shared map for this entire DAG traversal.
+            // it is discarded after this refinement round.
+            RefineVisited visited;
+            visited.reserve(1024);
+
             RefineGraphDfs(
                 G_min,
                 root,
                 depth_budget,
                 root_pk,
                 root_cpath,
-                B_active
+                B_active,
+                visited
             );
 
             ++refinement_round;
@@ -2654,13 +3071,17 @@ public:
                 // subgraph cache: canonical completeness was with respect to the old search
                 trie_cache.clear();
 
+                RefineVisited visited;
+                visited.reserve(1024);
+
                 RefineGraphDfs(
                     G_min,
                     root,
                     depth_budget,
                     root_pk,
                     root_cpath,
-                    B_active
+                    B_active,
+                    visited
                 );
             }
 
@@ -2697,6 +3118,640 @@ public:
     }
 
 private:
+
+    struct TrieNodeProxyGapSummary {
+        double root_gap = 1.0;
+        double max_node_gap = 1.0;
+
+        std::size_t nodes_checked = 0;
+
+        const TreeTrieNode* worst_node = nullptr;
+        int worst_proxy_objective = -1;
+        int worst_minimum_objective = -1;
+    };
+
+    void collect_max_trie_node_proxy_gap_(
+        const std::shared_ptr<TreeTrieNode>& node,
+        const Packed& mask,
+        int8_t depth,
+        const PathKey& pk,
+        const ContinuousPath& cpath,
+        std::unordered_set<const TreeTrieNode*>& visited,
+        TrieNodeProxyGapSummary& summary
+    ) {
+        if (!node) {
+            return;
+        }
+
+        const TreeTrieNode* node_ptr = node.get();
+
+        // a cached TreeTrieNode may be reachable through multiple graph paths.
+        // its subproblem/depth is canonical, so evaluate it only once.
+        if (!visited.insert(node_ptr).second) {
+            return;
+        }
+
+        if (
+            node->min_objective == std::numeric_limits<int>::max() ||
+            node->min_objective <= 0
+        ) {
+            return;
+        }
+
+        const int proxy_objective =
+            proxy_objective_for_gap_(
+                mask,
+                depth,
+                pk,
+                cpath
+            );
+
+        const double node_gap = std::max(
+            1.0,
+            static_cast<double>(proxy_objective) /
+            static_cast<double>(node->min_objective)
+        );
+
+        ++summary.nodes_checked;
+
+        if (node_gap > summary.max_node_gap) {
+            summary.max_node_gap = node_gap;
+            summary.worst_node = node_ptr;
+            summary.worst_proxy_objective = proxy_objective;
+            summary.worst_minimum_objective =
+                node->min_objective;
+        }
+
+        if (depth <= 0) {
+            return;
+        }
+
+        Packed left_mask(n_words);
+        Packed right_mask(n_words);
+
+        for (const auto& split : node->splits) {
+            if (!split.left || !split.right) {
+                continue;
+            }
+
+            const int feat = split.feature;
+
+            popcount_and_make_split_words(
+                mask.w.data(),
+                X_bits[(std::size_t)feat].w.data(),
+                left_mask.w.data(),
+                right_mask.w.data(),
+                n_words,
+                tail_mask
+            );
+
+            if (!left_mask.any() || !right_mask.any()) {
+                continue;
+            }
+
+            const PathKey* left_pk = &empty_pk();
+            const PathKey* right_pk = &empty_pk();
+
+            PathKey left_pk_local;
+            PathKey right_pk_local;
+
+            make_child_pks_if_needed_(
+                feat,
+                pk,
+                left_pk,
+                right_pk,
+                left_pk_local,
+                right_pk_local
+            );
+
+            const ContinuousPath* left_cpath = &cpath;
+            const ContinuousPath* right_cpath = &cpath;
+
+            ContinuousPath left_cpath_local;
+            ContinuousPath right_cpath_local;
+
+            make_child_continuous_paths_if_needed_(
+                feat,
+                cpath,
+                left_cpath,
+                right_cpath,
+                left_cpath_local,
+                right_cpath_local
+            );
+
+            const int8_t child_depth =
+                static_cast<int8_t>(depth - 1);
+
+            collect_max_trie_node_proxy_gap_(
+                split.left,
+                left_mask,
+                child_depth,
+                *left_pk,
+                *left_cpath,
+                visited,
+                summary
+            );
+
+            collect_max_trie_node_proxy_gap_(
+                split.right,
+                right_mask,
+                child_depth,
+                *right_pk,
+                *right_cpath,
+                visited,
+                summary
+            );
+        }
+    }
+
+    struct ProxyGapSummary {
+        double root_gap = 1.0;
+        double max_split_gap = 1.0;
+
+        std::size_t distinct_nodes_visited = 0;
+        std::size_t splits_checked = 0;
+
+        const TreeTrieNode* worst_node = nullptr;
+        int worst_feature = -1;
+
+        int worst_proxy_sum = 0;
+        int worst_minimum_sum = 0;
+    };
+
+    int proxy_objective_for_gap_(
+        const Packed& mask,
+        int8_t depth,
+        const PathKey& pk,
+        const ContinuousPath& cpath
+    ) {
+        if (depth <= 0 || lookahead_init < 0) {
+            return leaf_objective(mask);
+        }
+
+        if (lookahead_init == 0) {
+            return greedy_proxy_objective_(
+                mask,
+                depth,
+                pk,
+                cpath
+            );
+        }
+
+        int8_t k_here = lookahead_init;
+
+        if (
+            proxy_style == 2 &&
+            depth >= 0 &&
+            depth < static_cast<int>(k_at_depth.size())
+        ) {
+            k_here = static_cast<int8_t>(
+                k_at_depth[static_cast<std::size_t>(depth)]
+            );
+        } else {
+            k_here = std::min<int8_t>(k_here, depth);
+        }
+
+        if (proxy_style == 4) {
+            return split_algorithm(
+                mask,
+                depth,
+                k_here,
+                pk
+            );
+        }
+
+        return lickety_proxy_objective_(
+            mask,
+            depth,
+            k_here,
+            pk,
+            cpath
+        );
+    }
+
+    void extend_result_to_budget_(
+        int8_t depth_budget,
+        int new_budget,
+        const Packed& root,
+        const PathKey& root_pk,
+        const ContinuousPath& root_cpath,
+        const std::vector<int>& all_features
+    ) {
+        result = construct_trie_extend(
+            result,
+            root,
+            depth_budget,
+            new_budget,
+            root_pk,
+            root_cpath,
+            &all_features,
+            /*launched_by_anytime=*/false
+        );
+
+        if (!result) {
+            throw std::runtime_error(
+                "construct_trie_extend returned an empty root graph."
+            );
+        }
+
+        obj_bound = new_budget;
+        trained_depth_budget = depth_budget;
+
+        std::cout
+            << "Extended minimum objective: "
+            << result->min_objective
+            << "\n";
+    }
+
+    void collect_max_proxy_gap_(
+        const std::shared_ptr<TreeTrieNode>& node,
+        const Packed& mask,
+        int8_t depth,
+        const PathKey& pk,
+        const ContinuousPath& cpath,
+        std::unordered_set<const TreeTrieNode*>& visited,
+        ProxyGapSummary& summary
+    ) {
+        if (!node || depth <= 0) {
+            return;
+        }
+
+        const TreeTrieNode* node_ptr = node.get();
+
+        // a treetrienode is canonical for a subproblem-depth pair, so once we
+        // process it, encountering it through another parent does not give us new splits or new child subproblems.
+        
+        if (!visited.insert(node_ptr).second) {
+            return;
+        }
+
+        ++summary.distinct_nodes_visited;
+
+        Packed left_mask(n_words);
+        Packed right_mask(n_words);
+
+        for (const SplitNode& split : node->splits) {
+            if (!split.left || !split.right) {
+                continue;
+            }
+
+            const int feat = split.feature;
+
+            split_threshold_bits_(
+                mask,
+                feat,
+                left_mask,
+                right_mask
+            );
+
+            if (!left_mask.any() || !right_mask.any()) {
+                continue;
+            }
+
+            const PathKey* left_pk = &empty_pk();
+            const PathKey* right_pk = &empty_pk();
+
+            PathKey left_pk_local;
+            PathKey right_pk_local;
+
+            make_child_pks_if_needed_(
+                feat,
+                pk,
+                left_pk,
+                right_pk,
+                left_pk_local,
+                right_pk_local
+            );
+
+            const ContinuousPath* left_cpath = &cpath;
+            const ContinuousPath* right_cpath = &cpath;
+
+            ContinuousPath left_cpath_local;
+            ContinuousPath right_cpath_local;
+
+            make_child_continuous_paths_if_needed_(
+                feat,
+                cpath,
+                left_cpath,
+                right_cpath,
+                left_cpath_local,
+                right_cpath_local
+            );
+
+            const int8_t child_depth =
+                static_cast<int8_t>(depth - 1);
+
+            const int proxy_left =
+                proxy_objective_for_gap_(
+                    left_mask,
+                    child_depth,
+                    *left_pk,
+                    *left_cpath
+                );
+
+            const int proxy_right =
+                proxy_objective_for_gap_(
+                    right_mask,
+                    child_depth,
+                    *right_pk,
+                    *right_cpath
+                );
+
+            const int minimum_left =
+                split.left->min_objective;
+
+            const int minimum_right =
+                split.right->min_objective;
+
+            if (
+                minimum_left == std::numeric_limits<int>::max() ||
+                minimum_right == std::numeric_limits<int>::max()
+            ) {
+                continue;
+            }
+
+            const int proxy_sum =
+                proxy_left + proxy_right;
+
+            const int minimum_sum =
+                minimum_left + minimum_right;
+
+            if (minimum_sum <= 0) {
+                throw std::logic_error(
+                    "Encountered nonpositive minimum completion objective "
+                    "while computing proxy-gap ratios."
+                );
+            }
+
+            const double split_gap = std::max(
+                1.0,
+                static_cast<double>(proxy_sum) /
+                static_cast<double>(minimum_sum)
+            );
+
+            ++summary.splits_checked;
+
+            if (split_gap > summary.max_split_gap) {
+                summary.max_split_gap = split_gap;
+                summary.worst_node = node_ptr;
+                summary.worst_feature = feat;
+                summary.worst_proxy_sum = proxy_sum;
+                summary.worst_minimum_sum = minimum_sum;
+            }
+
+            collect_max_proxy_gap_(
+                split.left,
+                left_mask,
+                child_depth,
+                *left_pk,
+                *left_cpath,
+                visited,
+                summary
+            );
+
+            collect_max_proxy_gap_(
+                split.right,
+                right_mask,
+                child_depth,
+                *right_pk,
+                *right_cpath,
+                visited,
+                summary
+            );
+        }
+    }
+
+    int trie_node_gap_extension_budget_(
+        const std::shared_ptr<TreeTrieNode>& root_node,
+        const Packed& root_mask,
+        int8_t depth_budget,
+        int first_budget,
+        int current_budget,
+        const PathKey& root_pk,
+        const ContinuousPath& root_cpath
+    ) {
+        if (!root_node) {
+            throw std::runtime_error(
+                "Cannot compute a trie-node-gap extension budget "
+                "without a root graph."
+            );
+        }
+
+        if (
+            root_node->min_objective <= 0 ||
+            root_node->min_objective ==
+                std::numeric_limits<int>::max()
+        ) {
+            throw std::runtime_error(
+                "The root graph has an invalid minimum objective."
+            );
+        }
+
+        TrieNodeProxyGapSummary summary;
+
+        summary.root_gap = std::max(
+            1.0,
+            static_cast<double>(best_objective) /
+            static_cast<double>(root_node->min_objective)
+        );
+
+        std::unordered_set<const TreeTrieNode*> visited;
+        visited.reserve(trie_cache.size() * 2 + 16);
+
+        collect_max_trie_node_proxy_gap_(
+            root_node,
+            root_mask,
+            depth_budget,
+            root_pk,
+            root_cpath,
+            visited,
+            summary
+        );
+
+        const double relative_gap = std::max(
+            1.0,
+            summary.max_node_gap / summary.root_gap
+        );
+
+        // anchor every round to the first-stage budget.
+        const long double raw_candidate =
+            static_cast<long double>(first_budget) *
+            static_cast<long double>(relative_gap);
+
+        if (
+            raw_candidate >
+            static_cast<long double>(
+                std::numeric_limits<int>::max()
+            )
+        ) {
+            throw std::overflow_error(
+                "Trie-node-gap extension budget exceeds integer range."
+            );
+        }
+
+        const int candidate_budget =
+            static_cast<int>(std::ceil(raw_candidate));
+
+        std::cout
+            << "Trie-node-gap automatic extension:\n"
+            << "  First-stage budget: "
+            << first_budget
+            << "\n"
+            << "  Current budget: "
+            << current_budget
+            << "\n"
+            << "  Root proxy objective: "
+            << best_objective
+            << "\n"
+            << "  Root minimum objective: "
+            << root_node->min_objective
+            << "\n"
+            << "  Root proxy-gap ratio: "
+            << summary.root_gap
+            << "\n"
+            << "  Maximum trie-node proxy-gap ratio: "
+            << summary.max_node_gap
+            << "\n"
+            << "  Relative ratio: "
+            << relative_gap
+            << "\n"
+            << "  Candidate budget: "
+            << candidate_budget
+            << "\n"
+            << "  Trie nodes checked: "
+            << summary.nodes_checked
+            << "\n";
+
+        if (summary.worst_node != nullptr) {
+            std::cout
+                << "  Worst node proxy objective: "
+                << summary.worst_proxy_objective
+                << "\n"
+                << "  Worst node minimum objective: "
+                << summary.worst_minimum_objective
+                << "\n";
+        }
+
+        return std::max(first_budget, candidate_budget);
+    }
+
+    int split_gap_extension_budget_(
+        const std::shared_ptr<TreeTrieNode>& root_node,
+        const Packed& root_mask,
+        int8_t depth_budget,
+        int first_budget,
+        int current_budget,
+        const PathKey& root_pk,
+        const ContinuousPath& root_cpath
+    ) {
+        if (!root_node) {
+            throw std::runtime_error(
+                "Cannot compute a split-gap extension budget "
+                "without a root graph."
+            );
+        }
+
+        if (
+            root_node->min_objective <= 0 ||
+            root_node->min_objective ==
+                std::numeric_limits<int>::max()
+        ) {
+            throw std::runtime_error(
+                "The root graph has an invalid minimum objective."
+            );
+        }
+
+        ProxyGapSummary summary;
+
+        summary.root_gap = std::max(
+            1.0,
+            static_cast<double>(best_objective) /
+            static_cast<double>(root_node->min_objective)
+        );
+
+        std::unordered_set<const TreeTrieNode*> visited;
+        visited.reserve(trie_cache.size() * 2 + 16);
+
+        collect_max_proxy_gap_(
+            root_node,
+            root_mask,
+            depth_budget,
+            root_pk,
+            root_cpath,
+            visited,
+            summary
+        );
+
+        const double relative_gap = std::max(
+            1.0,
+            summary.max_split_gap / summary.root_gap
+        );
+
+        // use the original first-stage budget,
+        // not the current extended budget.
+        const long double raw_candidate =
+            static_cast<long double>(first_budget) *
+            static_cast<long double>(relative_gap);
+
+        if (
+            raw_candidate >
+            static_cast<long double>(
+                std::numeric_limits<int>::max()
+            )
+        ) {
+            throw std::overflow_error(
+                "Split-gap extension budget exceeds integer range."
+            );
+        }
+
+        const int candidate_budget =
+            static_cast<int>(std::ceil(raw_candidate));
+
+        std::cout
+            << "Split-gap automatic extension:\n"
+            << "  First-stage budget: "
+            << first_budget
+            << "\n"
+            << "  Current budget: "
+            << current_budget
+            << "\n"
+            << "  Root proxy objective: "
+            << best_objective
+            << "\n"
+            << "  Root minimum objective: "
+            << root_node->min_objective
+            << "\n"
+            << "  Root proxy-gap ratio: "
+            << summary.root_gap
+            << "\n"
+            << "  Maximum split proxy-gap ratio: "
+            << summary.max_split_gap
+            << "\n"
+            << "  Relative ratio: "
+            << relative_gap
+            << "\n"
+            << "  Candidate budget: "
+            << candidate_budget
+            << "\n"
+            << "  Splits checked: "
+            << summary.splits_checked
+            << "\n";
+
+        if (summary.worst_node != nullptr) {
+            std::cout
+                << "  Worst split feature: "
+                << summary.worst_feature
+                << "\n"
+                << "  Worst split proxy sum: "
+                << summary.worst_proxy_sum
+                << "\n"
+                << "  Worst split minimum sum: "
+                << summary.worst_minimum_sum
+                << "\n";
+        }
+
+        return std::max(first_budget, candidate_budget);
+    }
 
     static inline uint8_t pred_to_mask_(int pred) {
         if (pred == 0) return uint8_t(1);
@@ -3033,9 +4088,63 @@ private:
 
         Packed L(n_words), R(n_words);
 
+        ContinuousPath pi_cur = materialize_continuous_path_(cpath);
+
+        
         const int8_t k_here = (proxy_style == 2 && depth >= 0 && depth < (int)k_at_depth.size())
             ? k_at_depth[depth-1]
             : lookahead_init;
+
+        // continuous groups, already fully binarized
+        for (int cont_pos = 0; cont_pos < (int)continuous_starts.size(); ++cont_pos) {
+            const int raw_start_idx = continuous_starts[(size_t)cont_pos];
+
+            const int raw_end_idx = (cont_pos + 1 < (int)continuous_starts.size())
+                ? continuous_starts[(size_t)(cont_pos + 1)]
+                : n_features;
+
+            auto [start_idx, end_idx] =
+                tighten_continuous_interval_from_path_(
+                    raw_start_idx,
+                    raw_end_idx,
+                    pi_cur
+                );
+
+            if (start_idx >= end_idx) {
+                continue;
+            }
+
+            if (active_features) {
+                enumerate_active_continuous_feature_for_trie_restricted(
+                    node,
+                    mask,
+                    depth,
+                    budget,
+                    pk,
+                    pi_cur,
+                    k_here,
+                    start_idx,
+                    end_idx,
+                    L,
+                    R,
+                    active_features
+                );
+            } else {
+                enumerate_continuous_feature_for_trie(
+                    node,
+                    mask,
+                    depth,
+                    budget,
+                    pk,
+                    pi_cur,
+                    k_here,
+                    start_idx,
+                    end_idx,
+                    L,
+                    R
+                );
+            }
+        }
 
         const int first_continuous_feature = continuous_starts.empty() ? n_features : continuous_starts[0];
 
@@ -3067,12 +4176,12 @@ private:
             if (lookahead_init < 0) {
                 lossL = leaf_objective(L);
             } else if (lookahead_init == 0) {
-                lossL = greedy_proxy_objective_(L, depth - 1, *pkLp, cpath);
+                lossL = greedy_proxy_objective_(L, depth - 1, *pkLp, pi_cur);
             } else {
                 if (proxy_style == 4) {
                     lossL = split_algorithm(L, depth - 1, k_here, *pkLp);
                 } else {
-                    lossL = lickety_proxy_objective_(L, depth - 1, k_here, *pkLp, cpath);
+                    lossL = lickety_proxy_objective_(L, depth - 1, k_here, *pkLp, pi_cur);
                 }
             }
 
@@ -3085,12 +4194,12 @@ private:
             if (lookahead_init < 0) {
                 lossR = leaf_objective(R);
             } else if (lookahead_init == 0) {
-                lossR = greedy_proxy_objective_(R, depth - 1, *pkRp, cpath);
+                lossR = greedy_proxy_objective_(R, depth - 1, *pkRp, pi_cur);
             } else {
                 if (proxy_style == 4) {
                     lossR = split_algorithm(R, depth - 1, k_here, *pkRp);
                 } else {
-                    lossR = lickety_proxy_objective_(R, depth - 1, k_here, *pkRp, cpath);
+                    lossR = lickety_proxy_objective_(R, depth - 1, k_here, *pkRp, pi_cur);
                 }
             }
 
@@ -3111,82 +4220,17 @@ private:
                     L, R,
                     budget, depth,
                     *pkLp, *pkRp,
-                    cpath, cpath,
+                    pi_cur, pi_cur,
                     active_features
                 );
             } else {
-                LR = symmetric_single_pass(lossL, lossR, L, R, budget, depth, *pkLp, *pkRp, cpath, cpath);
+                LR = symmetric_single_pass(lossL, lossR, L, R, budget, depth, *pkLp, *pkRp, pi_cur, pi_cur);
             }
 
             // the left and right TreeTrieNode (OR nodes) to be added to the AND/OR graph being built
             if (!LR.first || !LR.second) continue; // safeguard, especially needed if we allow non-injective keys
             
             node->add_split(f, LR.first, LR.second); // add split with left and right subtries
-        }
-
-        // continuous groups, already fully binarized
-        for (int cont_pos = 0; cont_pos < (int)continuous_starts.size(); ++cont_pos) {
-            const int raw_start_idx = continuous_starts[(size_t)cont_pos];
-
-            const int raw_end_idx = (cont_pos + 1 < (int)continuous_starts.size())
-                ? continuous_starts[(size_t)(cont_pos + 1)]
-                : n_features;
-
-            auto [start_idx, end_idx] =
-                tighten_continuous_interval_from_path_(
-                    raw_start_idx,
-                    raw_end_idx,
-                    cpath
-                );
-
-            if (start_idx >= end_idx) {
-                continue;
-            }
-
-            // enumerate_continuous_feature_for_trie(
-            //     node,
-            //     mask,
-            //     depth,
-            //     budget,
-            //     pk,
-            //     cpath,
-            //     k_here,
-            //     start_idx,
-            //     end_idx,
-            //     L,
-            //     R
-            // );
-
-            if (active_features) {
-                enumerate_active_continuous_feature_for_trie_restricted(
-                    node,
-                    mask,
-                    depth,
-                    budget,
-                    pk,
-                    cpath,
-                    k_here,
-                    start_idx,
-                    end_idx,
-                    L,
-                    R,
-                    active_features
-                );
-            } else {
-                enumerate_continuous_feature_for_trie(
-                    node,
-                    mask,
-                    depth,
-                    budget,
-                    pk,
-                    cpath,
-                    k_here,
-                    start_idx,
-                    end_idx,
-                    L,
-                    R
-                );
-            }
         }
 
         if (trie_cache_enabled) trie_cache.emplace(key, node);
@@ -3199,7 +4243,7 @@ private:
         int8_t depth,
         int budget,
         const PathKey& pk,
-        const ContinuousPath& cpath,
+        ContinuousPath& cpath,
         int8_t k_here,
         int start_idx,
         int end_idx,
@@ -3237,7 +4281,10 @@ private:
         ProxyCompletionTree& evaluated =
             continuous_proxy_completion_cache[cache_key];
 
-        ContinuousPath q_cpath = materialize_continuous_path_(cpath);
+        // ContinuousPath q_cpath = materialize_continuous_path_(cpath);
+        if ((int)cpath.size() != (int)continuous_starts.size()) {
+            initialize_continuous_path_(cpath);
+        }
 
         std::deque<std::pair<int,int>> Q;
         Q.push_back({0, (int)active_thresholds.size() - 1});
@@ -3258,12 +4305,12 @@ private:
 
             if (left_empty || right_empty) {
                 if (left_empty && !right_empty) {
-                    constrain_continuous_false_branch_(q_cpath, feat);
+                    constrain_continuous_false_branch_(cpath, feat);
                     if (mid + 1 <= j) {
                         Q.push_back({mid + 1, j});
                     }
                 } else if (!left_empty && right_empty) {
-                    constrain_continuous_true_branch_(q_cpath, feat);
+                    constrain_continuous_true_branch_(cpath, feat);
                     if (i <= mid - 1) {
                         Q.push_back({i, mid - 1});
                     }
@@ -3294,7 +4341,7 @@ private:
 
             make_child_continuous_paths_if_needed_(
                 feat,
-                q_cpath,
+                cpath,
                 cpathLp,
                 cpathRp,
                 cpathL_local,
@@ -3575,7 +4622,7 @@ private:
         int8_t depth,
         int budget,
         const PathKey& pk,
-        const ContinuousPath& cpath,
+        ContinuousPath& cpath,
         int8_t k_here,
         int start_idx,
         int end_idx,
@@ -3622,7 +4669,10 @@ private:
         ProxyCompletionTree& evaluated =
             continuous_proxy_completion_cache[cache_key];
 
-        ContinuousPath q_cpath = materialize_continuous_path_(cpath);
+        // ContinuousPath q_cpath = materialize_continuous_path_(cpath);
+        if ((int)cpath.size() != (int)continuous_starts.size()) {
+            initialize_continuous_path_(cpath);
+        }
 
         const int anytime_lk1_feat =
             lookup_anytime_lickety_first_split_(mask, depth, pk);
@@ -3676,7 +4726,7 @@ private:
 
             make_child_continuous_paths_if_needed_(
                 feat,
-                q_cpath,
+                cpath,
                 cpathLp,
                 cpathRp,
                 cpathL_local,
@@ -3799,7 +4849,7 @@ private:
 
                 make_child_continuous_paths_if_needed_(
                     feat,
-                    q_cpath,
+                    cpath,
                     cpathLp,
                     cpathRp,
                     cpathL_local,
@@ -4002,13 +5052,13 @@ private:
 
             if (left_empty || right_empty) {
                 if (left_empty && !right_empty) {
-                    constrain_continuous_false_branch_(q_cpath, feat);
+                    constrain_continuous_false_branch_(cpath, feat);
                     M_L = std::max(M_L, mid + 1);
                     if (mid + 1 <= j) {
                         Q.push_back({mid + 1, j});
                     }
                 } else if (!left_empty && right_empty) {
-                    constrain_continuous_true_branch_(q_cpath, feat);
+                    constrain_continuous_true_branch_(cpath, feat);
                     M_R = std::min(M_R, mid - 1);
                     if (i <= mid - 1) {
                         Q.push_back({i, mid - 1});
@@ -4041,7 +5091,7 @@ private:
 
             make_child_continuous_paths_if_needed_(
                 feat,
-                q_cpath,
+                cpath,
                 cpathLp,
                 cpathRp,
                 cpathL_local,
@@ -4190,15 +5240,31 @@ private:
         }
     }
 
+    using RefineVisited =
+        std::unordered_set<TreeTrieNode*>;
+
     void RefineGraphDfs(
         std::shared_ptr<TreeTrieNode>& G,
         const Packed& mask,
         int8_t depth,
         const PathKey& pk,
         const ContinuousPath& cpath,
-        const std::vector<int>& B_active
+        const std::vector<int>& B_active,
+        RefineVisited& visited
     ) {
+        
         if (!G) return;
+
+        TreeTrieNode* node_ptr = G.get();
+
+        // insert returns {iterator, was_inserted}.
+        // If the node was already present, it has already been refined
+        // during this pass.
+        // budgets don't matter here because we have budget-independent subgraphs
+        // iterative budget refinement also counts and does the refinement in full
+        if (!visited.insert(node_ptr).second) {
+            return;
+        }
 
         const int budget = G->budget;
 
@@ -4223,6 +5289,7 @@ private:
             !feature_in_sorted_vector_(B_active, anytime_lk1_feat);
 
         const std::size_t split_count_before = G->splits.size();
+
 
         // post-order: first refine children of the splits that already existed.
         for (std::size_t idx = 0; idx < split_count_before; ++idx) {
@@ -4275,7 +5342,8 @@ private:
                     depth - 1,
                     *pkLp,
                     *cpathLp,
-                    B_active
+                    B_active,
+                    visited
                 );
             }
 
@@ -4286,7 +5354,8 @@ private:
                     depth - 1,
                     *pkRp,
                     *cpathRp,
-                    B_active
+                    B_active,
+                    visited
                 );
             }
 
@@ -4353,6 +5422,8 @@ private:
         // and do iterative budget refinement again given that their minimum objectives could have improved with what we just did
         std::unordered_set<int> already_split = local_split_features_(G);
 
+        ContinuousPath pi_cur = materialize_continuous_path_(cpath);
+
         for (int cont_pos = 0; cont_pos < (int)continuous_starts.size(); ++cont_pos) {
             const int raw_start_idx = continuous_starts[(std::size_t)cont_pos];
 
@@ -4365,7 +5436,7 @@ private:
                 tighten_continuous_interval_from_path_(
                     raw_start_idx,
                     raw_end_idx,
-                    cpath
+                    pi_cur
                 );
 
             if (start_idx >= end_idx) {
@@ -4378,7 +5449,7 @@ private:
                 depth,
                 budget,
                 pk,
-                cpath,
+                pi_cur,
                 k_here,
                 start_idx,
                 end_idx,
@@ -4798,7 +5869,7 @@ private:
         int8_t depth,
         int budget,
         const PathKey& pk,
-        const ContinuousPath& cpath,
+        ContinuousPath& cpath,
         int8_t k_here,
         int start_idx,
         int end_idx,
@@ -4816,7 +5887,10 @@ private:
         // successful splits are stored persistently by node->add_split(feat, ...).
         // std::map<int, std::pair<int,int>> evaluated;
 
-        ContinuousPath q_cpath = materialize_continuous_path_(cpath);
+        // ContinuousPath q_cpath = materialize_continuous_path_(cpath);
+        if ((int)cpath.size() != (int)continuous_starts.size()) {
+            initialize_continuous_path_(cpath);
+        }
         std::deque<std::pair<int,int>> Q;
         Q.push_back({start_idx, end_idx - 1});
 
@@ -4853,14 +5927,14 @@ private:
 
             if (left_empty || right_empty) {
                 if (left_empty && !right_empty) {
-                    constrain_continuous_false_branch_(q_cpath, feat);
+                    constrain_continuous_false_branch_(cpath, feat);
                     // threshold too low: all thresholds <= feat also have empty left.
                     // only higher thresholds can become valid.
                     if (feat + 1 <= j) {
                         Q.push_back({feat + 1, j});
                     }
                 } else if (!left_empty && right_empty) {
-                    constrain_continuous_true_branch_(q_cpath, feat);
+                    constrain_continuous_true_branch_(cpath, feat);
                     // threshold too high: all thresholds >= feat also have empty right.
                     // only lower thresholds can become valid.
                     if (i <= feat - 1) {
@@ -4894,7 +5968,7 @@ private:
 
             make_child_continuous_paths_if_needed_(
                 feat,
-                q_cpath,
+                cpath,
                 cpathLp,
                 cpathRp,
                 cpathL_local,
@@ -5726,12 +6800,68 @@ private:
 
         Packed L(n_words), R(n_words);
 
+        ContinuousPath pi_cur = materialize_continuous_path_(cpath);
+
         const int8_t k_here = (proxy_style == 2 && depth >= 0 && depth < (int)k_at_depth.size())
             ? k_at_depth[depth-1]
             : lookahead_init;
 
+        
         const int first_continuous_feature = continuous_starts.empty() ? n_features : continuous_starts[0];
         auto already_split = local_split_features_(node);
+
+        // continuous groups, already fully binarized
+        for (int cont_pos = 0; cont_pos < (int)continuous_starts.size(); ++cont_pos) {
+            const int raw_start_idx = continuous_starts[(size_t)cont_pos];
+
+            const int raw_end_idx = (cont_pos + 1 < (int)continuous_starts.size())
+                ? continuous_starts[(size_t)(cont_pos + 1)]
+                : n_features;
+
+            auto [start_idx, end_idx] =
+                tighten_continuous_interval_from_path_(
+                    raw_start_idx,
+                    raw_end_idx,
+                    pi_cur
+                );
+
+            if (start_idx >= end_idx) {
+                continue;
+            }
+
+            if (active_features) {
+                enumerate_continuous_feature_for_trie_extend_restricted(
+                    node,
+                    mask,
+                    depth,
+                    budget,
+                    pk,
+                    pi_cur,
+                    k_here,
+                    start_idx,
+                    end_idx,
+                    L,
+                    R,
+                    already_split,
+                    active_features
+                );
+            } else {
+                 enumerate_continuous_feature_for_trie_extend(
+                    node,
+                    mask,
+                    depth,
+                    budget,
+                    pk,
+                    pi_cur,
+                    k_here,
+                    start_idx,
+                    end_idx,
+                    L,
+                    R,
+                    already_split
+                );
+            }
+        }
 
         for (int f = 0; f < first_continuous_feature; ++f) {
             if (already_split.count(f)) {
@@ -5771,15 +6901,15 @@ private:
                     pkR_local
                 );
 
-                const ContinuousPath* cpathLp = &cpath;
-                const ContinuousPath* cpathRp = &cpath;
+                const ContinuousPath* cpathLp = &pi_cur;
+                const ContinuousPath* cpathRp = &pi_cur;
 
                 ContinuousPath cpathL_local;
                 ContinuousPath cpathR_local;
 
                 make_child_continuous_paths_if_needed_(
                     f,
-                    cpath,
+                    pi_cur,
                     cpathLp,
                     cpathRp,
                     cpathL_local,
@@ -5858,12 +6988,12 @@ private:
             if (lookahead_init < 0) {
                 lossL = leaf_objective(L);
             } else if (lookahead_init == 0) {
-                lossL = greedy_proxy_objective_(L, depth - 1, *pkLp, cpath);
+                lossL = greedy_proxy_objective_(L, depth - 1, *pkLp, pi_cur);
             } else {
                 if (proxy_style == 4) {
                     lossL = split_algorithm(L, depth - 1, k_here, *pkLp);
                 } else {
-                    lossL = lickety_proxy_objective_(L, depth - 1, k_here, *pkLp, cpath);
+                    lossL = lickety_proxy_objective_(L, depth - 1, k_here, *pkLp, pi_cur);
                 }
             }
 
@@ -5876,12 +7006,12 @@ private:
             if (lookahead_init < 0) {
                 lossR = leaf_objective(R);
             } else if (lookahead_init == 0) {
-                lossR = greedy_proxy_objective_(R, depth - 1, *pkRp, cpath);
+                lossR = greedy_proxy_objective_(R, depth - 1, *pkRp, pi_cur);
             } else {
                 if (proxy_style == 4) {
                     lossR = split_algorithm(R, depth - 1, k_here, *pkRp);
                 } else {
-                    lossR = lickety_proxy_objective_(R, depth - 1, k_here, *pkRp, cpath);
+                    lossR = lickety_proxy_objective_(R, depth - 1, k_here, *pkRp, pi_cur);
                 }
             }
 
@@ -5906,8 +7036,8 @@ private:
                 depth,
                 *pkLp,
                 *pkRp,
-                cpath,
-                cpath,
+                pi_cur,
+                pi_cur,
                 active_features
             );
 
@@ -5915,59 +7045,6 @@ private:
             if (!LR.first || !LR.second) continue; // safeguard, especially needed if we allow non-injective keys
             
             node->add_split(f, LR.first, LR.second); // add split with left and right subtries
-        }
-
-        // continuous groups, already fully binarized
-        for (int cont_pos = 0; cont_pos < (int)continuous_starts.size(); ++cont_pos) {
-            const int raw_start_idx = continuous_starts[(size_t)cont_pos];
-
-            const int raw_end_idx = (cont_pos + 1 < (int)continuous_starts.size())
-                ? continuous_starts[(size_t)(cont_pos + 1)]
-                : n_features;
-
-            auto [start_idx, end_idx] =
-                tighten_continuous_interval_from_path_(
-                    raw_start_idx,
-                    raw_end_idx,
-                    cpath
-                );
-
-            if (start_idx >= end_idx) {
-                continue;
-            }
-
-            if (active_features) {
-                enumerate_continuous_feature_for_trie_extend_restricted(
-                    node,
-                    mask,
-                    depth,
-                    budget,
-                    pk,
-                    cpath,
-                    k_here,
-                    start_idx,
-                    end_idx,
-                    L,
-                    R,
-                    already_split,
-                    active_features
-                );
-            } else {
-                 enumerate_continuous_feature_for_trie_extend(
-                    node,
-                    mask,
-                    depth,
-                    budget,
-                    pk,
-                    cpath,
-                    k_here,
-                    start_idx,
-                    end_idx,
-                    L,
-                    R,
-                    already_split
-                );
-            }
         }
 
         if (trie_cache_enabled) trie_cache.emplace(key, node);
@@ -5980,7 +7057,7 @@ private:
         int8_t depth,
         int budget,
         const PathKey& pk,
-        const ContinuousPath& cpath,
+        ContinuousPath& cpath,
         int8_t k_here,
         int start_idx,
         int end_idx,
@@ -5999,7 +7076,10 @@ private:
         // successful splits are stored persistently by node->add_split(feat, ...).
         // std::map<int, std::pair<int,int>> evaluated;
 
-        ContinuousPath q_cpath = materialize_continuous_path_(cpath);
+        // ContinuousPath q_cpath = materialize_continuous_path_(cpath);
+        if ((int)cpath.size() != (int)continuous_starts.size()) {
+            initialize_continuous_path_(cpath);
+        }
 
         std::deque<std::pair<int,int>> Q;
         Q.push_back({start_idx, end_idx - 1});
@@ -6068,7 +7148,7 @@ private:
 
                         make_child_continuous_paths_if_needed_(
                             feat,
-                            q_cpath,
+                            cpath,
                             cpathLp,
                             cpathRp,
                             cpathL_local,
@@ -6131,14 +7211,14 @@ private:
 
             if (left_empty || right_empty) {
                 if (left_empty && !right_empty) {
-                    constrain_continuous_false_branch_(q_cpath, feat);
+                    constrain_continuous_false_branch_(cpath, feat);
                     // threshold too low: all thresholds <= feat also have empty left.
                     // only higher thresholds can become valid.
                     if (feat + 1 <= j) {
                         Q.push_back({feat + 1, j});
                     }
                 } else if (!left_empty && right_empty) {
-                    constrain_continuous_true_branch_(q_cpath, feat);
+                    constrain_continuous_true_branch_(cpath, feat);
                     // threshold too high: all thresholds >= feat also have empty right.
                     // only lower thresholds can become valid.
                     if (i <= feat - 1) {
@@ -6172,7 +7252,7 @@ private:
 
             make_child_continuous_paths_if_needed_(
                 feat,
-                q_cpath,
+                cpath,
                 cpathLp,
                 cpathRp,
                 cpathL_local,
@@ -7008,7 +8088,7 @@ private:
         int8_t child_k,
         int8_t cache_lookup_k,
         const PathKey& pk,
-        const ContinuousPath& cpath,
+        ContinuousPath& cpath,
         int start_idx,
         int end_idx,
         int current_best,
@@ -7029,7 +8109,10 @@ private:
         
         std::map<int, std::pair<int,int>> evaluated;
 
-        ContinuousPath q_cpath = materialize_continuous_path_(cpath);
+        // ContinuousPath q_cpath = materialize_continuous_path_(cpath);
+        if ((int)cpath.size() != (int)continuous_starts.size()) {
+            initialize_continuous_path_(cpath);
+        }
 
         std::deque<std::pair<int,int>> Q;
         Q.push_back({start_idx, end_idx - 1});
@@ -7069,12 +8152,12 @@ private:
 
             if (left_empty || right_empty) {
                 if (left_empty && !right_empty) {
-                    constrain_continuous_false_branch_(q_cpath, feat);
+                    constrain_continuous_false_branch_(cpath, feat);
                     if (feat + 1 <= j) {
                         Q.push_back({feat + 1, j});
                     }
                 } else if (!left_empty && right_empty) {
-                    constrain_continuous_true_branch_(q_cpath, feat);
+                    constrain_continuous_true_branch_(cpath, feat);
                     if (i <= feat - 1) {
                         Q.push_back({i, feat - 1});
                     }
@@ -7105,7 +8188,7 @@ private:
 
             make_child_continuous_paths_if_needed_(
                 feat,
-                q_cpath,
+                cpath,
                 cpathLp,
                 cpathRp,
                 cpathL_local,
@@ -7307,6 +8390,48 @@ private:
         const int F = n_features;
         const int first_cont = first_continuous_feature_();
 
+        ContinuousPath pi_cur = materialize_continuous_path_(cpath);
+
+        // continuous groups.
+        for (int cont_pos = 0; cont_pos < (int)continuous_starts.size(); ++cont_pos) {
+            const int raw_start = continuous_starts[(size_t)cont_pos];
+            const int raw_end = continuous_group_end_(cont_pos);
+
+            if (raw_start >= F) continue;
+
+            auto [start_idx, end_idx] =
+                tighten_continuous_interval_from_path_(
+                    raw_start,
+                    std::min(raw_end, F),
+                    pi_cur
+                );
+
+            if (start_idx >= end_idx) continue;
+
+            ContinuousBestSplitResult cres =
+                search_continuous_feature_for_best_split_continuous_(
+                    mask,
+                    depth_budget,
+                    child_k,
+                    /*cache_lookup_k=*/k,
+                    pk,
+                    pi_cur,
+                    start_idx,
+                    end_idx,
+                    best_sum,
+                    ContinuousEvalMode::Lickety
+                );
+
+            if (cres.best_feat >= 0 && cres.best_sum < best_sum) {
+                best_sum = cres.best_sum;
+                best_feat = cres.best_feat;
+            }
+
+            if (cres.best_cached_sum < best_cached_sum) {
+                best_cached_sum = cres.best_cached_sum;
+            }
+        }
+
         // binary / ordinary feature columns only.
         for (int f = 0; f < first_cont; ++f) {
             and_bits(mask, X_bits[f], L);
@@ -7334,7 +8459,7 @@ private:
                 depth_budget - 1,
                 child_k,
                 *pkLp,
-                cpath
+                pi_cur
             );
 
             const int right_loss = eval_with_lookahead_continuous(
@@ -7342,7 +8467,7 @@ private:
                 depth_budget - 1,
                 child_k,
                 *pkRp,
-                cpath
+                pi_cur
             );
 
             const int sum = left_loss + right_loss;
@@ -7363,46 +8488,6 @@ private:
                 left_loss,
                 right_loss
             );
-        }
-
-        // continuous groups.
-        for (int cont_pos = 0; cont_pos < (int)continuous_starts.size(); ++cont_pos) {
-            const int raw_start = continuous_starts[(size_t)cont_pos];
-            const int raw_end = continuous_group_end_(cont_pos);
-
-            if (raw_start >= F) continue;
-
-            auto [start_idx, end_idx] =
-                tighten_continuous_interval_from_path_(
-                    raw_start,
-                    std::min(raw_end, F),
-                    cpath
-                );
-
-            if (start_idx >= end_idx) continue;
-
-            ContinuousBestSplitResult cres =
-                search_continuous_feature_for_best_split_continuous_(
-                    mask,
-                    depth_budget,
-                    child_k,
-                    /*cache_lookup_k=*/k,
-                    pk,
-                    cpath,
-                    start_idx,
-                    end_idx,
-                    best_sum,
-                    ContinuousEvalMode::Lickety
-                );
-
-            if (cres.best_feat >= 0 && cres.best_sum < best_sum) {
-                best_sum = cres.best_sum;
-                best_feat = cres.best_feat;
-            }
-
-            if (cres.best_cached_sum < best_cached_sum) {
-                best_cached_sum = cres.best_cached_sum;
-            }
         }
 
         int ans = leaf_loss;
@@ -7458,15 +8543,15 @@ private:
                 pkR_local
             );
 
-            const ContinuousPath* cpathLp = &cpath;
-            const ContinuousPath* cpathRp = &cpath;
+            const ContinuousPath* cpathLp = &pi_cur;
+            const ContinuousPath* cpathRp = &pi_cur;
 
             ContinuousPath cpathL_local;
             ContinuousPath cpathR_local;
 
             make_child_continuous_paths_if_needed_(
                 best_feat,
-                cpath,
+                pi_cur,
                 cpathLp,
                 cpathRp,
                 cpathL_local,
@@ -9066,6 +10151,48 @@ private:
         const int F = n_features;
         const int first_cont = first_continuous_feature_();
 
+        ContinuousPath pi_cur = materialize_continuous_path_(cpath);
+
+
+        // continuous groups
+        for (int cont_pos = 0; cont_pos < (int)continuous_starts.size(); ++cont_pos) {
+            const int raw_start = continuous_starts[(size_t)cont_pos];
+            const int raw_end = continuous_group_end_(cont_pos);
+
+            if (raw_start >= F) continue;
+
+            auto [start_idx, end_idx] =
+                tighten_continuous_interval_from_path_(
+                    raw_start,
+                    std::min(raw_end, F),
+                    pi_cur
+                );
+
+            if (start_idx >= end_idx) continue;
+
+            ContinuousBestSplitResult cres =
+                search_continuous_feature_for_best_split_continuous_(
+                    mask,
+                    depth_budget,
+                    /*child_k=*/depth_budget - 2,
+                    /*cache_lookup_k=*/depth_budget - 2,
+                    pk,
+                    pi_cur,
+                    start_idx,
+                    end_idx,
+                    best_sum,
+                    ContinuousEvalMode::Exact
+                );
+
+            if (cres.best_feat >= 0 && cres.best_sum < best_sum) {
+                best_sum = cres.best_sum;
+            }
+
+            if (cres.best_cached_sum < best_cached_sum) {
+                best_cached_sum = cres.best_cached_sum;
+            }
+        }
+
         // binary / ordinary features.
         for (int f = 0; f < first_cont; ++f) {
             if (num_classes == 2) {
@@ -9099,15 +10226,15 @@ private:
                 pkR_local
             );
 
-            const ContinuousPath* cpathLp = &cpath;
-            const ContinuousPath* cpathRp = &cpath;
+            const ContinuousPath* cpathLp = &pi_cur;
+            const ContinuousPath* cpathRp = &pi_cur;
 
             ContinuousPath cpathL_local;
             ContinuousPath cpathR_local;
 
             make_child_continuous_paths_if_needed_(
                 f,
-                cpath,
+                pi_cur,
                 cpathLp,
                 cpathRp,
                 cpathL_local,
@@ -9153,45 +10280,6 @@ private:
                 left_best,
                 right_best
             );
-        }
-
-        // continuous groups
-        for (int cont_pos = 0; cont_pos < (int)continuous_starts.size(); ++cont_pos) {
-            const int raw_start = continuous_starts[(size_t)cont_pos];
-            const int raw_end = continuous_group_end_(cont_pos);
-
-            if (raw_start >= F) continue;
-
-            auto [start_idx, end_idx] =
-                tighten_continuous_interval_from_path_(
-                    raw_start,
-                    std::min(raw_end, F),
-                    cpath
-                );
-
-            if (start_idx >= end_idx) continue;
-
-            ContinuousBestSplitResult cres =
-                search_continuous_feature_for_best_split_continuous_(
-                    mask,
-                    depth_budget,
-                    /*child_k=*/depth_budget - 2,
-                    /*cache_lookup_k=*/depth_budget - 2,
-                    pk,
-                    cpath,
-                    start_idx,
-                    end_idx,
-                    best_sum,
-                    ContinuousEvalMode::Exact
-                );
-
-            if (cres.best_feat >= 0 && cres.best_sum < best_sum) {
-                best_sum = cres.best_sum;
-            }
-
-            if (cres.best_cached_sum < best_cached_sum) {
-                best_cached_sum = cres.best_cached_sum;
-            }
         }
 
         int ans = best_sum;
@@ -9262,6 +10350,7 @@ private:
 
         const int F = n_features;
         const int first_cont = first_continuous_feature_();
+        ContinuousPath pi_cur = materialize_continuous_path_(cpath);
 
         // ordinary binary features
         for (int f = 0; f < first_cont; ++f) {
@@ -9304,7 +10393,7 @@ private:
                 tighten_continuous_interval_from_path_(
                     raw_start,
                     std::min(raw_end, F),
-                    cpath
+                    pi_cur
                 );
 
             if (start_idx >= end_idx) {
@@ -9318,7 +10407,7 @@ private:
                     /*child_k=*/-1,
                     /*cache_lookup_k=*/(int8_t)std::max(0, (int)depth_budget - 2),
                     pk,
-                    cpath,
+                    pi_cur,
                     start_idx,
                     end_idx,
                     best_sum,

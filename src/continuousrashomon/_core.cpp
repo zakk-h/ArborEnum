@@ -341,6 +341,212 @@ PYBIND11_MODULE(_core, m) {
         )
 
         .def(
+            "fit_then_extend",
+            [](PRAXIS &self,
+               py::array_t<
+                   uint8_t,
+                   py::array::c_style | py::array::forcecast
+               > X,
+               py::array_t<
+                   int,
+                   py::array::c_style | py::array::forcecast
+               > y,
+               double lambda_reg,
+               int depth_budget,
+               double first_rashomon_mult,
+               double second_rashomon_mult,
+               double multiplicative_slack,
+               std::string key_mode_str,
+               bool trie_cache_enabled,
+               int lookahead_k,
+               bool use_multipass,
+               bool rule_list_mode,
+               int oracle_style,
+               bool majority_leaf_only,
+               bool cache_cheap_subproblems,
+               int greedy_split_mode,
+               std::string greedy_continuous_mode,
+               bool proxy_caching,
+               std::vector<int> allowed_proxy_features,
+               bool restrict_proxy_in_lickety,
+               bool restrict_proxy_in_depthd_exact,
+               bool restrict_proxy_in_greedy,
+               std::vector<int> continuous_starts,
+               bool stronger_rollout
+            ) {
+                py::buffer_info xinfo = X.request();
+                py::buffer_info yinfo = y.request();
+
+                if (xinfo.ndim != 2) {
+                    throw std::runtime_error(
+                        "X must be 2D (n_samples x n_features)."
+                    );
+                }
+
+                if (yinfo.ndim != 1) {
+                    throw std::runtime_error(
+                        "y must be 1D."
+                    );
+                }
+
+                const int n_samples =
+                    static_cast<int>(xinfo.shape[0]);
+
+                const int n_features =
+                    static_cast<int>(xinfo.shape[1]);
+
+                if (
+                    static_cast<int>(yinfo.shape[0]) !=
+                    n_samples
+                ) {
+                    throw std::runtime_error(
+                        "y length must match X rows."
+                    );
+                }
+
+                auto *x_ptr =
+                    static_cast<uint8_t*>(xinfo.ptr);
+
+                auto *y_ptr =
+                    static_cast<int*>(yinfo.ptr);
+
+                std::vector<std::vector<bool>>
+                    X_col_major(
+                        static_cast<std::size_t>(
+                            n_features
+                        ),
+                        std::vector<bool>(
+                            static_cast<std::size_t>(
+                                n_samples
+                            )
+                        )
+                    );
+
+                for (int f = 0; f < n_features; ++f) {
+                    for (int i = 0; i < n_samples; ++i) {
+                        const uint8_t v =
+                            x_ptr[
+                                static_cast<std::size_t>(i) *
+                                static_cast<std::size_t>(
+                                    n_features
+                                ) +
+                                static_cast<std::size_t>(f)
+                            ];
+
+                        X_col_major[
+                            static_cast<std::size_t>(f)
+                        ][
+                            static_cast<std::size_t>(i)
+                        ] = (v != 0);
+                    }
+                }
+
+                std::vector<int> y_vec(
+                    y_ptr,
+                    y_ptr + n_samples
+                );
+
+                self.set_key_mode(
+                    parse_key_mode(key_mode_str)
+                );
+
+                self.set_trie_cache_enabled(
+                    trie_cache_enabled
+                );
+
+                self.set_multiplicative_slack(
+                    multiplicative_slack
+                );
+
+                self.set_use_multipass(
+                    use_multipass
+                );
+
+                self.set_rule_list_mode(
+                    rule_list_mode
+                );
+
+                self.set_cache_cheap_subproblems(
+                    cache_cheap_subproblems
+                );
+
+                self.set_greedy_split_mode(
+                    greedy_split_mode
+                );
+
+                self.set_greedy_continuous_mode(
+                    parse_greedy_continuous_mode(
+                        greedy_continuous_mode
+                    )
+                );
+
+                self.set_majority_leaf_only(
+                    majority_leaf_only
+                );
+
+                self.set_proxy_caching_enabled(
+                    proxy_caching
+                );
+
+                self.set_stronger_rollout(
+                    stronger_rollout
+                );
+
+                self.fit_then_extend(
+                    X_col_major,
+                    y_vec,
+                    lambda_reg,
+                    static_cast<int8_t>(depth_budget),
+                    first_rashomon_mult,
+                    second_rashomon_mult,
+                    static_cast<int8_t>(lookahead_k),
+                    use_multipass,
+                    rule_list_mode,
+                    oracle_style,
+                    majority_leaf_only,
+                    cache_cheap_subproblems,
+                    proxy_caching,
+                    allowed_proxy_features,
+                    restrict_proxy_in_lickety,
+                    restrict_proxy_in_depthd_exact,
+                    restrict_proxy_in_greedy,
+                    continuous_starts,
+                    stronger_rollout
+                );
+            },
+            py::arg("X"),
+            py::arg("y"),
+            py::arg("lambda_reg") = 0.01,
+            py::arg("depth_budget") = 5,
+            py::arg("first_rashomon_mult") = 0.01,
+            py::arg("second_rashomon_mult") = 0.03,
+            py::arg("multiplicative_slack") = 0.0,
+            py::arg("key_mode") = "hash",
+            py::arg("trie_cache_enabled") = true,
+            py::arg("lookahead_k") = 1,
+            py::arg("use_multipass") = true,
+            py::arg("rule_list_mode") = false,
+            py::arg("oracle_style") = 0,
+            py::arg("majority_leaf_only") = false,
+            py::arg("cache_cheap_subproblems") = false,
+            py::arg("greedy_split_mode") = 1,
+            py::arg("greedy_continuous_mode") =
+                "binary",
+            py::arg("proxy_caching") = true,
+            py::arg("allowed_proxy_features") =
+                std::vector<int>{},
+            py::arg("restrict_proxy_in_lickety") =
+                false,
+            py::arg("restrict_proxy_in_depthd_exact") =
+                false,
+            py::arg("restrict_proxy_in_greedy") =
+                false,
+            py::arg("continuous_starts") =
+                std::vector<int>{},
+            py::arg("stronger_rollout") = false
+        )
+
+        .def(
             "fit_anytime",
             [](PRAXIS &self,
             py::array_t<uint8_t, py::array::c_style | py::array::forcecast> X,
@@ -361,6 +567,7 @@ PYBIND11_MODULE(_core, m) {
             std::string greedy_continuous_mode,
             bool proxy_caching,
             std::vector<int> proxy_threshold_features,
+            std::vector<int> initial_active_threshold_features,
             int refinement_width,
             int max_refinement_rounds,
             bool increase_proxy_anytime,
@@ -436,6 +643,7 @@ PYBIND11_MODULE(_core, m) {
                     cache_cheap_subproblems,
                     proxy_caching,
                     proxy_threshold_features,
+                    initial_active_threshold_features,
                     refinement_width,
                     max_refinement_rounds,
                     increase_proxy_anytime,
@@ -463,6 +671,7 @@ PYBIND11_MODULE(_core, m) {
             py::arg("greedy_continuous_mode") = "binary",
             py::arg("proxy_caching") = true,
             py::arg("proxy_threshold_features") = std::vector<int>{},
+            py::arg("initial_active_threshold_features") = std::vector<int>{},
             py::arg("refinement_width") = 1,
             py::arg("max_refinement_rounds") = -1,
             py::arg("increase_proxy_anytime") = false,
@@ -475,29 +684,50 @@ PYBIND11_MODULE(_core, m) {
         .def(
             "prepare_continuous_data",
             [](PRAXIS &self,
-               py::array_t<double,  py::array::c_style | py::array::forcecast> X_num,
-               py::array_t<uint8_t, py::array::c_style | py::array::forcecast> X_bin,
-               py::array_t<int,     py::array::c_style | py::array::forcecast> y,
-               py::array_t<uint8_t, py::array::c_style | py::array::forcecast> X_active,
-               int max_number_thresholds_per_feature
+            py::array_t<double, py::array::c_style | py::array::forcecast> X_num,
+            py::array_t<uint8_t, py::array::c_style | py::array::forcecast> X_bin,
+            py::array_t<int, py::array::c_style | py::array::forcecast> y,
+            py::array_t<uint8_t, py::array::c_style | py::array::forcecast>
+                X_initial_active,
+            py::array_t<uint8_t, py::array::c_style | py::array::forcecast>
+                X_proxy_active,
+            int max_number_thresholds_per_feature
             ) {
-                auto X_num_vec = numpy_double_2d_to_row_major(X_num, "X_num");
-                auto X_bin_vec = numpy_uint8_2d_to_row_major(X_bin, "X_bin");
-                auto y_vec = numpy_int_1d_to_vector(y, "y");
-                auto X_active_vec = numpy_uint8_2d_to_row_major(X_active, "X_active");
+                auto X_num_vec =
+                    numpy_double_2d_to_row_major(X_num, "X_num");
+
+                auto X_bin_vec =
+                    numpy_uint8_2d_to_row_major(X_bin, "X_bin");
+
+                auto y_vec =
+                    numpy_int_1d_to_vector(y, "y");
+
+                auto X_initial_active_vec =
+                    numpy_uint8_2d_to_row_major(
+                        X_initial_active,
+                        "X_initial_active"
+                    );
+
+                auto X_proxy_active_vec =
+                    numpy_uint8_2d_to_row_major(
+                        X_proxy_active,
+                        "X_proxy_active"
+                    );
 
                 self.prepare_continuous_data(
                     X_num_vec,
                     X_bin_vec,
                     y_vec,
-                    X_active_vec,
+                    X_initial_active_vec,
+                    X_proxy_active_vec,
                     max_number_thresholds_per_feature
                 );
             },
             py::arg("X_num"),
             py::arg("X_bin"),
             py::arg("y"),
-            py::arg("X_active"),
+            py::arg("X_initial_active"),
+            py::arg("X_proxy_active"),
             py::arg("max_number_thresholds_per_feature") = -1
         )
 
@@ -520,6 +750,7 @@ PYBIND11_MODULE(_core, m) {
             std::string greedy_continuous_mode,
             bool proxy_caching,
             std::vector<int> proxy_threshold_features,
+            std::vector<int> initial_active_threshold_features,
             int refinement_width,
             int max_refinement_rounds,
             bool increase_proxy_anytime,
@@ -554,6 +785,7 @@ PYBIND11_MODULE(_core, m) {
                     cache_cheap_subproblems,
                     proxy_caching,
                     proxy_threshold_features,
+                    initial_active_threshold_features,
                     refinement_width,
                     max_refinement_rounds,
                     increase_proxy_anytime,
@@ -578,6 +810,7 @@ PYBIND11_MODULE(_core, m) {
             py::arg("greedy_continuous_mode") = "binary",
             py::arg("proxy_caching") = true,
             py::arg("proxy_threshold_features") = std::vector<int>{},
+            py::arg("initial_active_threshold_features") = std::vector<int>{},
             py::arg("refinement_width") = 1,
             py::arg("max_refinement_rounds") = -1,
             py::arg("increase_proxy_anytime") = false,
@@ -664,6 +897,120 @@ PYBIND11_MODULE(_core, m) {
             py::arg("restrict_proxy_in_depthd_exact") = false,
             py::arg("restrict_proxy_in_greedy") = false,
             py::arg("rashomon_mode") = true,
+            py::arg("stronger_rollout") = false
+        )
+
+        .def(
+            "fit_prepared_then_extend",
+            [](PRAXIS &self,
+               double lambda_reg,
+               int depth_budget,
+               double first_rashomon_mult,
+               double second_rashomon_mult,
+               double multiplicative_slack,
+               std::string key_mode_str,
+               bool trie_cache_enabled,
+               int lookahead_k,
+               bool use_multipass,
+               bool rule_list_mode,
+               int oracle_style,
+               bool majority_leaf_only,
+               bool cache_cheap_subproblems,
+               int greedy_split_mode,
+               std::string greedy_continuous_mode,
+               bool proxy_caching,
+               bool restrict_proxy_in_lickety,
+               bool restrict_proxy_in_depthd_exact,
+               bool restrict_proxy_in_greedy,
+               bool stronger_rollout
+            ) {
+                self.set_key_mode(
+                    parse_key_mode(key_mode_str)
+                );
+
+                self.set_trie_cache_enabled(
+                    trie_cache_enabled
+                );
+
+                self.set_multiplicative_slack(
+                    multiplicative_slack
+                );
+
+                self.set_use_multipass(
+                    use_multipass
+                );
+
+                self.set_rule_list_mode(
+                    rule_list_mode
+                );
+
+                self.set_cache_cheap_subproblems(
+                    cache_cheap_subproblems
+                );
+
+                self.set_greedy_split_mode(
+                    greedy_split_mode
+                );
+
+                self.set_greedy_continuous_mode(
+                    parse_greedy_continuous_mode(
+                        greedy_continuous_mode
+                    )
+                );
+
+                self.set_majority_leaf_only(
+                    majority_leaf_only
+                );
+
+                self.set_proxy_caching_enabled(
+                    proxy_caching
+                );
+
+                self.set_stronger_rollout(
+                    stronger_rollout
+                );
+
+                self.fit_prepared_then_extend(
+                    lambda_reg,
+                    static_cast<int8_t>(depth_budget),
+                    first_rashomon_mult,
+                    second_rashomon_mult,
+                    static_cast<int8_t>(lookahead_k),
+                    use_multipass,
+                    rule_list_mode,
+                    oracle_style,
+                    majority_leaf_only,
+                    cache_cheap_subproblems,
+                    proxy_caching,
+                    restrict_proxy_in_lickety,
+                    restrict_proxy_in_depthd_exact,
+                    restrict_proxy_in_greedy,
+                    stronger_rollout
+                );
+            },
+            py::arg("lambda_reg") = 0.01,
+            py::arg("depth_budget") = 5,
+            py::arg("first_rashomon_mult") = 0.01,
+            py::arg("second_rashomon_mult") = 0.03,
+            py::arg("multiplicative_slack") = 0.0,
+            py::arg("key_mode") = "hash",
+            py::arg("trie_cache_enabled") = true,
+            py::arg("lookahead_k") = 1,
+            py::arg("use_multipass") = true,
+            py::arg("rule_list_mode") = false,
+            py::arg("oracle_style") = 0,
+            py::arg("majority_leaf_only") = false,
+            py::arg("cache_cheap_subproblems") = false,
+            py::arg("greedy_split_mode") = 1,
+            py::arg("greedy_continuous_mode") =
+                "binary",
+            py::arg("proxy_caching") = true,
+            py::arg("restrict_proxy_in_lickety") =
+                false,
+            py::arg("restrict_proxy_in_depthd_exact") =
+                false,
+            py::arg("restrict_proxy_in_greedy") =
+                false,
             py::arg("stronger_rollout") = false
         )
 
