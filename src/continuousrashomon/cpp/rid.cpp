@@ -1,3 +1,4 @@
+// implementation for the rashomon importance distribution - not one of our contributions but still integrated with the method.
 #include <algorithm>
 #include <cstdint>
 #include <random>
@@ -21,16 +22,6 @@ static inline uint64_t popcnt64_u(uint64_t x) {
     return (uint64_t)__builtin_popcountll(x);
 #endif
 }
-
-// build y==1 bitset for eval dataset (size n, in n_words words)
-// static inline Packed build_y1_packed(const std::vector<int>& y, int n_words, uint64_t tail_mask) {
-//     Packed y1((size_t)n_words);
-//     for (int i = 0; i < (int)y.size(); ++i) {
-//         if (y[i]) y1.w[(size_t)(i >> 6)] |= (1ULL << (i & 63));
-//     }
-//     if (n_words > 0) y1.w[(size_t)(n_words - 1)] &= tail_mask;
-//     return y1;
-// }
 
 // y_bits[c] has bit i = 1 iff y[i] == c
 static inline std::vector<Packed> build_yc_packed(
@@ -56,25 +47,6 @@ static inline std::vector<Packed> build_yc_packed(
     }
     return y_bits;
 }
-
-// count correct predictions given pred1 bitset and y1 bitset.
-// pred1 bit i = 1 iff prediction==1 on row i.
-// static inline int count_correct_packed(const Packed& pred1, const Packed& y1, int n_words, uint64_t tail_mask) {
-//     uint64_t correct = 0;
-//     for (int w = 0; w < n_words; ++w) {
-//         uint64_t p = pred1.w[(size_t)w];
-//         uint64_t y = y1.w[(size_t)w];
-
-//         // correct bits = (p & y) | (~p & ~y)
-//         uint64_t c = (p & y) | (~p & ~y);
-
-//         // mask tail on last word
-//         if (w == n_words - 1) c &= tail_mask;
-
-//         correct += popcnt64_u(c);
-//     }
-//     return (int)correct;
-// }
 
 static inline int count_correct_packed_multi(
     const PackedPredMulti& pred,
@@ -144,29 +116,6 @@ static inline void make_permutation(int n, std::mt19937_64& rng, std::vector<int
     for (int i = 0; i < n; ++i) perm[i] = i;
     std::shuffle(perm.begin(), perm.end(), rng);
 }
-
-// scramble one column of X in-place using perm, but without copying whole X.
-// caller should restore original column after use.
-// static inline void scramble_column_inplace(
-//     std::vector<std::vector<uint8_t>>& X,
-//     int col,
-//     const std::vector<int>& perm,
-//     std::vector<uint8_t>& saved_col
-// ) {
-//     const int n = (int)X.size();
-//     saved_col.resize(n);
-//     for (int i = 0; i < n; ++i) saved_col[i] = X[i][col];
-//     for (int i = 0; i < n; ++i) X[i][col] = saved_col[perm[i]];
-// }
-
-// static inline void restore_column_inplace(
-//     std::vector<std::vector<uint8_t>>& X,
-//     int col,
-//     const std::vector<uint8_t>& saved_col
-// ) {
-//     const int n = (int)X.size();
-//     for (int i = 0; i < n; ++i) X[i][col] = saved_col[i];
-// }
 
 // scramble a single feature, but represented by multiple binary columns
 static inline void scramble_block_inplace(

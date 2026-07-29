@@ -1,3 +1,4 @@
+// this file is the implementation of our continuous rashomon set methods.
 #include <vector>
 #include <unordered_map>
 #include <algorithm>
@@ -16,6 +17,7 @@
 
 using namespace std;
 
+// fast bitvector computations used throughout. the names are reasonably self-explanatory. popcount of a bitvector, doing bitwise and with a popcount, etc.
 #if defined(_MSC_VER)
   #include <intrin.h>
   static inline int popcnt64(uint64_t x) {
@@ -201,6 +203,7 @@ static inline void andnot_words(
     out[n_words - 1] &= tail_mask;
 }
 
+// efficient splitting method
 static inline int popcount_and_make_split_words(
     const uint64_t* mask,
     const uint64_t* split,
@@ -262,6 +265,7 @@ static inline int popcount_and_make_split_words(
 #endif
 }
 
+// a low-level packed-bitvector operation used to efficiently carry out claims in the paper
 static inline bool any_words(const uint64_t* a, int n_words) {
     if (n_words <= 0) return false;
 
@@ -301,6 +305,8 @@ using PathKey = std::vector<Lit>;
 
 // using ContinuousPath = std::vector<ContinuousPathEntry>;
 
+// a continuous path entry corresponds to a part of the threshold registry in the paper
+// this is just the lower and upper bounds; the active threshold set is maintained separately
 struct ContinuousPathEntry {
     // active threshold interval for one continuous feature group.
     // valid thresholds are [lo, hi).
@@ -315,6 +321,7 @@ static inline const ContinuousPath& empty_continuous_path() {
     return p;
 }
 
+// this is our efficient bitvector representation. a vector of 64-bit words. this is referenced at the top of the appendix, but it also builds on existing work.
 struct Packed {
     vector<uint64_t> w; // words (64-bit each)
     Packed() = default;
@@ -375,6 +382,7 @@ struct Key128 {
     };
 };
 
+// if we want a higher certainty of no collisions, we could use a 128-bit fingerprint instead of a 64 bit fingerprint. this is in addition to what is discussed at the top of the appendix.
 static inline Key128 hash_mask128(
     const uint64_t* w,
     int n_words,
@@ -397,6 +405,7 @@ static inline Key128 hash_mask128(
     return Key128{h1, h2};
 }
 
+// creates a canonical cache key to represent the subproblem.
 class Fingerprint128IdTable {
 public:
     uint64_t intern(Key128 fp) {
@@ -417,6 +426,7 @@ private:
     uint64_t next_id = 0;
 };
 
+// if we are using literal encoding (existing in this code, not our main contribution)
 // 2*feat + sign
 static inline Lit enc_lit(int feat, int sign01) {
     if (feat < 0) {
@@ -439,18 +449,21 @@ static inline const PathKey& empty_pk() {
     return k;
 }
 
+// existing, not part of our contribution
 // insert literal into PathKey, maintaining sorted canonical order
 static inline void pk_insert_sorted(PathKey& pk, Lit lit) {
     auto it = std::lower_bound(pk.begin(), pk.end(), lit);
     pk.insert(it, lit);
 }
 
+// existing, not part of our contribution
 // remove literal from PathKey (must exist)
 static inline void pk_erase_sorted(PathKey& pk, Lit lit) {
     auto it = std::lower_bound(pk.begin(), pk.end(), lit);
     pk.erase(it);
 }
 
+// efficient way to get multi-class predictions
 struct PackedPredMulti {
     std::vector<Packed> by_class; // size = num_classes, each is n_words over eval rows
 };
@@ -461,6 +474,8 @@ struct ObjBucketMulti {
     std::vector<PackedPredMulti> preds; // one entry per tree at this objective
 };
 
+// predictions attached to objective. these methods are useful in extraction or for variable importance.
+// not part of our continuous-feature contribution
 struct PredPackWithObj {
     int obj;
     PackedPredMulti pred;
@@ -495,6 +510,7 @@ private:
     size_t pool_size = 0;
 };
 
+// construct canonical cache keys (interning) for literals (not part of our contribution)
 class LitIdTable {
 public:
     uint32_t intern(const std::vector<Lit>& lits) {
@@ -521,7 +537,7 @@ private:
 
 // two structures to define the key type used in hash maps
 // K2: for greedy and lickety cache (subproblem, depth)
-// K3: tries (subproblem, depth, budget)
+// K3: tries (subproblem, depth, budget). In our contribution, we phase out K3 for budget-indepenent subgraph caching - to come later.
 // define equality with operator== and how to hash the keys for unordered_map
 
 struct K2 {
@@ -572,12 +588,14 @@ struct KLA {
     };
 };
 
+// this can be used in continuous features if greedy is ever allowed to use more features than licketysplit. then, it is the analog to how we add a licketysplit feature to the enumeration loop in the anytime algorithm.
+// we do not perform experiments with this, so it is not part of our contribution.
 struct GreedyObjFirstSplit {
     int obj = std::numeric_limits<int>::max();
     int first_feat = -1;
 };
 
-
+//  key used for the threshold proxy completion cache. that is, the map in the main paper.
 struct KContProxy {
     uint64_t k; // 64-bit fingerprint or interning id
     int depth;
@@ -599,18 +617,21 @@ struct KContProxy {
 
 using ProxyCompletionTree = std::map<int, std::pair<int,int>>;
 
+// all the ProxyCompletion maps, so this is how we get E in the main paper
 std::unordered_map<
     KContProxy,
     ProxyCompletionTree,
     KContProxy::Hash
 > continuous_proxy_completion_cache;
 
+// existing data structures for storing the Rashomon set - not part of our contribution.
 struct HistEntry {
     int obj;
     uint64_t cnt;
 };
 static inline bool hist_less(const HistEntry& a, const HistEntry& b){ return a.obj < b.obj; } // helper for sorting
 
+// we preserve the naming in the class. These correspond to OR nodes in our paper.
 struct TreeTrieNode; // fwd
 
 struct LeafNode {
@@ -618,6 +639,7 @@ struct LeafNode {
     int loss;       // gamma + miscls
 };
 
+// these correspond to AND nodes in our paper.
 struct SplitNode {
     int feature = -1;
     shared_ptr<TreeTrieNode> left;
@@ -625,6 +647,9 @@ struct SplitNode {
     uint64_t num_valid_trees = 0; // trees contributed by this split under parent's budget
 };
 
+// this is existing work. we do not claim it as our contribution, though we will utilize some caching later to create budget-independent nodes.
+// by budget independent, they still will store a budget, but there will not exist multiple different nodes for the same subproblem and remaining depth, but with different budgets.
+// the largest budget which we solve it with is useful metadata, as illustrated in the paper.
 struct TreeTrieNode {
     int budget = 0;
     int min_objective = numeric_limits<int>::max();
@@ -799,6 +824,7 @@ struct PredNode {
 //     std::vector<Packed> preds; // each is a prediction bitvector for one tree at this obj. predictions for all trees with an objective.
 // };
 
+// useful in variable importance. not part of our contribution.
 struct EvalCtx {
     int n_eval = 0;
     int n_words = 0;
@@ -809,8 +835,10 @@ struct EvalCtx {
 
 class PRAXIS {
 public:
+    // we use hash64 in all of our experiments.
     enum class KeyMode { HASH64, HASH128, EXACT, LITS_EXACT };
 
+    // we ablate these choices in the appendix.
     enum class GreedyContinuousMode {
         BINARY = 0,
         NUMERICAL = 1
@@ -933,6 +961,7 @@ private:
         return 0;
     }
 
+    // the literal representation depends on the path key, nothing else does.
     inline uint64_t key_of_subproblem(const Packed& mask, const PathKey& pk) const {
         if (key_mode == KeyMode::LITS_EXACT) {
             return key_of_state(mask, pk); // interns pk
@@ -945,12 +974,15 @@ private:
     //     return (num_proxy_features > 0) ? std::min(num_proxy_features, n_features) : n_features;
     // }
 
+    // in our work, we essentially have 3 different types of decision tree algorithms. optimal ones, licketysplit, and greedy.
+    // this can differentiate between them
     enum class ProxyLoopKind {
         Lickety,
         DepthDExact,
         Greedy
     };
 
+    // we may also consider any of those 3 being restricted to a small binarization. this checks that for a given kind.
     inline bool should_restrict_proxy_features_(ProxyLoopKind kind) const {
         if (allowed_proxy_features.empty()) return false;
 
@@ -971,6 +1003,7 @@ private:
         return empty; // empty means use normal 0..n_features-1 loop
     }
 
+    // various ways to derive what features you should give the proxy
     inline bool use_restricted_greedy_proxy_() const {
         return !allowed_proxy_features.empty() && restrict_proxy_in_greedy;
     }
@@ -995,6 +1028,9 @@ private:
             && use_restricted_depthd_exact_proxy_();
     }
 
+    // for the anytime algorithm, if the proxy starts out with all of the features, but the enumeration loop doesn't,
+    // then we should add the first split from licketysplit to the enumeration thresholds considered at each subproblem. 
+    // this method determines this and the following one gets it.
     inline bool anytime_continuous_lickety_k1_first_split_enabled_() const {
         return anytime_mode_active_
             && lookahead_init == 1
@@ -1025,17 +1061,7 @@ private:
         return std::binary_search(xs.begin(), xs.end(), f);
     }
 
-    // inline int greedy_proxy_objective_(
-    //     const Packed& mask,
-    //     int8_t depth,
-    //     const PathKey& pk
-    // ) {
-    //     if (use_restricted_greedy_proxy_()) {
-    //         return train_greedy(mask, depth, pk);
-    //     }
-    //     return train_greedy_continuous(mask, depth, pk);
-    // }
-
+    // a simple way to get the proxy objective when you don't know which proxy you are using
     int proxy_completion_objective_(
         const Packed& mask,
         int8_t depth,
@@ -1058,6 +1084,8 @@ private:
         return lickety_proxy_objective_(mask, depth, k_here, pk, cpath);
     }
 
+    // this method chooses between the various greedy modes: restricted to a binarization, or fully continuous (but then is your data representation sorted lists of indices or  bitvectors)
+    // these are compared in the appendix.
     int greedy_proxy_objective_(
         const Packed& mask,
         int8_t depth_budget,
@@ -1089,9 +1117,11 @@ private:
         }
 
         // use raw numerical sorted lists for continuous features.
+        // this entry point will construct what is needed
         return greedy_numerical_entry_point(mask, depth_budget, pk);
     }
 
+    // decide which exact solver to use. and exact over what features.
     inline int depthd_exact_proxy_objective_(
         const Packed& mask,
         int8_t depth,
@@ -1113,6 +1143,7 @@ private:
         return depthd_exact_solver_cached_continuous(mask, depth, pk, cpath);
     }
 
+    // decide what licketysplit style algorithm to use, and with what features.
     inline int lickety_proxy_objective_(
         const Packed& mask,
         int8_t depth,
@@ -1133,6 +1164,7 @@ private:
         return generalized_lickety_split_continuous(mask, depth, k, pk, cpath);
     }
 
+    // do we need a separate lookahead integer in the cache key? it depends on our lookahead.
     inline bool use_kla_cache() const { return lookahead_init > 1; }
 
     void reserve_caches_mid_() {
@@ -1165,7 +1197,7 @@ private:
         return popcount_and(mask, Y_bits[(size_t)c]);
     }
 
-
+    // standard formulas in greedy decision tree optimization
     static inline double entropy(double p) {
         const double eps = 1e-12;
         p = max(eps, min(1.0 - eps, p));
@@ -1227,6 +1259,7 @@ private:
         return feat;
     }
 
+    // collecting different features. we use this to evaluate the anytime algorithm over time.
     void collect_graph_feature_ids_(
         const std::shared_ptr<TreeTrieNode>& node,
         std::unordered_set<int>& seen
@@ -1259,6 +1292,7 @@ private:
         };
     };
 
+    // bitvector cache key
     ExactMaskDepthKey exact_mask_depth_key_(
         const Packed& mask,
         int depth
@@ -1285,6 +1319,9 @@ private:
         return key;
     }
 
+    // this method is used to get the various statistics about the graph so we can understand how compact the different options are
+    // trie representation, budget-dependent graph, or budget-independent graph
+    // the following few methods handle these cases.
     void collect_graph_subproblem_depth_pairs_(
         const std::shared_ptr<TreeTrieNode>& node,
         const Packed& mask,
@@ -1389,6 +1426,8 @@ private:
         return seen.size();
     }
 
+    // what thresholds we consider for continuous features. if max_number_thresholds_per_feature is positive, then this isn't guaranteed to be complete.
+    // we evaluate with -1 and 100 in the paper.
     std::vector<double> threshold_values_for_numeric_feature_(
         const std::vector<double>& raw_values,
         const std::vector<double>& sorted_unique_vals,
@@ -1534,6 +1573,7 @@ public:
         return greedy_continuous_mode == GreedyContinuousMode::BINARY ? 0 : 1;
     }
 
+    // basic graph statistics for the anytime algorithm or for compact storage evaluation
     size_t count_graph_features() const {
         if (!result) {
             return 0;
@@ -1584,6 +1624,8 @@ public:
         return seen.size();
     }
 
+    // this method is new and its goal is to convert raw binary and numerical inputs into packed binary columns, and contiguous continuous-threshold groups. it also will choose what thresholds the proxy uses. we map proxy thresholds to the nearest in hamming distance. it should be 0 if we take all thresholds.
+    // this corresponds to how we handle continuous features in the main paper.
     void prepare_continuous_data(
         const std::vector<std::vector<double>>& X_num_row_major,
         const std::vector<std::vector<uint8_t>>& X_bin_row_major,
@@ -1869,6 +1911,7 @@ public:
         has_prepared_data = true;
     }
 
+    // use the already prepared data and fit the rashomon set (by calling fit, which will then do the equivalent of ContinuousRSet)
     void fit_prepared(
         double lambda,
         int8_t depth_budget,
@@ -1926,6 +1969,9 @@ public:
         return out;
     }
 
+    // initializes the budget based on the proxy or optimal solution and will call construct_true
+    // construct_trie is the equivalent of ContinuousRSet, although we will go to a construct_trie_extend variant when extending or when we have a different active feature set
+    // this is code duplication but gets us some small speedups because of overhead
     void fit(const std::vector<std::vector<bool>>& X_col_major,
              const std::vector<int>& y,
              double lambda,
@@ -2129,6 +2175,9 @@ public:
         // }
     }
 
+    // this is how we evaluate extending subgraphs to a larger budget. we first solve it with the budget fit set, but we can also enlarge it.
+    // you can set a bigger varepsilon_mult, as we do in the main paper, or try other ways to enlarge it.
+    // we test with mode 3 in the main paper.
     shared_ptr<TreeTrieNode> fit_then_extend(
         const std::vector<std::vector<bool>>& X_col_major,
         const std::vector<int>& y,
@@ -2587,6 +2636,7 @@ public:
             << "\n";
     }
 
+    // anytime algorithm
     void fit_prepared_anytime(
         double lambda,
         int8_t depth_budget,
@@ -2655,6 +2705,8 @@ public:
             prepared_continuous_starts
         );
     }
+
+    // the majority of the following extraction methods are existing. we note this and skip to our contributions.
 
     // predict using the i-th tree in the Rashomon set: X_row_major: binary [n_samples][n_features]
     std::vector<uint8_t> get_predictions(uint64_t tree_index, const std::vector<std::vector<uint8_t>>& X_row_major) const {
@@ -2860,6 +2912,8 @@ public:
         return generalized_lickety_split_continuous(root, depth_budget, /*k=*/1, root_pk);
     }
 
+    // our anytime rashomon set algorithm which corresponds to algorithm 4 in the main paper.
+    // it is a pretty exact translation.
     shared_ptr<TreeTrieNode> anytime_continuous_rset(
         int8_t depth_budget,
         double rashomon_mult,
@@ -3119,6 +3173,8 @@ public:
 
 private:
 
+    // varying statistics that may be helpful in extending the budget of the graph to improve approximation quality.
+    // these are not part of our contributions
     struct TrieNodeProxyGapSummary {
         double root_gap = 1.0;
         double max_node_gap = 1.0;
@@ -3753,6 +3809,7 @@ private:
         return std::max(first_budget, candidate_budget);
     }
 
+    // the following operations are largely existing and low-level. not part of our contribution.
     static inline uint8_t pred_to_mask_(int pred) {
         if (pred == 0) return uint8_t(1);
         if (pred == 1) return uint8_t(2);
@@ -3814,6 +3871,7 @@ private:
         return mask;
     }
 
+    // has the anytime algorithm activated all thresholds?
     bool active_contains_all_threshold_columns_(
         const std::vector<int>& B_active
     ) const {
@@ -3832,6 +3890,9 @@ private:
         return true;
     }
 
+    // we select new thresholds by taking the midpoint between adjacent active thresholds. 
+    // we do this for each adjacent active threshold. 
+    // this corresponds to our theoretical guarantees discussed in the appendix, and what we say is our default behavior in the algorithm description.
     std::vector<int> SelectNewThresholds(
         const std::vector<int>& B_active,
         const std::vector<int>& continuous_starts,
@@ -3933,6 +3994,7 @@ private:
         return vals;
     }
 
+    // how many samples do these differ by?
     static int hamming_distance_binary_column_(
         const std::vector<bool>& a,
         const std::vector<uint8_t>& b
@@ -3993,13 +4055,17 @@ private:
         const int b = row & 63;
         return ((mask.w[(std::size_t)w] >> b) & 1ULL) != 0ULL;
     }
-
+    
+    // we ablate this choice in the appendix
     struct NumericalGreedyState {
         // one sorted row list per numerical continuous group.
         // sorted_idx_by_num[g] is sorted by numerical_X_cols_for_greedy[g].
         std::vector<std::vector<int>> sorted_idx_by_num;
     };
 
+    // the equivalent of ContinuousRSet, with some caveats on extension.
+    // as seen just below, if we need to extend a graph to a bigger budget, we switch over to this construct_trie_extend method, which is an exact implementation of ContinuousRSet
+    // it is beneficial to call use this method if we aren't extending anything because of some small overhead.
     shared_ptr<TreeTrieNode> construct_trie(const Packed& mask, int8_t depth, int budget, const PathKey& pk, const ContinuousPath& cpath = empty_continuous_path(), const std::vector<int>* active_features = nullptr) {
         const uint64_t k = key_of_subproblem(mask, pk);
         K2 key{k, depth};
@@ -4028,6 +4094,8 @@ private:
         node->budget = budget;
 
         int n_sub = 0;
+
+        // add leaves methods in the appendix
 
         if (num_classes == 2) {
             int pos = 0;
@@ -4088,6 +4156,10 @@ private:
 
         Packed L(n_words), R(n_words);
 
+        // this continuous path is what is tracking the lower and upper bounds on each feature, 
+        // and those bounds are from the threshold registry S, so we are saying 
+        // what do we not know if it is constant or not, and that is what we need to investigate
+        // we update this lazily as we say in the main paper
         ContinuousPath pi_cur = materialize_continuous_path_(cpath);
 
         
@@ -4113,7 +4185,9 @@ private:
             if (start_idx >= end_idx) {
                 continue;
             }
-
+            // the difference in restricted and not is if we have active features.
+            // we said in the main paper all features are active in the deterministic algorithm.
+            // we leave the else case for readability
             if (active_features) {
                 enumerate_active_continuous_feature_for_trie_restricted(
                     node,
@@ -4207,7 +4281,7 @@ private:
             if (!rule_list_mode) {
                 if (lossL + lossR > budget) continue; // approximation decision tree rashomon set
             } else {
-                if (lossL > budget - gamma && lossR > budget - gamma) continue; // exact rule list rashomon set
+                if (lossL > budget - gamma && lossR > budget - gamma) continue; // exact rule list rashomon set, leftover from existing work
             }
 
             
@@ -4237,6 +4311,10 @@ private:
         return node;
     }
 
+    // we skip this method for simplicity. we note that this does not call initandprune style logic
+    // because we are in construct_trie, not construct_trie_extend, and thus we should not have any threshold-to-proxy-completion maps
+    // if we had those maps, we would have been here with a different budget, and that budget would have been smaller, so we now would be extending the graph
+    // if we were extending the graph, we would not be calling this because this is only called from construct_trie
     void enumerate_active_continuous_feature_for_trie_restricted(
         shared_ptr<TreeTrieNode>& node,
         const Packed& mask,
@@ -4351,11 +4429,12 @@ private:
             int lossL;
             int lossR;
 
-            auto it_eval = evaluated.find(feat);
+            // there is little need to look at the evaluated map here, we could just go to proxy completions
+            // auto it_eval = evaluated.find(feat);
 
-            if (it_eval != evaluated.end()) {
-                lossL = it_eval->second.first;
-                lossR = it_eval->second.second;
+            if (false) {
+                lossL = 0;
+                lossR = 0;
             } else {
                 if (lookahead_init < 0) {
                     lossL = leaf_objective(L);
@@ -4616,6 +4695,10 @@ private:
         return *it;
     }
 
+    // this algorithm is a combined version of InitAndPrune and EnumContFeature
+    // it collects the acurrently active thresholds, gets E, loops over all cached threshold completions, if it is feasible solve or resolve it,
+    //  otherwise tighten global search bounds, prune the neighborhood, take the complement, 
+    // ..... do the queue logic, and so on. a full implementation of those two methods.
     void enumerate_continuous_feature_for_trie_extend_restricted(
         shared_ptr<TreeTrieNode>& node,
         const Packed& mask,
@@ -5243,6 +5326,7 @@ private:
     using RefineVisited =
         std::unordered_set<TreeTrieNode*>;
 
+    // an implementation of RefineGraph from the paper (appendix). as in the algorithm, it takes in the visited set, which starts out empty, so this recursive graph procedure can add to it.
     void RefineGraphDfs(
         std::shared_ptr<TreeTrieNode>& G,
         const Packed& mask,
@@ -5461,6 +5545,7 @@ private:
         }
     }
 
+    // distance between thresholds in active sample distance (i.e., tied to a subproblem)
     inline int bit_distance_between_thresholds_(
         const Packed& mask,
         int feat_a,
@@ -5480,6 +5565,7 @@ private:
         );
     }
 
+    // we may not need the exact distance, we can terminate early if it is too far away. this is documented in the appendix.
     inline bool bit_distance_at_least_(
         const Packed& mask,
         int feat_a,
@@ -5535,6 +5621,7 @@ private:
 
     // map is red black tree, so both of these are log
     // returns the largest evaluated threshold index strictly less than i
+    // used in some pruning discussed in the proxy section of the appendix
     inline int predecessor_eval_(
         const std::map<int, std::pair<int,int>>& evaluated,
         int i
@@ -5579,112 +5666,7 @@ private:
         return z - budget;
     }
 
-    // int tighten_lower_bound_bitvector_(
-    //     const Packed& mask,
-    //     int end_idx,
-    //     int u,
-    //     int i,
-    //     int delta
-    // ) const {
-    //     // return min k >= i such that distance(u,k) >= delta.
-    //     // search interval is [i, end_idx).
-    //     // return end_idx if no such k exists.
-    //     // k is the point that we would start looking at after if we know i is really bad - delta bad. we look to the right of k, k+1 usually.
-
-    //     if (i >= end_idx) return end_idx;
-
-    //     int lo = i;
-    //     int hi = end_idx - 1;
-    //     int ans = end_idx;
-
-    //     // we can binary search because distance increases. in practice, we may find linearly scanning is better because we can escape really early. evaluate.
-    //     while (lo <= hi) {
-    //         const int mid = lo + ((hi - lo) >> 1);
-
-    //         const bool moved_enough = bit_distance_at_least_(mask, u, mid, delta);
-
-    //         if (moved_enough) {
-    //             ans = mid;
-    //             hi = mid - 1;
-    //         } else {
-    //             lo = mid + 1;
-    //         }
-    //     }
-
-    //     return ans;
-    // }
-
-    // int tighten_upper_bound_bitvector_(
-    //     const Packed& mask,
-    //     int start_idx,
-    //     int v,
-    //     int j,
-    //     int delta
-    // ) const {
-    //     // return max k <= j such that distance(k,v) >= delta.
-    //     // search interval is [start_idx, j].
-    //     // return start_idx - 1 if no such k exists.
-
-    //     if (j < start_idx) return start_idx - 1;
-
-    //     int lo = start_idx;
-    //     int hi = j;
-    //     int ans = start_idx - 1;
-
-    //     while (lo <= hi) {
-    //         const int mid = lo + ((hi - lo) >> 1);
-
-    //         const bool moved_enough = bit_distance_at_least_(mask, mid, v, delta);
-
-    //         if (moved_enough) {
-    //             ans = mid;
-    //             lo = mid + 1;
-    //         } else {
-    //             hi = mid - 1;
-    //         }
-    //     }
-
-    //     return ans;
-    // }
-
-    // int tighten_lower_bound_bitvector_(
-    //     const Packed& mask,
-    //     int end_idx,
-    //     int u,
-    //     int i,
-    //     int delta
-    // ) const {
-    //     if (delta <= 0) return i;
-    //     if (i >= end_idx) return end_idx;
-
-    //     for (int k = i; k < end_idx; ++k) {
-    //         if (bit_distance_at_least_(mask, u, k, delta)) {
-    //             return k;
-    //         }
-    //     }
-
-    //     return end_idx;
-    // }
-
-    // int tighten_upper_bound_bitvector_(
-    //     const Packed& mask,
-    //     int start_idx,
-    //     int v,
-    //     int j,
-    //     int delta
-    // ) const {
-    //     if (delta <= 0) return j;
-    //     if (j < start_idx) return start_idx - 1;
-
-    //     for (int k = j; k >= start_idx; --k) {
-    //         if (bit_distance_at_least_(mask, k, v, delta)) {
-    //             return k;
-    //         }
-    //     }
-
-    //     return start_idx - 1;
-    // }
-
+    // we balance probing and binary search as discussed in the additional methods section of the appendix
     int tighten_lower_bound_bitvector_(
         const Packed& mask,
         int end_idx,
@@ -5863,6 +5845,7 @@ private:
         );
     }
 
+    // this method is essentially EnumContFeature without InitAndPrune. it is called when we are not extending the graph, so we don't loop over all proxy completions.
     void enumerate_continuous_feature_for_trie(
         shared_ptr<TreeTrieNode>& node,
         const Packed& mask,
@@ -6074,272 +6057,6 @@ private:
 
                 continue; // we enumerate nearby thresholds because they are high quality too
             }
-            /*
-            if (feasible) {
-                // given a threshold split_feat and guessed child objective values guessL, guessR, 
-                // try to build the left/right Rashomon subtries under this split, 
-                // add the split to the parent node if both children exist, 
-                // and report the true child minimum objectives
-                auto solve_and_add_from_guesses = [&](
-                    int split_feat,
-                    int guessL,
-                    int guessR,
-                    int& out_minL,
-                    int& out_minR
-                ) -> bool {
-                    split_threshold_bits_(mask, split_feat, L, R);
-
-                    if (!L.any() || !R.any()) {
-                        return false;
-                    }
-
-                    const PathKey* local_pkLp = &empty_pk();
-                    const PathKey* local_pkRp = &empty_pk();
-
-                    PathKey local_pkL;
-                    PathKey local_pkR;
-
-                    make_child_pks_if_needed_(
-                        split_feat,
-                        pk,
-                        local_pkLp,
-                        local_pkRp,
-                        local_pkL,
-                        local_pkR
-                    );
-
-                    const ContinuousPath* local_cpathLp = &cpath;
-                    const ContinuousPath* local_cpathRp = &cpath;
-
-                    ContinuousPath local_cpathL;
-                    ContinuousPath local_cpathR;
-
-                    make_child_continuous_paths_if_needed_(
-                        split_feat,
-                        cpath,
-                        local_cpathLp,
-                        local_cpathRp,
-                        local_cpathL,
-                        local_cpathR
-                    );
-
-                    std::pair<
-                        std::shared_ptr<TreeTrieNode>,
-                        std::shared_ptr<TreeTrieNode>
-                    > LR;
-
-                    if (rule_list_mode) {
-                        LR = solve_siblings(
-                            guessL,
-                            guessR,
-                            L,
-                            R,
-                            budget,
-                            depth,
-                            *local_pkLp,
-                            *local_pkRp,
-                            *local_cpathLp,
-                            *local_cpathRp
-                        );
-                    } else if (use_multipass) {
-                        LR = solve_siblings(
-                            guessL,
-                            guessR,
-                            L,
-                            R,
-                            budget,
-                            depth,
-                            *local_pkLp,
-                            *local_pkRp,
-                            *local_cpathLp,
-                            *local_cpathRp
-                        );
-                    } else {
-                        LR = symmetric_single_pass(
-                            guessL,
-                            guessR,
-                            L,
-                            R,
-                            budget,
-                            depth,
-                            *local_pkLp,
-                            *local_pkRp,
-                            *local_cpathLp,
-                            *local_cpathRp
-                        );
-                    }
-
-                    if (!LR.first || !LR.second) {
-                        // evaluated[split_feat] = {guessL, guessR};
-                        return false;
-                    }
-
-                    node->add_split(split_feat, LR.first, LR.second);
-
-                    out_minL = LR.first->min_objective;
-                    out_minR = LR.second->min_objective;
-
-                    // store the actual subgraph minima
-                    // evaluated[split_feat] = {out_minL, out_minR};
-
-                    return true;
-                };
-
-                int base_minL = std::numeric_limits<int>::max();
-                int base_minR = std::numeric_limits<int>::max();
-
-                const bool base_ok = solve_and_add_from_guesses(
-                    feat,
-                    lossL,
-                    lossR,
-                    base_minL,
-                    base_minR
-                );
-                
-                // this should never happen, would be a collision on the fingerprints if so
-                if (!base_ok) {
-                    // evaluated[feat] = {lossL, lossR};
-
-                    if (i <= feat - 1) {
-                        Q.push_back({i, feat - 1});
-                    }
-
-                    if (feat + 1 <= j) {
-                        Q.push_back({feat + 1, j});
-                    }
-
-                    continue;
-                }
-
-                // in rule-list mode, keep the old behavior because the feasibility condition
-                // is not simply minL + minR <= budget.
-                if (rule_list_mode) {
-                    if (i <= feat - 1) {
-                        Q.push_back({i, feat - 1});
-                    }
-
-                    if (feat + 1 <= j) {
-                        Q.push_back({feat + 1, j});
-                    }
-
-                    continue;
-                }
-
-                // walk left from the feasible threshold.
-                // moving left means:
-                // left child loses x points  -> do not decrease its min objective
-                // right child gains x points -> add x to the right guess
-                {
-                    int anchor_feat = feat;
-                    int anchor_minL = base_minL;
-                    int anchor_minR = base_minR;
-                    int delta = budget - (anchor_minL + anchor_minR);
-
-                    int t = feat - 1; // start of walking left, feat is midpoint
-
-                    for (; t >= i; --t) {
-                        if (delta < 0) break; // if delta = 0, consecutive columns may be the same when acting on this subproblem, we don't want to skip them
-
-                        const int x = threshold_distance_bitvector_(
-                            mask,
-                            t,
-                            anchor_feat
-                        );
-
-                        if (x > delta) {
-                            break;
-                        }
-
-                        const int guessL = anchor_minL;
-                        const int guessR = anchor_minR + x;
-
-                        int new_minL = std::numeric_limits<int>::max(); // the method will fill these in 
-                        int new_minR = std::numeric_limits<int>::max();
-
-                        const bool ok = solve_and_add_from_guesses(
-                            t,
-                            guessL,
-                            guessR,
-                            new_minL,
-                            new_minR
-                        );
-
-                        if (!ok) {
-                            break;
-                        }
-
-                        anchor_feat = t; // new reference location
-                        anchor_minL = new_minL; // reference location best objectives
-                        anchor_minR = new_minR;
-                        delta = budget - (anchor_minL + anchor_minR); // new delta at this reference
-                    }
-
-                    // continue normal interval search on the part not covered by the local feasible walk
-                    if (i <= t) {
-                        Q.push_back({i, t});
-                    }
-                }
-
-                // walk right from the feasible threshold.
-                // moving right means:
-                // left child gains x points  -> add x to the left guess
-                // right child loses x points -> do not decrease its min objective
-                {
-                    int anchor_feat = feat;
-                    int anchor_minL = base_minL;
-                    int anchor_minR = base_minR;
-                    int delta = budget - (anchor_minL + anchor_minR);
-
-                    int t = feat + 1;
-
-                    for (; t <= j; ++t) {
-                        if (delta < 0) break;
-
-                        const int x = threshold_distance_bitvector_(
-                            mask,
-                            anchor_feat,
-                            t
-                        );
-
-                        if (x > delta) {
-                            break;
-                        }
-
-                        const int guessL = anchor_minL + x;
-                        const int guessR = anchor_minR;
-
-                        int new_minL = std::numeric_limits<int>::max();
-                        int new_minR = std::numeric_limits<int>::max();
-
-                        const bool ok = solve_and_add_from_guesses(
-                            t,
-                            guessL,
-                            guessR,
-                            new_minL,
-                            new_minR
-                        );
-
-                        if (!ok) {
-                            break;
-                        }
-
-                        anchor_feat = t;
-                        anchor_minL = new_minL;
-                        anchor_minR = new_minR;
-                        delta = budget - (anchor_minL + anchor_minR);
-                    }
-
-                    // continue normal interval search on the part
-                    // not covered by the local feasible walk.
-                    if (t <= j) {
-                        Q.push_back({t, j});
-                    }
-                }
-
-                continue; // we just finished everything we do if a threshold is within budget, go to the next iteration and get a new threshold
-            }
-            */
-
 
             // evaluated[feat] = {lossL, lossR};
 
@@ -6362,6 +6079,7 @@ private:
                 // this is only possible in rule-list mode, where infeasible means
                 // both sides individually exceed budget - gamma, not necessarily
                 // that lossL + lossR > budget.
+                // this is not part of our contribution but an attempt to preserve behavior from existing work
                 if (i <= feat - 1) {
                     Q.push_back({i, feat - 1});
                 }
@@ -6399,6 +6117,7 @@ private:
         }
     }
 
+    // this is the iterative budget refinement covered in the appendix. the bulk of it is not novel.
     // returns left and right treetrienode. the left and right mask are constants, even as you recurse on construct_trie
     pair<shared_ptr<TreeTrieNode>, shared_ptr<TreeTrieNode>>
     solve_siblings(int loss_l, int loss_r,
@@ -6471,6 +6190,7 @@ private:
     
     }
 
+    // what splits are known to be in the rashomon set at this subproblem?
     static std::unordered_set<int> local_split_features_(
         const std::shared_ptr<TreeTrieNode>& node
     ) {
@@ -6486,6 +6206,7 @@ private:
         return seen;
     }
 
+    // the more efficient version of solve siblings that can extend directly to bigger budgets
     pair<shared_ptr<TreeTrieNode>, shared_ptr<TreeTrieNode>>
     solve_siblings_extend(
         shared_ptr<TreeTrieNode> left_node,
@@ -6537,6 +6258,7 @@ private:
             );
         };
 
+        // we need to determine which side to solve first, due to caveats with adding thresholds. the appendix discusses this.
         auto solve_ordered = [&](
             shared_ptr<TreeTrieNode>& first_node,
             shared_ptr<TreeTrieNode>& second_node,
@@ -6681,8 +6403,7 @@ private:
         return {left_node, right_node};
     }
 
-
-    
+    // the expected implementation of ContinuousRSet. here, we have active_thresholds (active_features) and directly extend a given node (or we can look up a better one if it exists).
     shared_ptr<TreeTrieNode> construct_trie_extend(shared_ptr<TreeTrieNode> node, const Packed& mask, int8_t depth, int budget, const PathKey& pk, const ContinuousPath& cpath = empty_continuous_path(), const std::vector<int>* active_features = nullptr, bool launched_by_anytime = false) {
         if (!node) {
             return construct_trie(mask, depth, budget, pk, cpath,  active_features);
@@ -6701,7 +6422,7 @@ private:
             }
         }
 
-        if (!node) { // no node was given so how can i extend it
+        if (!node) { // no node was given and nothing was found in the cache if we were caching so how can i extend it
             return construct_trie(
                 mask,
                 depth,
@@ -6846,6 +6567,7 @@ private:
                     active_features
                 );
             } else {
+                // this case is currently unreachable because we pass all active thresholds, preserved for ablation purposed
                  enumerate_continuous_feature_for_trie_extend(
                     node,
                     mask,
@@ -7051,6 +6773,7 @@ private:
         return node;
     }
 
+    // this method is not used in the paper experiments but one can make the else branch where this is called trigger to perform an ablation on InitAndPrune
     void enumerate_continuous_feature_for_trie_extend(
         shared_ptr<TreeTrieNode>& node,
         const Packed& mask,
@@ -7338,272 +7061,6 @@ private:
 
                 continue; // we enumerate nearby thresholds because they are high quality too
             }
-            /*
-            if (feasible) {
-                // given a threshold split_feat and guessed child objective values guessL, guessR, 
-                // try to build the left/right Rashomon subtries under this split, 
-                // add the split to the parent node if both children exist, 
-                // and report the true child minimum objectives
-                auto solve_and_add_from_guesses = [&](
-                    int split_feat,
-                    int guessL,
-                    int guessR,
-                    int& out_minL,
-                    int& out_minR
-                ) -> bool {
-                    split_threshold_bits_(mask, split_feat, L, R);
-
-                    if (!L.any() || !R.any()) {
-                        return false;
-                    }
-
-                    const PathKey* local_pkLp = &empty_pk();
-                    const PathKey* local_pkRp = &empty_pk();
-
-                    PathKey local_pkL;
-                    PathKey local_pkR;
-
-                    make_child_pks_if_needed_(
-                        split_feat,
-                        pk,
-                        local_pkLp,
-                        local_pkRp,
-                        local_pkL,
-                        local_pkR
-                    );
-
-                    const ContinuousPath* local_cpathLp = &cpath;
-                    const ContinuousPath* local_cpathRp = &cpath;
-
-                    ContinuousPath local_cpathL;
-                    ContinuousPath local_cpathR;
-
-                    make_child_continuous_paths_if_needed_(
-                        split_feat,
-                        cpath,
-                        local_cpathLp,
-                        local_cpathRp,
-                        local_cpathL,
-                        local_cpathR
-                    );
-
-                    std::pair<
-                        std::shared_ptr<TreeTrieNode>,
-                        std::shared_ptr<TreeTrieNode>
-                    > LR;
-
-                    if (rule_list_mode) {
-                        LR = solve_siblings(
-                            guessL,
-                            guessR,
-                            L,
-                            R,
-                            budget,
-                            depth,
-                            *local_pkLp,
-                            *local_pkRp,
-                            *local_cpathLp,
-                            *local_cpathRp
-                        );
-                    } else if (use_multipass) {
-                        LR = solve_siblings(
-                            guessL,
-                            guessR,
-                            L,
-                            R,
-                            budget,
-                            depth,
-                            *local_pkLp,
-                            *local_pkRp,
-                            *local_cpathLp,
-                            *local_cpathRp
-                        );
-                    } else {
-                        LR = symmetric_single_pass(
-                            guessL,
-                            guessR,
-                            L,
-                            R,
-                            budget,
-                            depth,
-                            *local_pkLp,
-                            *local_pkRp,
-                            *local_cpathLp,
-                            *local_cpathRp
-                        );
-                    }
-
-                    if (!LR.first || !LR.second) {
-                        // evaluated[split_feat] = {guessL, guessR};
-                        return false;
-                    }
-
-                    node->add_split(split_feat, LR.first, LR.second);
-
-                    out_minL = LR.first->min_objective;
-                    out_minR = LR.second->min_objective;
-
-                    // store the actual subgraph minima
-                    // evaluated[split_feat] = {out_minL, out_minR};
-
-                    return true;
-                };
-
-                int base_minL = std::numeric_limits<int>::max();
-                int base_minR = std::numeric_limits<int>::max();
-
-                const bool base_ok = solve_and_add_from_guesses(
-                    feat,
-                    lossL,
-                    lossR,
-                    base_minL,
-                    base_minR
-                );
-                
-                // this should never happen, would be a collision on the fingerprints if so
-                if (!base_ok) {
-                    // evaluated[feat] = {lossL, lossR};
-
-                    if (i <= feat - 1) {
-                        Q.push_back({i, feat - 1});
-                    }
-
-                    if (feat + 1 <= j) {
-                        Q.push_back({feat + 1, j});
-                    }
-
-                    continue;
-                }
-
-                // in rule-list mode, keep the old behavior because the feasibility condition
-                // is not simply minL + minR <= budget.
-                if (rule_list_mode) {
-                    if (i <= feat - 1) {
-                        Q.push_back({i, feat - 1});
-                    }
-
-                    if (feat + 1 <= j) {
-                        Q.push_back({feat + 1, j});
-                    }
-
-                    continue;
-                }
-
-                // walk left from the feasible threshold.
-                // moving left means:
-                // left child loses x points  -> do not decrease its min objective
-                // right child gains x points -> add x to the right guess
-                {
-                    int anchor_feat = feat;
-                    int anchor_minL = base_minL;
-                    int anchor_minR = base_minR;
-                    int delta = budget - (anchor_minL + anchor_minR);
-
-                    int t = feat - 1; // start of walking left, feat is midpoint
-
-                    for (; t >= i; --t) {
-                        if (delta < 0) break; // if delta = 0, consecutive columns may be the same when acting on this subproblem, we don't want to skip them
-
-                        const int x = threshold_distance_bitvector_(
-                            mask,
-                            t,
-                            anchor_feat
-                        );
-
-                        if (x > delta) {
-                            break;
-                        }
-
-                        const int guessL = anchor_minL;
-                        const int guessR = anchor_minR + x;
-
-                        int new_minL = std::numeric_limits<int>::max(); // the method will fill these in 
-                        int new_minR = std::numeric_limits<int>::max();
-
-                        const bool ok = solve_and_add_from_guesses(
-                            t,
-                            guessL,
-                            guessR,
-                            new_minL,
-                            new_minR
-                        );
-
-                        if (!ok) {
-                            break;
-                        }
-
-                        anchor_feat = t; // new reference location
-                        anchor_minL = new_minL; // reference location best objectives
-                        anchor_minR = new_minR;
-                        delta = budget - (anchor_minL + anchor_minR); // new delta at this reference
-                    }
-
-                    // continue normal interval search on the part not covered by the local feasible walk
-                    if (i <= t) {
-                        Q.push_back({i, t});
-                    }
-                }
-
-                // walk right from the feasible threshold.
-                // moving right means:
-                // left child gains x points  -> add x to the left guess
-                // right child loses x points -> do not decrease its min objective
-                {
-                    int anchor_feat = feat;
-                    int anchor_minL = base_minL;
-                    int anchor_minR = base_minR;
-                    int delta = budget - (anchor_minL + anchor_minR);
-
-                    int t = feat + 1;
-
-                    for (; t <= j; ++t) {
-                        if (delta < 0) break;
-
-                        const int x = threshold_distance_bitvector_(
-                            mask,
-                            anchor_feat,
-                            t
-                        );
-
-                        if (x > delta) {
-                            break;
-                        }
-
-                        const int guessL = anchor_minL + x;
-                        const int guessR = anchor_minR;
-
-                        int new_minL = std::numeric_limits<int>::max();
-                        int new_minR = std::numeric_limits<int>::max();
-
-                        const bool ok = solve_and_add_from_guesses(
-                            t,
-                            guessL,
-                            guessR,
-                            new_minL,
-                            new_minR
-                        );
-
-                        if (!ok) {
-                            break;
-                        }
-
-                        anchor_feat = t;
-                        anchor_minL = new_minL;
-                        anchor_minR = new_minR;
-                        delta = budget - (anchor_minL + anchor_minR);
-                    }
-
-                    // continue normal interval search on the part
-                    // not covered by the local feasible walk.
-                    if (t <= j) {
-                        Q.push_back({t, j});
-                    }
-                }
-
-                continue; // we just finished everything we do if a threshold is within budget, go to the next iteration and get a new threshold
-            }
-            */
-
 
             // evaluated[feat] = {lossL, lossR};
 
@@ -7770,6 +7227,7 @@ private:
         return feat >= first_continuous_feature_() && feat < n_features;
     }
 
+    // apply restrictions based on our non-constant lower and upper bounds, those are stored in cpath in this implementation
     inline std::pair<int,int> tighten_continuous_interval_from_path_(
         int start_idx,
         int end_idx,
@@ -7843,6 +7301,7 @@ private:
         Exact
     };
 
+    // called the incumbent solution in the appendix
     struct ContinuousBestSplitResult {
         int best_sum = std::numeric_limits<int>::max();          // feature-selection score
         int best_cached_sum = std::numeric_limits<int>::max();   // objective-only candidate
@@ -8082,6 +7541,8 @@ private:
         return generalized_lickety_split_continuous(mask, depth_budget, k, pk, cpath);
     }
 
+    // this is how we choose the best split whether in licketysplit/snip or optimal modes
+    // this implements the best split selector in the appendix (proxy algorithms section)
     ContinuousBestSplitResult search_continuous_feature_for_best_split_continuous_(
         const Packed& mask,
         int8_t depth_budget,
@@ -8310,6 +7771,8 @@ private:
         return out;
     }
 
+    // this is "licketysnip" with some lookahead. licketysnip with k (lookahead) 1 is what we evalaute in our paper.
+    // using k >= depth_budget-1 recovers the optimal proxy that we use in our paper.
     int generalized_lickety_split_continuous(
         const Packed& mask,
         int8_t depth_budget,
@@ -8499,7 +7962,8 @@ private:
         if (best_cached_sum != std::numeric_limits<int>::max()) {
             ans = std::min(ans, best_cached_sum);
         }
-
+        
+        // this isn't used in our experiments; it can optionally improve a completion.
         tighten_with_trie_min_if_available_(ans, kmask, depth_budget);
 
         if (proxy_style == 0) {
@@ -8593,753 +8057,7 @@ private:
         return ans;
     }
 
-    int special_depth2_fixed_root_split_sum_bitvector_(
-        const Packed& Lroot,
-        const Packed& Rroot,
-        const PathKey& pkL,
-        const PathKey& pkR,
-        int incumbent
-    ) {
-        constexpr int8_t DEPTH = 1;
-        constexpr int8_t KTAG  = 0;
-
-        uint64_t kL = 0;
-        uint64_t kR = 0;
-
-        bool have_cached_L = false;
-        bool have_cached_R = false;
-
-        int bestL = 0;
-        int bestR = 0;
-
-        if (proxy_caching_enabled) {
-            kL = key_of_subproblem(Lroot, pkL);
-            kR = key_of_subproblem(Rroot, pkR);
-
-            have_cached_L = try_get_lickety_cached_(kL, DEPTH, KTAG, bestL);
-            have_cached_R = try_get_lickety_cached_(kR, DEPTH, KTAG, bestR);
-
-            if (have_cached_L && have_cached_R) {
-                return bestL + bestR;
-            }
-        }
-
-        const int leafL = leaf_objective(Lroot);
-        const int leafR = leaf_objective(Rroot);
-
-        if (!have_cached_L) bestL = leafL;
-        if (!have_cached_R) bestR = leafR;
-
-        int nLroot = 0;
-        int nRroot = 0;
-
-        int posLroot = 0;
-        int posRroot = 0;
-
-        std::vector<int> cntLroot;
-        std::vector<int> cntRroot;
-
-        if (num_classes == 2) {
-            count_total_pos_binary(Lroot, nLroot, posLroot);
-            count_total_pos_binary(Rroot, nRroot, posRroot);
-        } else {
-            nLroot = count_total(Lroot);
-            nRroot = count_total(Rroot);
-
-            count_per_class(Lroot, cntLroot);
-            count_per_class(Rroot, cntRroot);
-        }
-
-        const bool scanL =
-            !have_cached_L &&
-            nLroot > 1 &&
-            leafL > 2 * gamma;
-
-        const bool scanR =
-            !have_cached_R &&
-            nRroot > 1 &&
-            leafR > 2 * gamma;
-
-        if (!scanL && !scanR) {
-            if (proxy_caching_enabled) {
-                if (!have_cached_L) {
-                    cache_lickety_if_true_(
-                        kL,
-                        DEPTH,
-                        KTAG,
-                        bestL,
-                        /*allow_cache=*/cache_cheap_subproblems || leafL > 2 * gamma
-                    );
-                }
-
-                if (!have_cached_R) {
-                    cache_lickety_if_true_(
-                        kR,
-                        DEPTH,
-                        KTAG,
-                        bestR,
-                        /*allow_cache=*/cache_cheap_subproblems || leafR > 2 * gamma
-                    );
-                }
-            }
-
-            return bestL + bestR;
-        }
-
-        const int first_cont = first_continuous_feature_();
-
-        Packed LL(n_words), LR(n_words);
-        Packed RL(n_words), RR(n_words);
-
-        // ordinary non-continuous binary features.
-        for (int f2 = 0; f2 < first_cont; ++f2) {
-            if (scanL) {
-                if (num_classes == 2) {
-                    int left_n = 0;
-                    split_bits_count_left(Lroot, X_bits[(std::size_t)f2], LL, LR, left_n);
-
-                    if (left_n != 0 && left_n != nLroot) {
-                        const int candL =
-                            leaf_objective(LL) + leaf_objective(LR);
-
-                        if (candL < bestL) {
-                            bestL = candL;
-                        }
-                    }
-                } else {
-                    and_bits(Lroot, X_bits[(std::size_t)f2], LL);
-                    andnot_bits(Lroot, X_bits[(std::size_t)f2], LR);
-
-                    if (LL.any() && LR.any()) {
-                        const int candL =
-                            leaf_objective(LL) + leaf_objective(LR);
-
-                        if (candL < bestL) {
-                            bestL = candL;
-                        }
-                    }
-                }
-            }
-
-            if (scanR) {
-                if (num_classes == 2) {
-                    int left_n = 0;
-                    split_bits_count_left(Rroot, X_bits[(std::size_t)f2], RL, RR, left_n);
-
-                    if (left_n != 0 && left_n != nRroot) {
-                        const int candR =
-                            leaf_objective(RL) + leaf_objective(RR);
-
-                        if (candR < bestR) {
-                            bestR = candR;
-                        }
-                    }
-                } else {
-                    and_bits(Rroot, X_bits[(std::size_t)f2], RL);
-                    andnot_bits(Rroot, X_bits[(std::size_t)f2], RR);
-
-                    if (RL.any() && RR.any()) {
-                        const int candR =
-                            leaf_objective(RL) + leaf_objective(RR);
-
-                        if (candR < bestR) {
-                            bestR = candR;
-                        }
-                    }
-                }
-            }
-
-            if (bestL + bestR <= 2 * gamma) {
-                goto done_scanning;
-            }
-        }
-
-        // continuous groups represented as contiguous monotone binary columns.
-        // for a group: f = start, start+1, ..., end-1
-        // columns are nested: X_bits[start] subset X_bits[start+1] subset ...
-        // so for each threshold we update counts using only the newly-added delta = X_bits[f] \ X_bits[f - 1]
-        // for each second continuous feature, scan the ordered threshold
-        // block once and maintain the four child counters.
-
-        for (int cont_pos = 0; cont_pos < (int)continuous_starts.size(); ++cont_pos) {
-            const int start_idx = continuous_starts[(std::size_t)cont_pos];
-            const int end_idx = continuous_group_end_(cont_pos);
-
-            if (start_idx >= end_idx) {
-                continue;
-            }
-
-            if (num_classes == 2) {
-                const Packed& Ypos = Y_bits[(std::size_t)1];
-
-                int L_second_left_n = 0;
-                int L_second_left_pos = 0;
-
-                int R_second_left_n = 0;
-                int R_second_left_pos = 0;
-
-                int prev_L_second_left_n = -1;
-                int prev_L_second_left_pos = -1;
-                int prev_R_second_left_n = -1;
-                int prev_R_second_left_pos = -1;
-
-                for (int f2 = start_idx; f2 < end_idx; ++f2) {
-                    const Packed& cur = X_bits[(std::size_t)f2];
-
-                    const Packed* prev =
-                        (f2 == start_idx)
-                            ? nullptr
-                            : &X_bits[(std::size_t)(f2 - 1)];
-
-                    int dL_n = 0;
-                    int dL_pos = 0;
-
-                    int dR_n = 0;
-                    int dR_pos = 0;
-
-                    for (int w = 0; w < n_words; ++w) {
-                        const uint64_t curw = cur.w[(std::size_t)w];
-                        const uint64_t prevw =
-                            prev ? prev->w[(std::size_t)w] : 0ULL;
-
-                        const uint64_t delta = curw & ~prevw;
-
-                        const uint64_t dL =
-                            delta & Lroot.w[(std::size_t)w];
-
-                        const uint64_t dR =
-                            delta & Rroot.w[(std::size_t)w];
-
-                        dL_n += popcnt64(dL);
-                        dR_n += popcnt64(dR);
-
-                        dL_pos += popcnt64(dL & Ypos.w[(std::size_t)w]);
-                        dR_pos += popcnt64(dR & Ypos.w[(std::size_t)w]);
-                    }
-
-                    L_second_left_n += dL_n;
-                    L_second_left_pos += dL_pos;
-
-                    R_second_left_n += dR_n;
-                    R_second_left_pos += dR_pos;
-
-                    if (scanL) {
-                        const bool same_as_prev_L =
-                            L_second_left_n == prev_L_second_left_n &&
-                            L_second_left_pos == prev_L_second_left_pos;
-
-                        prev_L_second_left_n = L_second_left_n;
-                        prev_L_second_left_pos = L_second_left_pos;
-
-                        if (!same_as_prev_L &&
-                            L_second_left_n != 0 &&
-                            L_second_left_n != nLroot) {
-                            const int L_second_right_n =
-                                nLroot - L_second_left_n;
-
-                            const int L_second_right_pos =
-                                posLroot - L_second_left_pos;
-
-                            const int candL =
-                                leaf_objective_binary_from_counts(
-                                    L_second_left_n,
-                                    L_second_left_pos
-                                )
-                                +
-                                leaf_objective_binary_from_counts(
-                                    L_second_right_n,
-                                    L_second_right_pos
-                                );
-
-                            if (candL < bestL) {
-                                bestL = candL;
-                            }
-                        }
-                    }
-
-                    if (scanR) {
-                        const bool same_as_prev_R =
-                            R_second_left_n == prev_R_second_left_n &&
-                            R_second_left_pos == prev_R_second_left_pos;
-
-                        prev_R_second_left_n = R_second_left_n;
-                        prev_R_second_left_pos = R_second_left_pos;
-
-                        if (!same_as_prev_R &&
-                            R_second_left_n != 0 &&
-                            R_second_left_n != nRroot) {
-                            const int R_second_right_n =
-                                nRroot - R_second_left_n;
-
-                            const int R_second_right_pos =
-                                posRroot - R_second_left_pos;
-
-                            const int candR =
-                                leaf_objective_binary_from_counts(
-                                    R_second_left_n,
-                                    R_second_left_pos
-                                )
-                                +
-                                leaf_objective_binary_from_counts(
-                                    R_second_right_n,
-                                    R_second_right_pos
-                                );
-
-                            if (candR < bestR) {
-                                bestR = candR;
-                            }
-                        }
-                    }
-
-                    if (bestL + bestR <= 2 * gamma) {
-                        goto done_scanning;
-                    }
-                }
-            } else {
-                std::vector<int> L_second_left_cnt((std::size_t)num_classes, 0);
-                std::vector<int> R_second_left_cnt((std::size_t)num_classes, 0);
-
-                std::vector<int> prev_L_second_left_cnt((std::size_t)num_classes, -1);
-                std::vector<int> prev_R_second_left_cnt((std::size_t)num_classes, -1);
-
-                std::vector<int> L_second_right_cnt((std::size_t)num_classes, 0);
-                std::vector<int> R_second_right_cnt((std::size_t)num_classes, 0);
-
-                for (int f2 = start_idx; f2 < end_idx; ++f2) {
-                    const Packed& cur = X_bits[(std::size_t)f2];
-
-                    const Packed* prev =
-                        (f2 == start_idx)
-                            ? nullptr
-                            : &X_bits[(std::size_t)(f2 - 1)];
-
-                    for (int w = 0; w < n_words; ++w) {
-                        const uint64_t curw = cur.w[(std::size_t)w];
-                        const uint64_t prevw =
-                            prev ? prev->w[(std::size_t)w] : 0ULL;
-
-                        const uint64_t delta = curw & ~prevw;
-
-                        const uint64_t dL =
-                            delta & Lroot.w[(std::size_t)w];
-
-                        const uint64_t dR =
-                            delta & Rroot.w[(std::size_t)w];
-
-                        if (dL) {
-                            for (int c = 0; c < num_classes; ++c) {
-                                L_second_left_cnt[(std::size_t)c] +=
-                                    popcnt64(
-                                        dL & Y_bits[(std::size_t)c].w[(std::size_t)w]
-                                    );
-                            }
-                        }
-
-                        if (dR) {
-                            for (int c = 0; c < num_classes; ++c) {
-                                R_second_left_cnt[(std::size_t)c] +=
-                                    popcnt64(
-                                        dR & Y_bits[(std::size_t)c].w[(std::size_t)w]
-                                    );
-                            }
-                        }
-                    }
-
-                    if (scanL) {
-                        const bool same_as_prev_L =
-                            L_second_left_cnt == prev_L_second_left_cnt;
-
-                        prev_L_second_left_cnt = L_second_left_cnt;
-
-                        int L_second_left_n = 0;
-                        for (int c = 0; c < num_classes; ++c) {
-                            L_second_left_n +=
-                                L_second_left_cnt[(std::size_t)c];
-                        }
-
-                        if (!same_as_prev_L &&
-                            L_second_left_n != 0 &&
-                            L_second_left_n != nLroot) {
-                            for (int c = 0; c < num_classes; ++c) {
-                                L_second_right_cnt[(std::size_t)c] =
-                                    cntLroot[(std::size_t)c] -
-                                    L_second_left_cnt[(std::size_t)c];
-                            }
-
-                            const int candL =
-                                leaf_objective_multiclass_from_counts_(
-                                    L_second_left_cnt
-                                )
-                                +
-                                leaf_objective_multiclass_from_counts_(
-                                    L_second_right_cnt
-                                );
-
-                            if (candL < bestL) {
-                                bestL = candL;
-                            }
-                        }
-                    }
-
-                    if (scanR) {
-                        const bool same_as_prev_R =
-                            R_second_left_cnt == prev_R_second_left_cnt;
-
-                        prev_R_second_left_cnt = R_second_left_cnt;
-
-                        int R_second_left_n = 0;
-                        for (int c = 0; c < num_classes; ++c) {
-                            R_second_left_n +=
-                                R_second_left_cnt[(std::size_t)c];
-                        }
-
-                        if (!same_as_prev_R &&
-                            R_second_left_n != 0 &&
-                            R_second_left_n != nRroot) {
-                            for (int c = 0; c < num_classes; ++c) {
-                                R_second_right_cnt[(std::size_t)c] =
-                                    cntRroot[(std::size_t)c] -
-                                    R_second_left_cnt[(std::size_t)c];
-                            }
-
-                            const int candR =
-                                leaf_objective_multiclass_from_counts_(
-                                    R_second_left_cnt
-                                )
-                                +
-                                leaf_objective_multiclass_from_counts_(
-                                    R_second_right_cnt
-                                );
-
-                            if (candR < bestR) {
-                                bestR = candR;
-                            }
-                        }
-                    }
-
-                    if (bestL + bestR <= 2 * gamma) {
-                        goto done_scanning;
-                    }
-                }
-            }
-        }
-
-    done_scanning:
-
-        if (proxy_caching_enabled) {
-            if (!have_cached_L) {
-                cache_lickety_if_true_(
-                    kL,
-                    DEPTH,
-                    KTAG,
-                    bestL,
-                    /*allow_cache=*/true
-                );
-            }
-
-            if (!have_cached_R) {
-                cache_lickety_if_true_(
-                    kR,
-                    DEPTH,
-                    KTAG,
-                    bestR,
-                    /*allow_cache=*/true
-                );
-            }
-        }
-
-        (void)incumbent;
-        return bestL + bestR;
-    }
-    
-    int special_depth2_exact_bitvector_no_cache_(
-        const Packed& mask,
-        int leaf_loss,
-        int n_sub,
-        const PathKey& pk
-    ) {
-        constexpr int8_t DEPTH = 2;
-        constexpr int8_t KTAG  = 1;
-
-        uint64_t kmask = 0;
-        int cached = 0;
-
-        if (proxy_caching_enabled) {
-            kmask = key_of_subproblem(mask, pk);
-
-            if (try_get_lickety_cached_(kmask, DEPTH, KTAG, cached)) {
-                return cached;
-            }
-        }
-
-        int best_sum = leaf_loss;
-
-        const int first_cont = first_continuous_feature_();
-
-        Packed L(n_words), R(n_words);
-
-        // ordinary non-continuous binary root features.
-        for (int f1 = 0; f1 < first_cont; ++f1) {
-            if (num_classes == 2) {
-                int left_n = 0;
-                split_bits_count_left(mask, X_bits[(std::size_t)f1], L, R, left_n);
-
-                if (left_n == 0 || left_n == n_sub) {
-                    continue;
-                }
-            } else {
-                and_bits(mask, X_bits[(std::size_t)f1], L);
-                andnot_bits(mask, X_bits[(std::size_t)f1], R);
-
-                if (!L.any() || !R.any()) {
-                    continue;
-                }
-            }
-
-            const PathKey* pkLp = &empty_pk();
-            const PathKey* pkRp = &empty_pk();
-
-            PathKey pkL_local;
-            PathKey pkR_local;
-
-            make_child_pks_if_needed_(
-                f1,
-                pk,
-                pkLp,
-                pkRp,
-                pkL_local,
-                pkR_local
-            );
-
-            const int sum = special_depth2_fixed_root_split_sum_bitvector_(
-                L,
-                R,
-                *pkLp,
-                *pkRp,
-                best_sum
-            );
-
-            if (sum < best_sum) {
-                best_sum = sum;
-
-                if (best_sum <= 2 * gamma) {
-                    goto done_depth2_scan;
-                }
-            }
-        }
-
-        // continuous root features represented as contiguous monotone threshold blocks.
-        // we update the root-left mask incrementally by delta = mask & (X_bits[f] \ X_bits[f - 1])
-        for (int cont_pos = 0; cont_pos < (int)continuous_starts.size(); ++cont_pos) {
-            const int start_idx = continuous_starts[(std::size_t)cont_pos];
-            const int end_idx = continuous_group_end_(cont_pos);
-
-            if (start_idx >= end_idx) {
-                continue;
-            }
-
-            L.clear();
-
-            if (num_classes == 2) {
-                const Packed& Ypos = Y_bits[(std::size_t)1];
-
-                int left_n = 0;
-                int left_pos = 0;
-
-                int prev_left_n = -1;
-                int prev_left_pos = -1;
-
-                for (int f1 = start_idx; f1 < end_idx; ++f1) {
-                    const Packed& cur = X_bits[(std::size_t)f1];
-
-                    const Packed* prev =
-                        (f1 == start_idx)
-                            ? nullptr
-                            : &X_bits[(std::size_t)(f1 - 1)];
-
-                    int delta_n = 0;
-                    int delta_pos = 0;
-
-                    for (int w = 0; w < n_words; ++w) {
-                        const uint64_t curw = cur.w[(std::size_t)w];
-                        const uint64_t prevw =
-                            prev ? prev->w[(std::size_t)w] : 0ULL;
-
-                        const uint64_t delta =
-                            mask.w[(std::size_t)w] &
-                            curw &
-                            ~prevw;
-
-                        L.w[(std::size_t)w] |= delta;
-
-                        delta_n += popcnt64(delta);
-                        delta_pos += popcnt64(
-                            delta & Ypos.w[(std::size_t)w]
-                        );
-                    }
-
-                    L.w[(std::size_t)(n_words - 1)] &= tail_mask;
-
-                    left_n += delta_n;
-                    left_pos += delta_pos;
-
-                    const bool same_as_prev =
-                        left_n == prev_left_n &&
-                        left_pos == prev_left_pos;
-
-                    prev_left_n = left_n;
-                    prev_left_pos = left_pos;
-
-                    if (same_as_prev || left_n == 0 || left_n == n_sub) {
-                        continue;
-                    }
-
-                    andnot_bits(mask, L, R);
-
-                    if (!R.any()) {
-                        break;
-                    }
-
-                    const PathKey* pkLp = &empty_pk();
-                    const PathKey* pkRp = &empty_pk();
-
-                    PathKey pkL_local;
-                    PathKey pkR_local;
-
-                    make_child_pks_if_needed_(
-                        f1,
-                        pk,
-                        pkLp,
-                        pkRp,
-                        pkL_local,
-                        pkR_local
-                    );
-
-                    const int sum = special_depth2_fixed_root_split_sum_bitvector_(
-                        L,
-                        R,
-                        *pkLp,
-                        *pkRp,
-                        best_sum
-                    );
-
-                    if (sum < best_sum) {
-                        best_sum = sum;
-
-                        if (best_sum <= 2 * gamma) {
-                            goto done_depth2_scan;
-                        }
-                    }
-                }
-            } else {
-                std::vector<int> left_counts((std::size_t)num_classes, 0);
-                std::vector<int> prev_left_counts((std::size_t)num_classes, -1);
-
-                int left_n = 0;
-
-                for (int f1 = start_idx; f1 < end_idx; ++f1) {
-                    const Packed& cur = X_bits[(std::size_t)f1];
-
-                    const Packed* prev =
-                        (f1 == start_idx)
-                            ? nullptr
-                            : &X_bits[(std::size_t)(f1 - 1)];
-
-                    int delta_n = 0;
-
-                    for (int w = 0; w < n_words; ++w) {
-                        const uint64_t curw = cur.w[(std::size_t)w];
-                        const uint64_t prevw =
-                            prev ? prev->w[(std::size_t)w] : 0ULL;
-
-                        const uint64_t delta =
-                            mask.w[(std::size_t)w] &
-                            curw &
-                            ~prevw;
-
-                        L.w[(std::size_t)w] |= delta;
-
-                        delta_n += popcnt64(delta);
-
-                        if (delta) {
-                            for (int c = 0; c < num_classes; ++c) {
-                                left_counts[(std::size_t)c] +=
-                                    popcnt64(
-                                        delta &
-                                        Y_bits[(std::size_t)c].w[(std::size_t)w]
-                                    );
-                            }
-                        }
-                    }
-
-                    L.w[(std::size_t)(n_words - 1)] &= tail_mask;
-
-                    left_n += delta_n;
-
-                    const bool same_as_prev =
-                        left_counts == prev_left_counts;
-
-                    prev_left_counts = left_counts;
-
-                    if (same_as_prev || left_n == 0 || left_n == n_sub) {
-                        continue;
-                    }
-
-                    andnot_bits(mask, L, R);
-
-                    if (!R.any()) {
-                        break;
-                    }
-
-                    const PathKey* pkLp = &empty_pk();
-                    const PathKey* pkRp = &empty_pk();
-
-                    PathKey pkL_local;
-                    PathKey pkR_local;
-
-                    make_child_pks_if_needed_(
-                        f1,
-                        pk,
-                        pkLp,
-                        pkRp,
-                        pkL_local,
-                        pkR_local
-                    );
-
-                    const int sum = special_depth2_fixed_root_split_sum_bitvector_(
-                        L,
-                        R,
-                        *pkLp,
-                        *pkRp,
-                        best_sum
-                    );
-
-                    if (sum < best_sum) {
-                        best_sum = sum;
-
-                        if (best_sum <= 2 * gamma) {
-                            goto done_depth2_scan;
-                        }
-                    }
-                }
-            }
-        }
-
-    done_depth2_scan:
-
-        if (proxy_caching_enabled) {
-            cache_lickety_if_true_(
-                kmask,
-                DEPTH,
-                KTAG,
-                best_sum,
-                /*allow_cache=*/true
-            );
-        }
-
-        return best_sum;
-    }
-    
+    // getting the sorted lists of indices that we need for this other greedy mode
     NumericalGreedyState make_numerical_state_for_mask_(
         const Packed& mask
     ) const {
@@ -9371,689 +8089,7 @@ private:
         return state;
     }
 
-    int special_depth2_fixed_root_split_sum_numerical_(
-        const Packed& Lroot,
-        const Packed& Rroot,
-        const PathKey& pkL,
-        const PathKey& pkR,
-        const NumericalGreedyState& state,
-        int incumbent
-    ) {
-        constexpr int8_t DEPTH = 1;
-        constexpr int8_t KTAG  = 0;
-
-        uint64_t kL = 0;
-        uint64_t kR = 0;
-
-        bool have_cached_L = false;
-        bool have_cached_R = false;
-
-        int bestL = 0;
-        int bestR = 0;
-
-        if (proxy_caching_enabled) {
-            kL = key_of_subproblem(Lroot, pkL);
-            kR = key_of_subproblem(Rroot, pkR);
-
-            have_cached_L = try_get_lickety_cached_(kL, DEPTH, KTAG, bestL);
-            have_cached_R = try_get_lickety_cached_(kR, DEPTH, KTAG, bestR);
-
-            if (have_cached_L && have_cached_R) {
-                return bestL + bestR;
-            }
-        }
-
-        const int leafL = leaf_objective(Lroot);
-        const int leafR = leaf_objective(Rroot);
-
-        if (!have_cached_L) bestL = leafL;
-        if (!have_cached_R) bestR = leafR;
-
-        int nLroot = 0;
-        int nRroot = 0;
-        int posLroot = 0;
-        int posRroot = 0;
-
-        std::vector<int> countsLroot;
-        std::vector<int> countsRroot;
-
-        if (num_classes == 2) {
-            count_total_pos_binary(Lroot, nLroot, posLroot);
-            count_total_pos_binary(Rroot, nRroot, posRroot);
-        } else {
-            nLroot = count_total(Lroot);
-            nRroot = count_total(Rroot);
-
-            count_per_class(Lroot, countsLroot);
-            count_per_class(Rroot, countsRroot);
-        }
-
-        const bool scanL =
-            !have_cached_L &&
-            nLroot > 1 &&
-            leafL > 2 * gamma;
-
-        const bool scanR =
-            !have_cached_R &&
-            nRroot > 1 &&
-            leafR > 2 * gamma;
-
-        if (!scanL && !scanR) {
-            if (proxy_caching_enabled) {
-                if (!have_cached_L) {
-                    cache_lickety_if_true_(
-                        kL,
-                        DEPTH,
-                        KTAG,
-                        bestL,
-                        /*allow_cache=*/cache_cheap_subproblems || leafL > 2 * gamma
-                    );
-                }
-
-                if (!have_cached_R) {
-                    cache_lickety_if_true_(
-                        kR,
-                        DEPTH,
-                        KTAG,
-                        bestR,
-                        /*allow_cache=*/cache_cheap_subproblems || leafR > 2 * gamma
-                    );
-                }
-            }
-
-            return bestL + bestR;
-        }
-
-        const int first_cont = first_continuous_feature_();
-        const int G = (int)continuous_starts.size();
-
-        if ((int)state.sorted_idx_by_num.size() != G) {
-            throw std::logic_error(
-                "Numerical depth-2 parent state is not aligned with continuous_starts."
-            );
-        }
-
-        if ((int)numerical_X_cols_for_greedy.size() != G ||
-            (int)numerical_unique_values_for_greedy.size() != G) {
-            throw std::logic_error(
-                "Numerical greedy arrays are not aligned with continuous_starts."
-            );
-        }
-
-        Packed LL(n_words), LR(n_words);
-        Packed RL(n_words), RR(n_words);
-
-        // ordinary binary second-level features.
-        for (int f2 = 0; f2 < first_cont; ++f2) {
-            if (scanL) {
-                if (num_classes == 2) {
-                    int left_n = 0;
-                    split_bits_count_left(
-                        Lroot,
-                        X_bits[(std::size_t)f2],
-                        LL,
-                        LR,
-                        left_n
-                    );
-
-                    if (left_n != 0 && left_n != nLroot) {
-                        const int candL =
-                            leaf_objective(LL) + leaf_objective(LR);
-
-                        if (candL < bestL) {
-                            bestL = candL;
-                        }
-                    }
-                } else {
-                    and_bits(Lroot, X_bits[(std::size_t)f2], LL);
-                    andnot_bits(Lroot, X_bits[(std::size_t)f2], LR);
-
-                    if (LL.any() && LR.any()) {
-                        const int candL =
-                            leaf_objective(LL) + leaf_objective(LR);
-
-                        if (candL < bestL) {
-                            bestL = candL;
-                        }
-                    }
-                }
-            }
-
-            if (scanR) {
-                if (num_classes == 2) {
-                    int left_n = 0;
-                    split_bits_count_left(
-                        Rroot,
-                        X_bits[(std::size_t)f2],
-                        RL,
-                        RR,
-                        left_n
-                    );
-
-                    if (left_n != 0 && left_n != nRroot) {
-                        const int candR =
-                            leaf_objective(RL) + leaf_objective(RR);
-
-                        if (candR < bestR) {
-                            bestR = candR;
-                        }
-                    }
-                } else {
-                    and_bits(Rroot, X_bits[(std::size_t)f2], RL);
-                    andnot_bits(Rroot, X_bits[(std::size_t)f2], RR);
-
-                    if (RL.any() && RR.any()) {
-                        const int candR =
-                            leaf_objective(RL) + leaf_objective(RR);
-
-                        if (candR < bestR) {
-                            bestR = candR;
-                        }
-                    }
-                }
-            }
-
-            if (bestL + bestR <= 2 * gamma) {
-                goto done_numerical_fixed_root;
-            }
-        }
-
-        // numerical continuous second-level features.
-        // For each second numerical feature g, scan the parent sorted rows once
-        // and maintain four counters:
-        //   Lroot + second-left, Lroot + second-right,
-        //   Rroot + second-left, Rroot + second-right.
-        for (int g = 0; g < G; ++g) {
-            const auto& sorted_rows = state.sorted_idx_by_num[(std::size_t)g];
-
-            if (sorted_rows.size() <= 1) {
-                continue;
-            }
-
-            const std::vector<double>& x =
-                numerical_X_cols_for_greedy[(std::size_t)g];
-
-            if (num_classes == 2) {
-                int L_second_left_n = 0;
-                int L_second_left_pos = 0;
-
-                int R_second_left_n = 0;
-                int R_second_left_pos = 0;
-
-                std::size_t i = 0;
-
-                while (i < sorted_rows.size()) {
-                    const double value = x[(std::size_t)sorted_rows[i]];
-
-                    // move the entire tie block to second-left.
-                    std::size_t j = i;
-                    while (j < sorted_rows.size() &&
-                           x[(std::size_t)sorted_rows[j]] == value) {
-                        const int row = sorted_rows[j];
-
-                        if (mask_has_row_(Lroot, row)) {
-                            ++L_second_left_n;
-                            if (y_train[(std::size_t)row] == 1) {
-                                ++L_second_left_pos;
-                            }
-                        } else if (mask_has_row_(Rroot, row)) {
-                            ++R_second_left_n;
-                            if (y_train[(std::size_t)row] == 1) {
-                                ++R_second_left_pos;
-                            }
-                        }
-
-                        ++j;
-                    }
-
-                    // no valid threshold after the maximum parent value.
-                    if (j >= sorted_rows.size()) {
-                        break;
-                    }
-
-                    if (scanL &&
-                        L_second_left_n != 0 &&
-                        L_second_left_n != nLroot) {
-                        const int L_second_right_n =
-                            nLroot - L_second_left_n;
-
-                        const int L_second_right_pos =
-                            posLroot - L_second_left_pos;
-
-                        const int candL =
-                            leaf_objective_binary_from_counts(
-                                L_second_left_n,
-                                L_second_left_pos
-                            )
-                            +
-                            leaf_objective_binary_from_counts(
-                                L_second_right_n,
-                                L_second_right_pos
-                            );
-
-                        if (candL < bestL) {
-                            bestL = candL;
-                        }
-                    }
-
-                    if (scanR &&
-                        R_second_left_n != 0 &&
-                        R_second_left_n != nRroot) {
-                        const int R_second_right_n =
-                            nRroot - R_second_left_n;
-
-                        const int R_second_right_pos =
-                            posRroot - R_second_left_pos;
-
-                        const int candR =
-                            leaf_objective_binary_from_counts(
-                                R_second_left_n,
-                                R_second_left_pos
-                            )
-                            +
-                            leaf_objective_binary_from_counts(
-                                R_second_right_n,
-                                R_second_right_pos
-                            );
-
-                        if (candR < bestR) {
-                            bestR = candR;
-                        }
-                    }
-
-                    if (bestL + bestR <= 2 * gamma) {
-                        goto done_numerical_fixed_root;
-                    }
-
-                    i = j;
-                }
-            } else {
-                std::vector<int> L_second_left_counts((std::size_t)num_classes, 0);
-                std::vector<int> R_second_left_counts((std::size_t)num_classes, 0);
-
-                std::vector<int> L_second_right_counts((std::size_t)num_classes, 0);
-                std::vector<int> R_second_right_counts((std::size_t)num_classes, 0);
-
-                int L_second_left_n = 0;
-                int R_second_left_n = 0;
-
-                std::size_t i = 0;
-
-                while (i < sorted_rows.size()) {
-                    const double value = x[(std::size_t)sorted_rows[i]];
-
-                    // move the entire tie block to second-left.
-                    std::size_t j = i;
-                    while (j < sorted_rows.size() &&
-                           x[(std::size_t)sorted_rows[j]] == value) {
-                        const int row = sorted_rows[j];
-                        const int c = y_train[(std::size_t)row];
-
-                        if (c < 0 || c >= num_classes) {
-                            throw std::logic_error(
-                                "Class label out of range in numerical depth-2 solver."
-                            );
-                        }
-
-                        if (mask_has_row_(Lroot, row)) {
-                            ++L_second_left_n;
-                            ++L_second_left_counts[(std::size_t)c];
-                        } else if (mask_has_row_(Rroot, row)) {
-                            ++R_second_left_n;
-                            ++R_second_left_counts[(std::size_t)c];
-                        }
-
-                        ++j;
-                    }
-
-                    // no valid threshold after the maximum parent value.
-                    if (j >= sorted_rows.size()) {
-                        break;
-                    }
-
-                    if (scanL &&
-                        L_second_left_n != 0 &&
-                        L_second_left_n != nLroot) {
-                        for (int c = 0; c < num_classes; ++c) {
-                            L_second_right_counts[(std::size_t)c] =
-                                countsLroot[(std::size_t)c] -
-                                L_second_left_counts[(std::size_t)c];
-                        }
-
-                        const int candL =
-                            leaf_objective_multiclass_from_counts_(
-                                L_second_left_counts
-                            )
-                            +
-                            leaf_objective_multiclass_from_counts_(
-                                L_second_right_counts
-                            );
-
-                        if (candL < bestL) {
-                            bestL = candL;
-                        }
-                    }
-
-                    if (scanR &&
-                        R_second_left_n != 0 &&
-                        R_second_left_n != nRroot) {
-                        for (int c = 0; c < num_classes; ++c) {
-                            R_second_right_counts[(std::size_t)c] =
-                                countsRroot[(std::size_t)c] -
-                                R_second_left_counts[(std::size_t)c];
-                        }
-
-                        const int candR =
-                            leaf_objective_multiclass_from_counts_(
-                                R_second_left_counts
-                            )
-                            +
-                            leaf_objective_multiclass_from_counts_(
-                                R_second_right_counts
-                            );
-
-                        if (candR < bestR) {
-                            bestR = candR;
-                        }
-                    }
-
-                    if (bestL + bestR <= 2 * gamma) {
-                        goto done_numerical_fixed_root;
-                    }
-
-                    i = j;
-                }
-            }
-        }
-
-    done_numerical_fixed_root:
-
-        if (proxy_caching_enabled) {
-            if (!have_cached_L) {
-                cache_lickety_if_true_(
-                    kL,
-                    DEPTH,
-                    KTAG,
-                    bestL,
-                    /*allow_cache=*/true
-                );
-            }
-
-            if (!have_cached_R) {
-                cache_lickety_if_true_(
-                    kR,
-                    DEPTH,
-                    KTAG,
-                    bestR,
-                    /*allow_cache=*/true
-                );
-            }
-        }
-
-        (void)incumbent;
-        return bestL + bestR;
-    }
-
-    int special_depth2_exact_numerical_no_cache_(
-        const Packed& mask,
-        int leaf_loss,
-        int n_sub,
-        const NumericalGreedyState& state,
-        const PathKey& pk
-    ) {
-        constexpr int8_t DEPTH = 2;
-        constexpr int8_t KTAG  = 1;
-
-        uint64_t kmask = 0;
-        int cached = 0;
-
-        if (proxy_caching_enabled) {
-            kmask = key_of_subproblem(mask, pk);
-
-            if (try_get_lickety_cached_(kmask, DEPTH, KTAG, cached)) {
-                return cached;
-            }
-        }
-
-        int best_sum = leaf_loss;
-
-        const int first_cont = first_continuous_feature_();
-        const int G = (int)continuous_starts.size();
-
-        if ((int)state.sorted_idx_by_num.size() != G) {
-            throw std::logic_error(
-                "Numerical depth-2 state is not aligned with continuous_starts."
-            );
-        }
-
-        if ((int)numerical_X_cols_for_greedy.size() != G ||
-            (int)numerical_unique_values_for_greedy.size() != G) {
-            throw std::logic_error(
-                "Numerical greedy arrays are not aligned with continuous_starts."
-            );
-        }
-
-        Packed L(n_words), R(n_words);
-
-        // root split on ordinary binary features.
-        // We do not partition numerical state anymore. The fixed-root solver
-        // scans the parent sorted lists once per second feature.
-        for (int f1 = 0; f1 < first_cont; ++f1) {
-            if (num_classes == 2) {
-                int left_n = 0;
-                split_bits_count_left(mask, X_bits[(std::size_t)f1], L, R, left_n);
-
-                if (left_n == 0 || left_n == n_sub) {
-                    continue;
-                }
-            } else {
-                and_bits(mask, X_bits[(std::size_t)f1], L);
-                andnot_bits(mask, X_bits[(std::size_t)f1], R);
-
-                if (!L.any() || !R.any()) {
-                    continue;
-                }
-            }
-
-            const PathKey* pkLp = &empty_pk();
-            const PathKey* pkRp = &empty_pk();
-
-            PathKey pkL_local;
-            PathKey pkR_local;
-
-            make_child_pks_if_needed_(
-                f1,
-                pk,
-                pkLp,
-                pkRp,
-                pkL_local,
-                pkR_local
-            );
-
-            const int sum = special_depth2_fixed_root_split_sum_numerical_(
-                L,
-                R,
-                *pkLp,
-                *pkRp,
-                state,
-                best_sum
-            );
-
-            if (sum < best_sum) {
-                best_sum = sum;
-
-                if (best_sum <= 2 * gamma) {
-                    goto done_numerical_depth2;
-                }
-            }
-        }
-
-        // root split on numerical continuous features.
-        // Scan root feature sorted rows once, building L incrementally.
-        // For each valid root threshold, call the fixed-root solver using
-        // the original parent state.
-        for (int g = 0; g < G; ++g) {
-            const auto& sorted_rows = state.sorted_idx_by_num[(std::size_t)g];
-
-            if (sorted_rows.size() <= 1) {
-                continue;
-            }
-
-            const std::vector<double>& x =
-                numerical_X_cols_for_greedy[(std::size_t)g];
-
-            const int start_feat = continuous_starts[(std::size_t)g];
-            const int end_feat = continuous_group_end_(g);
-
-            if (start_feat >= end_feat) {
-                continue;
-            }
-
-            const std::vector<double>& vals =
-                numerical_unique_values_for_greedy[(std::size_t)g];
-
-            if (vals.size() <= 1) {
-                continue;
-            }
-
-            const int expected_end_feat = start_feat + (int)vals.size() - 1;
-            if (expected_end_feat != end_feat) {
-                throw std::logic_error(
-                    "continuous_starts/end does not match numerical_unique_values_for_greedy."
-                );
-            }
-
-            L.clear();
-
-            int nL = 0;
-            std::size_t i = 0;
-
-            while (i < sorted_rows.size()) {
-                const double value = x[(std::size_t)sorted_rows[i]];
-
-                // move the whole tie block for this root feature to root-left.
-                std::size_t j = i;
-                while (j < sorted_rows.size() &&
-                       x[(std::size_t)sorted_rows[j]] == value) {
-                    const int row = sorted_rows[j];
-
-                    L.w[(std::size_t)(row >> 6)] |=
-                        (1ULL << (row & 63));
-
-                    ++nL;
-                    ++j;
-                }
-
-                L.w[(std::size_t)(n_words - 1)] &= tail_mask;
-
-                // no valid root threshold after the maximum value.
-                if (j >= sorted_rows.size()) {
-                    break;
-                }
-
-                if (nL == 0 || nL == n_sub) {
-                    i = j;
-                    continue;
-                }
-
-                // map value to the existing threshold column only as a consistency check.
-                auto it = std::lower_bound(vals.begin(), vals.end(), value);
-
-                if (it == vals.end() || *it != value) {
-                    throw std::logic_error(
-                        "Active numerical value not found in global unique values."
-                    );
-                }
-
-                const int global_idx =
-                    (int)std::distance(vals.begin(), it);
-
-                if (global_idx + 1 >= (int)vals.size()) {
-                    break;
-                }
-
-                const int feat = start_feat + global_idx;
-
-                if (feat < start_feat || feat >= end_feat) {
-                    throw std::logic_error(
-                        "Mapped numerical threshold feature index is out of group range."
-                    );
-                }
-
-                andnot_bits(mask, L, R);
-
-                if (!R.any()) {
-                    break;
-                }
-
-                const PathKey* pkLp = &empty_pk();
-                const PathKey* pkRp = &empty_pk();
-
-                PathKey pkL_local;
-                PathKey pkR_local;
-
-                make_child_pks_if_needed_(
-                    feat,
-                    pk,
-                    pkLp,
-                    pkRp,
-                    pkL_local,
-                    pkR_local
-                );
-
-                const int sum = special_depth2_fixed_root_split_sum_numerical_(
-                    L,
-                    R,
-                    *pkLp,
-                    *pkRp,
-                    state,
-                    best_sum
-                );
-
-                if (sum < best_sum) {
-                    best_sum = sum;
-
-                    if (best_sum <= 2 * gamma) {
-                        goto done_numerical_depth2;
-                    }
-                }
-
-                i = j;
-            }
-        }
-
-    done_numerical_depth2:
-
-        if (proxy_caching_enabled) {
-            cache_lickety_if_true_(
-                kmask,
-                DEPTH,
-                KTAG,
-                best_sum,
-                /*allow_cache=*/true
-            );
-        }
-
-        return best_sum;
-    }
-    
-    int special_depth2_exact_numerical_no_cache_(
-        const Packed& mask,
-        int leaf_loss,
-        int n_sub,
-        const PathKey& pk
-    ) {
-        NumericalGreedyState state = make_numerical_state_for_mask_(mask);
-
-        return special_depth2_exact_numerical_no_cache_(
-            mask,
-            leaf_loss,
-            n_sub,
-            state,
-            pk
-        );
-    }
-
+    // just a wrapper for the optimal decision tree here. it calls the existing best-split selector with the correct lookahead
     int depthd_exact_solver_cached_continuous(
         const Packed& mask,
         int8_t depth_budget,
@@ -10077,27 +8113,6 @@ private:
                 return cached;
             }
         }
-
-        // if (depth_budget == 2) {
-        //     int n_sub = 0;
-        //     int leaf_loss = 0;
-
-        //     if (num_classes == 2) {
-        //         int pos = 0;
-        //         count_total_pos_binary(mask, n_sub, pos);
-        //         leaf_loss = leaf_objective_binary_from_counts(n_sub, pos);
-        //     } else {
-        //         n_sub = count_total(mask);
-        //         leaf_loss = leaf_objective(mask);
-        //     }
-
-        //     return special_depth2_exact_bitvector_no_cache_(
-        //         mask,
-        //         leaf_loss,
-        //         n_sub,
-        //         pk
-        //     );
-        // }
 
         int n_sub = 0;
         int pos = 0;
@@ -10124,24 +8139,6 @@ private:
 
             return leaf_loss;
         }
-
-        // if (depth_budget == 2) {
-        //     if (greedy_continuous_mode == GreedyContinuousMode::NUMERICAL) {
-        //         return special_depth2_exact_numerical_no_cache_(
-        //             mask,
-        //             leaf_loss,
-        //             n_sub,
-        //             pk
-        //         );
-        //     }
-
-        //     return special_depth2_exact_bitvector_no_cache_(
-        //         mask,
-        //         leaf_loss,
-        //         n_sub,
-        //         pk
-        //     );
-        // }
 
         int best_sum = leaf_loss;
         int best_cached_sum = std::numeric_limits<int>::max();
@@ -10303,6 +8300,8 @@ private:
         return ans;
     }
 
+    // what greedy should choose for objective-minimizing split at depth 1, not based on information gain.
+    // we also record what split this is in the cache. we don't utilize this in our experiments but support it.
     GreedyObjFirstSplit depth1_exact_solver_cached_continuous_with_first_split_(
         const Packed& mask,
         const PathKey& pk,
@@ -10524,7 +8523,8 @@ private:
 
         return best;
     }
-
+    
+    // general scoring method
     GainSplitResult best_continuous_score_split_(
         const Packed& mask,
         int start_idx,
@@ -10693,42 +8693,7 @@ private:
         return best;
     }
 
-    // int greedy_numerical_entry_point(
-    //     const Packed& mask,
-    //     int8_t depth_budget,
-    //     const PathKey& pk
-    // ) {
-
-    //     if (numerical_X_cols_for_greedy.size() != continuous_starts.size()) {
-    //         throw std::logic_error(
-    //             "Numerical greedy representation is not aligned with continuous_starts."
-    //         );
-    //     }
-
-    //     NumericalGreedyState state;
-    //     state.sorted_idx_by_num.resize(numerical_global_sorted_idx.size());
-
-    //     for (std::size_t g = 0; g < numerical_global_sorted_idx.size(); ++g) {
-    //         const auto& global_order = numerical_global_sorted_idx[g];
-    //         auto& active_order = state.sorted_idx_by_num[g];
-
-    //         active_order.reserve(global_order.size());
-
-    //         for (int row : global_order) {
-    //             if (mask_has_row_(mask, row)) {
-    //                 active_order.push_back(row);
-    //             }
-    //         }
-    //     }
-
-    //     return train_greedy_continuous_numerical(
-    //         mask,
-    //         depth_budget,
-    //         pk,
-    //         state
-    //     );
-    // }
-
+    // get the sorted lists of indices to do greedy more efficiently for large-scale problems
     int greedy_numerical_entry_point(
         const Packed& mask,
         int8_t depth_budget,
@@ -10746,7 +8711,7 @@ private:
             return leaf_objective(mask);
         }
 
-        // Important: check the greedy cache before paying to build the
+        // important: check the greedy cache before paying to build the
         // NumericalGreedyState.
         if (proxy_caching_enabled) {
             const uint64_t kmask = key_of_subproblem(mask, pk);
@@ -11093,6 +9058,8 @@ private:
         }
     }
 
+    // the actual training with the numerical representation, called state here, now that we have it
+    // this does use the special depth 1 solver to get the optimal split at depth 1 instead of information-gain selection
     int train_greedy_continuous_numerical(
         const Packed& mask,
         int8_t depth_budget,
@@ -11219,44 +9186,6 @@ private:
 
             return leaf_loss;
         }
-
-        // special greedy numerical depth-2 case:
-        // greedy already chose the root split best.feat.
-        // now solve the two depth-1 child problems with the fixed-root-split depth 2 solver
-        // if (depth_budget == 2) {
-        //     const PathKey* pkLp = &empty_pk();
-        //     const PathKey* pkRp = &empty_pk();
-
-        //     PathKey pkL_local;
-        //     PathKey pkR_local;
-
-        //     make_child_pks_if_needed_(
-        //         best.feat,
-        //         pk,
-        //         pkLp,
-        //         pkRp,
-        //         pkL_local,
-        //         pkR_local
-        //     );
-
-        //     const int split_loss =
-        //         special_depth2_fixed_root_split_sum_numerical_(
-        //             L,
-        //             R,
-        //             *pkLp,
-        //             *pkRp,
-        //             state,
-        //             leaf_loss
-        //         );
-
-        //     const int ans = std::min(leaf_loss, split_loss);
-
-        //     if (proxy_caching_enabled) {
-        //         greedy_cache.emplace(key, ans);
-        //     }
-
-        //     return ans;
-        // }
 
         const PathKey* pkLp = &empty_pk();
         const PathKey* pkRp = &empty_pk();
@@ -11426,6 +9355,7 @@ private:
         return best_sum;
     }
 
+    // implementation of the fast scanning described in the appendix
     int depth1_numerical_feature_best_sum_(
         int num_group,
         const std::vector<int>& sorted_rows,
@@ -11584,273 +9514,7 @@ private:
         return best_sum;
     }
 
-    int depth1_bitvector_solver_cached_continuous(
-        const Packed& mask,
-        const PathKey& pk,
-        const ContinuousPath& cpath = empty_continuous_path()
-    ) {
-        constexpr int8_t DEPTH = 1;
-
-        uint64_t kmask = 0;
-        K2 key{0, DEPTH};
-
-        if (proxy_caching_enabled) {
-            kmask = key_of_subproblem(mask, pk);
-            key.k = kmask;
-
-            if (auto it = greedy_cache.find(key); it != greedy_cache.end()) {
-                return it->second;
-            }
-        }
-
-        int n_sub = 0;
-        int pos = 0;
-        int leaf_loss = 0;
-
-        std::vector<int> parent_counts;
-
-        if (num_classes == 2) {
-            count_total_pos_binary(mask, n_sub, pos);
-            leaf_loss = leaf_objective_binary_from_counts(n_sub, pos);
-        } else {
-            n_sub = count_total(mask);
-            count_per_class(mask, parent_counts);
-            leaf_loss = leaf_objective_multiclass_from_counts_(parent_counts);
-        }
-
-        if (n_sub <= 1) {
-            if (proxy_caching_enabled) {
-                greedy_cache.emplace(key, leaf_loss);
-            }
-            return leaf_loss;
-        }
-
-        // any split has at least two leaves, so no split can beat this.
-        if (leaf_loss <= 2 * gamma) {
-            if (cache_cheap_subproblems && proxy_caching_enabled) {
-                greedy_cache.emplace(key, leaf_loss);
-            }
-            return leaf_loss;
-        }
-
-        int best_sum = leaf_loss;
-
-        const int F = n_features;
-        const int first_cont = first_continuous_feature_();
-
-        // ordinary binary features.
-        if (num_classes == 2) {
-            best_sum = depth1_bitvector_best_sum_binary_range_(
-                mask,
-                /*start_idx=*/0,
-                /*end_idx=*/std::min(first_cont, F),
-                n_sub,
-                pos,
-                best_sum,
-                /*skip_duplicate_active_splits=*/false
-            );
-        } else {
-            best_sum = depth1_bitvector_best_sum_multiclass_range_(
-                mask,
-                /*start_idx=*/0,
-                /*end_idx=*/std::min(first_cont, F),
-                n_sub,
-                parent_counts,
-                best_sum,
-                /*skip_duplicate_active_splits=*/false
-            );
-        }
-
-        // continuous threshold groups.
-        // use cpath only to restrict the threshold interval, then scan bitvectors linearly.
-        for (int cont_pos = 0; cont_pos < (int)continuous_starts.size(); ++cont_pos) {
-            const int raw_start = continuous_starts[(size_t)cont_pos];
-            const int raw_end = continuous_group_end_(cont_pos);
-
-            if (raw_start >= F) continue;
-
-            auto [start_idx, end_idx] =
-                tighten_continuous_interval_from_path_(
-                    raw_start,
-                    std::min(raw_end, F),
-                    cpath
-                );
-
-            if (start_idx >= end_idx) continue;
-
-            if (num_classes == 2) {
-                best_sum = depth1_bitvector_best_sum_binary_range_(
-                    mask,
-                    start_idx,
-                    end_idx,
-                    n_sub,
-                    pos,
-                    best_sum,
-                    /*skip_duplicate_active_splits=*/true
-                );
-            } else {
-                best_sum = depth1_bitvector_best_sum_multiclass_range_(
-                    mask,
-                    start_idx,
-                    end_idx,
-                    n_sub,
-                    parent_counts,
-                    best_sum,
-                    /*skip_duplicate_active_splits=*/true
-                );
-            }
-        }
-
-        if (proxy_caching_enabled) {
-            greedy_cache.emplace(key, best_sum);
-        }
-
-        return best_sum;
-    }
-
-    int depth1_bitvector_best_sum_binary_range_(
-        const Packed& mask,
-        int start_idx,
-        int end_idx,
-        int n_total,
-        int pos_total,
-        int incumbent,
-        bool skip_duplicate_active_splits
-    ) const {
-        int best_sum = incumbent;
-
-        if (start_idx >= end_idx) return best_sum;
-
-        const Packed& Ypos = Y_bits[(size_t)1];
-
-        int prev_nL = -1;
-        int prev_posL = -1;
-
-        for (int feat = start_idx; feat < end_idx; ++feat) {
-            const Packed& Xf = X_bits[(size_t)feat];
-
-            int nL = 0;
-            int posL = 0;
-
-            // fast bitvector count only, not materializing L/R.
-            for (int w = 0; w < n_words; ++w) {
-                const uint64_t left_bits =
-                    mask.w[(size_t)w] & Xf.w[(size_t)w];
-
-                nL += popcnt64(left_bits);
-                posL += popcnt64(left_bits & Ypos.w[(size_t)w]);
-            }
-
-            // adjacent continuous thresholds can induce the same active split
-            // inside the current subproblem. skip duplicate count states.
-            if (skip_duplicate_active_splits &&
-                nL == prev_nL &&
-                posL == prev_posL) {
-                continue;
-            }
-
-            prev_nL = nL;
-            prev_posL = posL;
-
-            if (nL == 0 || nL == n_total) continue;
-
-            const int nR = n_total - nL;
-            const int posR = pos_total - posL;
-
-            const int left_loss =
-                leaf_objective_binary_from_counts(nL, posL);
-
-            const int right_loss =
-                leaf_objective_binary_from_counts(nR, posR);
-
-            const int sum = left_loss + right_loss;
-
-            if (sum < best_sum) {
-                best_sum = sum;
-            }
-        }
-
-        return best_sum;
-    }
-
-    int depth1_bitvector_best_sum_multiclass_range_(
-        const Packed& mask,
-        int start_idx,
-        int end_idx,
-        int n_total,
-        const std::vector<int>& parent_counts,
-        int incumbent,
-        bool skip_duplicate_active_splits
-    ) const {
-        int best_sum = incumbent;
-
-        if (start_idx >= end_idx) return best_sum;
-
-        std::vector<int> left_counts((size_t)num_classes, 0);
-        std::vector<int> right_counts((size_t)num_classes, 0);
-
-        std::vector<int> prev_left_counts;
-        if (skip_duplicate_active_splits) {
-            prev_left_counts.assign((size_t)num_classes, -1);
-        }
-
-        int prev_nL = -1;
-
-        for (int feat = start_idx; feat < end_idx; ++feat) {
-            std::fill(left_counts.begin(), left_counts.end(), 0);
-
-            const Packed& Xf = X_bits[(size_t)feat];
-
-            int nL = 0;
-
-            // fast bitvector count only, not materializing L/R.
-            for (int w = 0; w < n_words; ++w) {
-                const uint64_t left_bits =
-                    mask.w[(size_t)w] & Xf.w[(size_t)w];
-
-                nL += popcnt64(left_bits);
-
-                for (int c = 0; c < num_classes; ++c) {
-                    left_counts[(size_t)c] += popcnt64(
-                        left_bits & Y_bits[(size_t)c].w[(size_t)w]
-                    );
-                }
-            }
-
-            if (skip_duplicate_active_splits &&
-                nL == prev_nL &&
-                left_counts == prev_left_counts) {
-                continue;
-            }
-
-            prev_nL = nL;
-            if (skip_duplicate_active_splits) {
-                prev_left_counts = left_counts;
-            }
-
-            if (nL == 0 || nL == n_total) continue;
-
-            for (int c = 0; c < num_classes; ++c) {
-                right_counts[(size_t)c] =
-                    parent_counts[(size_t)c] - left_counts[(size_t)c];
-            }
-
-            const int left_loss =
-                leaf_objective_multiclass_from_counts_(left_counts);
-
-            const int right_loss =
-                leaf_objective_multiclass_from_counts_(right_counts);
-
-            const int sum = left_loss + right_loss;
-
-            if (sum < best_sum) {
-                best_sum = sum;
-            }
-        }
-
-        return best_sum;
-    }
-
+    // essentially the same greedy solver was in praxis; there is a subtle optimization we add (proxy section of the appendix)
     int train_greedy_continuous(
         const Packed& mask,
         int8_t depth_budget,
@@ -11995,42 +9659,6 @@ private:
             return leaf_loss;
         }
 
-        // special greedy depth-2 case:
-        // greedy already chose the root split best.feat.
-        // now solve the two depth-1 child problems simultaneously.
-        // if (depth_budget == 2) {
-        //     const PathKey* pkLp = &empty_pk();
-        //     const PathKey* pkRp = &empty_pk();
-
-        //     PathKey pkL_local;
-        //     PathKey pkR_local;
-
-        //     make_child_pks_if_needed_(
-        //         best.feat,
-        //         pk,
-        //         pkLp,
-        //         pkRp,
-        //         pkL_local,
-        //         pkR_local
-        //     );
-
-        //     const int split_loss =
-        //         special_depth2_fixed_root_split_sum_bitvector_(
-        //             L,
-        //             R,
-        //             *pkLp,
-        //             *pkRp,
-        //             leaf_loss
-        //         );
-
-        //     const int ans = std::min(leaf_loss, split_loss);
-
-        //     if (proxy_caching_enabled) {
-        //         greedy_cache.emplace(key, ans);
-        //     }
-
-        //     return ans;
-        // }
 
         const PathKey* pkLp = &empty_pk();
         const PathKey* pkRp = &empty_pk();
@@ -12086,6 +9714,7 @@ private:
         return ans;
     }
 
+    // the only difference here is we log the first split in a cache
     GreedyObjFirstSplit train_greedy_continuous_with_first_split_(
         const Packed& mask,
         int8_t depth_budget,
@@ -12238,43 +9867,6 @@ private:
             return out;
         }
 
-        // special greedy depth-2 case:
-        // greedy already chose the root split best.feat.
-        // now solve the two depth-1 child problems simultaneously.
-        // if (depth_budget == 2) {
-        //     const PathKey* pkLp = &empty_pk();
-        //     const PathKey* pkRp = &empty_pk();
-
-        //     PathKey pkL_local;
-        //     PathKey pkR_local;
-
-        //     make_child_pks_if_needed_(
-        //         best.feat,
-        //         pk,
-        //         pkLp,
-        //         pkRp,
-        //         pkL_local,
-        //         pkR_local
-        //     );
-
-        //     const int split_loss =
-        //         special_depth2_fixed_root_split_sum_bitvector_(
-        //             L,
-        //             R,
-        //             *pkLp,
-        //             *pkRp,
-        //             leaf_loss
-        //         );
-
-        //     const int ans = std::min(leaf_loss, split_loss);
-
-        //     if (proxy_caching_enabled) {
-        //         greedy_cache.emplace(key, ans);
-        //     }
-
-        //     return ans;
-        // }
-
         const PathKey* pkLp = &empty_pk();
         const PathKey* pkRp = &empty_pk();
 
@@ -12330,9 +9922,10 @@ private:
         return out;
     }
 
-    // end continuous land
+    // end continuous algorithms 
 
-    
+    // these are now existing binary algorithms - nothing new exists beyond this point. our contribution ends here.
+
     int train_greedy(const Packed& mask, int8_t depth_budget, const PathKey& pk) {
         if (depth_budget == 0) {
             return leaf_objective(mask);
@@ -13107,7 +10700,6 @@ private:
                 return depthd_exact_proxy_objective_(mask, 2, pk);
         }
 
-        // TODO, this is an issue with anytime, we need to use K3 if we're going to do anytime
         // (k=1 so use K2 cache)
         uint64_t kmask = 0;
         K2 key2{0, depth_budget};
@@ -13226,8 +10818,8 @@ private:
 
     // a generalized lickety_split algorithm with a lookahead parameter k. we also support other proxy styles here (such as recursively applying split) that have the same flavor.
     int generalized_lickety_split(const Packed& mask, int8_t depth_budget, int8_t k, const PathKey& pk) {
-        // TODO only do this call if also anytime is false
-        if (k == 1 && lookahead_init == 1 && proxy_style == 0) {
+        // only do this call if also anytime is false to allow for proxy strength refinement
+        if (!anytime_mode_active_ && k == 1 && lookahead_init == 1 && proxy_style == 0) {
             return lickety_split_k1(mask, depth_budget, pk);
         }
 
