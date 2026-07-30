@@ -4063,9 +4063,8 @@ private:
         std::vector<std::vector<int>> sorted_idx_by_num;
     };
 
-    // the equivalent of ContinuousRSet, with some caveats on extension.
+    // a wrapper equivalent of ContinuousRSet
     // as seen just below, if we need to extend a graph to a bigger budget, we switch over to this construct_trie_extend method, which is an exact implementation of ContinuousRSet
-    // it is beneficial to call use this method if we aren't extending anything because of some small overhead.
     shared_ptr<TreeTrieNode> construct_trie(const Packed& mask, int8_t depth, int budget, const PathKey& pk, const ContinuousPath& cpath = empty_continuous_path(), const std::vector<int>* active_features = nullptr) {
         // testing something
         auto node = std::make_shared<TreeTrieNode>();
