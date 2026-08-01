@@ -172,12 +172,37 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
     const std::vector<std::vector<int>>& binning_map_vars = {},
     const std::vector<int>& continuous_starts = {},
     bool use_anytime_fit = false,
+    double second_rashomon_mult = -1.0,
+    double multiplier_step_size = 0.01,
     const std::vector<int>& proxy_threshold_features = {},
+    const std::vector<int>& initial_active_threshold_features = {},
     int refinement_width = 1,
-    int max_refinement_rounds = -1
+    int max_refinement_rounds = -1,
+    bool use_multipass = true,
+    bool rule_list_mode = false,
+    int proxy_style = 0,
+    bool majority_leaf_only = false,
+    bool cache_cheap_subproblems = false,
+    bool proxy_caching = true,
+    int proxy_refinement_mode = 0,
+    bool continuous_proxy_in_lickety = true,
+    bool continuous_proxy_in_depthd_exact = true,
+    bool continuous_proxy_in_greedy = true,
+    double runtime_limit_seconds = -1.0,
+    double memory_limit_mb = -1.0
 ) {
     const int n_full = (int)X_row_major.size();
     const int d = (int)X_row_major[0].size();
+
+    const double resolved_second_rashomon_mult =
+        second_rashomon_mult < 0.0
+            ? rashomon_mult
+            : second_rashomon_mult;
+
+    const std::vector<int>& resolved_initial_active_features =
+        initial_active_threshold_features.empty()
+            ? proxy_threshold_features
+            : initial_active_threshold_features;
 
     // build var->cols mapping.
     // if no binning map is provided, assume no relationship between binary features
@@ -238,22 +263,26 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
                 lambda,
                 static_cast<int8_t>(depth_budget),
                 rashomon_mult,
+                resolved_second_rashomon_mult,
+                multiplier_step_size,
                 static_cast<int8_t>(lookahead_k),
-                true,                         // use_multipass
-                false,                        // rule_list_mode
-                0,                            // proxy_style
-                false,                        // majority_leaf_only
-                false,                        // cache_cheap_subproblems
-                true,                         // proxy_caching
-                proxy_threshold_features,     // snapped active proxy thresholds
-                proxy_threshold_features,     // initial enumeration featues
+                use_multipass,
+                rule_list_mode,
+                proxy_style,
+                majority_leaf_only,
+                cache_cheap_subproblems,
+                proxy_caching,
+                proxy_threshold_features,
+                resolved_initial_active_features,
                 refinement_width,
                 max_refinement_rounds,
-                false,                        // increase_proxy_anytime
-                true, // continuous proxy use (1/3)
-                true,
-                true,
-                continuous_starts
+                proxy_refinement_mode,
+                continuous_proxy_in_lickety,
+                continuous_proxy_in_depthd_exact,
+                continuous_proxy_in_greedy,
+                continuous_starts,
+                runtime_limit_seconds,
+                memory_limit_mb
             );
         } else {
             model.fit(
@@ -275,7 +304,9 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
                 !proxy_threshold_features.empty(),                        // restrict_proxy_in_depthd_exact
                 !proxy_threshold_features.empty(),                        // restrict_proxy_in_greedy
                 true,                         // rashomon_mode
-                continuous_starts
+                continuous_starts,
+                false
+
             );
         }
 

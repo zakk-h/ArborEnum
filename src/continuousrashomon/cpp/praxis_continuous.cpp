@@ -14,6 +14,22 @@
 #include <deque>
 #include <map>
 #include <span>
+#include <chrono>
+
+#include <fstream>
+
+#if defined(_WIN32)
+  #define NOMINMAX
+  #include <windows.h>
+  #include <psapi.h>
+  #if defined(_MSC_VER)
+    #pragma comment(lib, "Psapi.lib")
+  #endif
+#elif defined(__APPLE__)
+  #include <mach/mach.h>
+#else
+  #include <unistd.h>
+#endif
 
 using namespace std;
 
@@ -617,12 +633,7 @@ struct KContProxy {
 
 using ProxyCompletionTree = std::map<int, std::pair<int,int>>;
 
-// all the ProxyCompletion maps, so this is how we get E in the main paper
-std::unordered_map<
-    KContProxy,
-    ProxyCompletionTree,
-    KContProxy::Hash
-> continuous_proxy_completion_cache;
+
 
 // existing data structures for storing the Rashomon set - not part of our contribution.
 struct HistEntry {
@@ -696,6 +707,16 @@ struct TreeTrieNode {
     void add_split(int feat,
                const shared_ptr<TreeTrieNode>& L,
                const shared_ptr<TreeTrieNode>& R) {
+
+        if (
+            !L ||
+            !R ||
+            (L->leaves.empty() && L->splits.empty()) ||
+            (R->leaves.empty() && R->splits.empty())
+        ) {
+            return;
+        }
+
         SplitNode s;
         s.feature = feat;
         s.left  = L;
@@ -902,10 +923,23 @@ private:
     unordered_map<K2, int, K2::Hash> greedy_cache;
     unordered_map<K2,  int, K2::Hash>  lickety_cache_k2; // used when lookahead_init <= 1
     unordered_map<KLA, int, KLA::Hash>  lickety_cache_kla; // used when lookahead_init > 1
+    // all the ProxyCompletion maps, so this is how we get E in the main paper
+    std::unordered_map<
+        KContProxy,
+        ProxyCompletionTree,
+        KContProxy::Hash
+    > continuous_proxy_completion_cache;
 
     unordered_map<K2, GreedyObjFirstSplit, K2::Hash> greedy_first_split_cache;
     unordered_map<K2, int, K2::Hash> anytime_lickety_first_split_cache;
     bool anytime_mode_active_ = false;
+
+    // enabled only by fit_then_extend and the explicit anytime algorithm.
+    // negative values mean that the corresponding limit is disabled.
+    bool resource_limits_active_ = false;
+    double runtime_limit_seconds_ = -1.0;
+    double memory_limit_mb_ = -1.0;
+    std::chrono::steady_clock::time_point resource_start_time_;
 
     // unordered_map<K3, shared_ptr<TreeTrieNode>, K3::Hash> trie_cache; // if trie_cache_enabled is on
     unordered_map<K2, shared_ptr<TreeTrieNode>, K2::Hash> trie_cache; // canonical node per (subproblem, depth)
@@ -1121,6 +1155,82 @@ private:
         return greedy_numerical_entry_point(mask, depth_budget, pk);
     }
 
+    void shift_proxy_strength_down_one_() {
+        if (true) {
+            // snapshot positive-lookahead entries before mutating the map.
+            std::vector<std::pair<KLA, int>> source_entries;
+            source_entries.reserve(lickety_cache_kla.size());
+
+            for (const auto& [key, objective] : lickety_cache_kla) {
+                if (key.la >= 1) {
+                    source_entries.emplace_back(key, objective);
+                }
+            }
+
+            // remove objectives that are not over continuous features
+            greedy_cache.clear();
+
+            for (
+                auto it = lickety_cache_kla.begin();
+                it != lickety_cache_kla.end();
+            ) {
+                if (it->first.la == 0) {
+                    it = lickety_cache_kla.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+
+            // move every positive-lookahead objective down by one because of the greedy base case not being optimal
+            for (const auto& [key, objective] : source_entries) {
+                const KLA shifted_key{
+                    key.k,
+                    key.depth,
+                    key.la - 1
+                };
+
+                auto [shifted_it, inserted] =
+                    lickety_cache_kla.emplace(
+                        shifted_key,
+                        objective
+                    );
+
+                if (!inserted) {
+                    shifted_it->second = std::min(
+                        shifted_it->second,
+                        objective
+                    );
+                }
+
+                // lookahead 1 becomes the new bottom-level completion,
+                // so make it visible through the greedy lookup path too.
+                if (key.la == 1) {
+                    const K2 greedy_key{
+                        key.k,
+                        key.depth
+                    };
+
+                    auto [greedy_it, greedy_inserted] =
+                        greedy_cache.emplace(
+                            greedy_key,
+                            objective
+                        );
+
+                    if (!greedy_inserted) {
+                        greedy_it->second = std::min(
+                            greedy_it->second,
+                            objective
+                        );
+                    }
+                }
+            }
+
+            return;
+        }
+        // in anytime, we are always using KLA cache, not K2, so no need for an else case here
+       
+    }
+
     // decide which exact solver to use. and exact over what features.
     inline int depthd_exact_proxy_objective_(
         const Packed& mask,
@@ -1182,7 +1292,171 @@ private:
             trie_cache.reserve(512);
         }
     }
-        
+
+    static double current_memory_mb_() {
+    #if defined(_WIN32)
+        PROCESS_MEMORY_COUNTERS_EX counters;
+        std::memset(&counters, 0, sizeof(counters));
+        counters.cb = sizeof(counters);
+
+        if (!GetProcessMemoryInfo(
+                GetCurrentProcess(),
+                reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+                sizeof(counters)
+            )) {
+            return 0.0;
+        }
+
+        return static_cast<double>(counters.WorkingSetSize) /
+            (1024.0 * 1024.0);
+
+    #elif defined(__APPLE__)
+        mach_task_basic_info info;
+        mach_msg_type_number_t count =
+            MACH_TASK_BASIC_INFO_COUNT;
+
+        const kern_return_t result = task_info(
+            mach_task_self(),
+            MACH_TASK_BASIC_INFO,
+            reinterpret_cast<task_info_t>(&info),
+            &count
+        );
+
+        if (result != KERN_SUCCESS) {
+            return 0.0;
+        }
+
+        return static_cast<double>(info.resident_size) /
+            (1024.0 * 1024.0);
+
+    #else
+        std::ifstream statm("/proc/self/statm");
+
+        long total_pages = 0;
+        long resident_pages = 0;
+
+        if (!(statm >> total_pages >> resident_pages)) {
+            return 0.0;
+        }
+
+        const long page_size = sysconf(_SC_PAGESIZE);
+
+        if (page_size <= 0) {
+            return 0.0;
+        }
+
+        return (
+            static_cast<double>(resident_pages) *
+            static_cast<double>(page_size)
+        ) / (1024.0 * 1024.0);
+    #endif
+    }
+
+    
+
+    void begin_resource_tracking_(
+        double runtime_limit_seconds,
+        double memory_limit_mb
+    ) {
+        if (
+            runtime_limit_seconds < 0.0 &&
+            memory_limit_mb < 0.0
+        ) {
+            resource_limits_active_ = false;
+            runtime_limit_seconds_ = -1.0;
+            memory_limit_mb_ = -1.0;
+            return;
+        }
+
+        resource_limits_active_ = true;
+        runtime_limit_seconds_ = runtime_limit_seconds;
+        memory_limit_mb_ = memory_limit_mb;
+        resource_start_time_ = std::chrono::steady_clock::now();
+    }
+
+    void end_resource_tracking_() {
+        resource_limits_active_ = false;
+        runtime_limit_seconds_ = -1.0;
+        memory_limit_mb_ = -1.0;
+    }
+
+    bool resource_limit_reached_() const {
+        if (!resource_limits_active_) {
+            return false;
+        }
+
+        if (runtime_limit_seconds_ >= 0.0) {
+            const double elapsed_seconds =
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() -
+                    resource_start_time_
+                ).count();
+
+            if (elapsed_seconds >= runtime_limit_seconds_) {
+                return true;
+            }
+        }
+
+        if (
+            memory_limit_mb_ >= 0.0 &&
+            current_memory_mb_() >= memory_limit_mb_
+        ) {
+            return true;
+        }
+
+        return false;
+    }
+
+    double elapsed_resource_seconds_() const {
+        return std::chrono::duration<double>(
+            std::chrono::steady_clock::now() -
+            resource_start_time_
+        ).count();
+    }
+
+    struct AnytimeRoundCost {
+        double seconds = 0.0;
+        double memory_mb = 0.0;
+    };
+
+    AnytimeRoundCost finish_anytime_round_(
+        const std::chrono::steady_clock::time_point& start_time,
+        double start_memory_mb
+    ) const {
+        AnytimeRoundCost cost;
+
+        cost.seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - start_time
+        ).count();
+
+        cost.memory_mb = std::max(
+            0.0,
+            current_memory_mb_() - start_memory_mb
+        );
+
+        return cost;
+    }
+
+    bool auto_proxy_round_is_allowed_(
+        const AnytimeRoundCost& previous_round,
+        int refinement_round
+    ) const {
+        const double scale =
+            std::ldexp(1.0, refinement_round); // 2^r
+
+        const bool time_ok =
+            runtime_limit_seconds_ < 0.0 ||
+            previous_round.seconds / runtime_limit_seconds_
+                <= scale / 500.0;
+
+        const bool memory_ok =
+            memory_limit_mb_ < 0.0 ||
+            previous_round.memory_mb / memory_limit_mb_
+                <= scale / 37.0;
+
+        return time_ok && memory_ok;
+    }
+                
     inline int count_total(const Packed& mask) const { return mask.count(); } // number of active samples
     // inline int count_pos(const Packed& mask) const { return popcount_and(mask, Ypos); } // number of active samples that are positive
 
@@ -1839,9 +2113,14 @@ public:
                     f < (int)X_cols.size();
                     ++f
                 ) {
-                    const int d = hamming_distance_binary_column_(
+                    const int d_same = hamming_distance_binary_column_(
                         X_cols[(std::size_t)f],
                         selected_col
+                    );
+
+                    const int d = std::min(
+                        d_same,
+                        n - d_same
                     );
 
                     if (d < best_dist) {
@@ -2185,6 +2464,7 @@ public:
         int8_t depth_budget,
         double first_rashomon_mult,
         double second_rashomon_mult,
+        double multiplier_step_size,
         int8_t lookahead_k,
         bool use_multipass_flag,
         bool rule_list_mode_flag,
@@ -2197,7 +2477,9 @@ public:
         bool restrict_proxy_in_depthd_exact_in,
         bool restrict_proxy_in_greedy_in,
         const std::vector<int>& continuous_starts_in,
-        bool stronger_rollout_flag = false
+        bool stronger_rollout_flag = false,
+        double runtime_limit_seconds = -1.0,
+        double memory_limit_mb = -1.0
     ) {
         if (
             first_rashomon_mult < 0.0 ||
@@ -2207,6 +2489,21 @@ public:
                 "Rashomon multipliers must be nonnegative."
             );
         }
+
+        if (
+            second_rashomon_mult > first_rashomon_mult &&
+            multiplier_step_size <= 0.0
+        ) {
+            throw std::runtime_error(
+                "multiplier_step_size must be positive when the second "
+                "Rashomon multiplier is larger than the first."
+            );
+        }
+
+        begin_resource_tracking_(
+            runtime_limit_seconds,
+            memory_limit_mb
+        );
 
         // stage 1: ordinary solve using the first multiplier.
         fit(
@@ -2400,24 +2697,79 @@ public:
             );
         }
 
-        std::cout
-            << "Explicitly extending to objective bound: "
-            << explicit_second_budget
-            << "\n";
-
         if (explicit_second_budget == first_budget) {
             obj_bound = first_budget;
+            end_resource_tracking_();
             return result;
         }
 
-        extend_result_to_budget_(
-            depth_budget,
-            explicit_second_budget,
-            root,
-            root_pk,
-            root_cpath,
-            all_features
-        );
+        double current_multiplier = first_rashomon_mult;
+
+        while (current_budget < explicit_second_budget) {
+            if (resource_limit_reached_()) {
+                std::cout
+                    << "Resource limit reached; stopping extension.\n";
+                break;
+            }
+
+            current_multiplier = std::min(
+                second_rashomon_mult,
+                current_multiplier + multiplier_step_size
+            );
+
+            int next_budget = static_cast<int>(
+                std::llround(
+                    static_cast<double>(best_objective) *
+                    (1.0 + current_multiplier) *
+                    (1.0 + multiplicative_slack)
+                )
+            );
+
+            // ensure every unfinished iteration makes integer-budget progress.
+            if (
+                next_budget <= current_budget
+            ) {
+                next_budget = current_budget + 1;
+            }
+
+            // never exceed the requested final budget.
+            next_budget = std::min(
+                next_budget,
+                explicit_second_budget
+            );
+
+            std::cout
+                << "Extending multiplier to "
+                << current_multiplier
+                << " with objective bound "
+                << next_budget
+                << "\n";
+
+            extend_result_to_budget_(
+                depth_budget,
+                next_budget,
+                root,
+                root_pk,
+                root_cpath,
+                all_features
+            );
+
+            if (resource_limit_reached_()) {
+                std::cout
+                    << "Resource limit reached during extension; "
+                    << "keeping completed objective bound "
+                    << current_budget
+                    << ".\n";
+                break;
+            }
+
+
+            current_budget = next_budget;
+        }
+        
+
+        obj_bound = current_budget;
+        end_resource_tracking_();
 
         return result;
     }
@@ -2427,6 +2779,7 @@ public:
         int8_t depth_budget,
         double first_rashomon_mult,
         double second_rashomon_mult,
+        double multiplier_step_size,
         int8_t lookahead_k,
         bool use_multipass_flag,
         bool rule_list_mode_flag,
@@ -2437,7 +2790,9 @@ public:
         bool restrict_proxy_in_lickety_in,
         bool restrict_proxy_in_depthd_exact_in,
         bool restrict_proxy_in_greedy_in,
-        bool stronger_rollout_flag = false
+        bool stronger_rollout_flag = false,
+        double runtime_limit_seconds = -1.0,
+        double memory_limit_mb = -1.0
     ) {
         if (!has_prepared_data) {
             throw std::runtime_error(
@@ -2453,6 +2808,7 @@ public:
             depth_budget,
             first_rashomon_mult,
             second_rashomon_mult,
+            multiplier_step_size,
             lookahead_k,
             use_multipass_flag,
             rule_list_mode_flag,
@@ -2465,7 +2821,9 @@ public:
             restrict_proxy_in_depthd_exact_in,
             restrict_proxy_in_greedy_in,
             prepared_continuous_starts,
-            stronger_rollout_flag
+            stronger_rollout_flag,
+            runtime_limit_seconds,
+            memory_limit_mb
         );
     }
 
@@ -2475,6 +2833,8 @@ public:
         double lambda,
         int8_t depth_budget,
         double rashomon_mult,
+        double second_rashomon_mult,
+        double multiplier_step_size,
         int8_t lookahead_k,
         bool use_multipass_flag,
         bool rule_list_mode_flag,
@@ -2486,11 +2846,13 @@ public:
         const std::vector<int>& initial_active_threshold_features,
         int refinement_width,
         int max_refinement_rounds,
-        bool increase_proxy_anytime,
+        int proxy_refinement_mode,
         bool continuous_proxy_in_lickety,
         bool continuous_proxy_in_depthd_exact,
         bool continuous_proxy_in_greedy,
-        const std::vector<int>& continuous_starts_in
+        const std::vector<int>& continuous_starts_in,
+        double runtime_limit_seconds = -1.0,
+        double memory_limit_mb = -1.0
     ) {
         clear_fit_state_();
 
@@ -2526,6 +2888,32 @@ public:
                 );
             }
         }
+
+        if (
+            proxy_refinement_mode < 0 ||
+            proxy_refinement_mode > 2
+        ) {
+            throw std::runtime_error(
+                "proxy_refinement_mode must be 0, 1, or 2."
+            );
+        }
+
+        if (
+            second_rashomon_mult > rashomon_mult &&
+            multiplier_step_size <= 0.0
+        ) {
+            throw std::runtime_error(
+                "multiplier_step_size must be positive when "
+                "second_rashomon_mult exceeds rashomon_mult."
+            );
+        }
+
+
+        begin_resource_tracking_(
+            runtime_limit_seconds,
+            memory_limit_mb
+        );
+
 
         n_words = (n_samples + 63) / 64;
         tail_mask = (n_samples % 64)
@@ -2612,15 +3000,33 @@ public:
         result = anytime_continuous_rset(
             depth_budget,
             rashomon_mult,
+            second_rashomon_mult,
+            multiplier_step_size,
             proxy_threshold_features,
             initial_active_threshold_features,
             refinement_width,
             max_refinement_rounds,
-            increase_proxy_anytime,
+            proxy_refinement_mode,
             continuous_proxy_in_lickety,
             continuous_proxy_in_depthd_exact,
             continuous_proxy_in_greedy
         );
+        
+        const bool stopped_for_resources = resource_limit_reached_();
+
+        end_resource_tracking_();
+
+        if (!result) {
+            if (stopped_for_resources) {
+                throw std::runtime_error(
+                    "Resource limit reached before a feasible graph was constructed."
+                );
+            }
+
+            throw std::runtime_error(
+                "Graph construction returned null without reaching a resource limit."
+            );
+        }
 
         cout << "Anytime minimum objective: " << result->min_objective << "\n";
         cout << "Cache sizes - Greedy: " << greedy_cache.size()
@@ -2641,6 +3047,8 @@ public:
         double lambda,
         int8_t depth_budget,
         double rashomon_mult,
+        double second_rashomon_mult,
+        double multiplier_step_size,
         int8_t lookahead_k,
         bool use_multipass_flag,
         bool rule_list_mode_flag,
@@ -2652,10 +3060,12 @@ public:
         const std::vector<int>& initial_active_threshold_features,
         int refinement_width,
         int max_refinement_rounds = -1,
-        bool increase_proxy_anytime = false,
+        int proxy_refinement_mode = 0,
         bool continuous_proxy_in_lickety = false,
         bool continuous_proxy_in_depthd_exact = false,
-        bool continuous_proxy_in_greedy = false
+        bool continuous_proxy_in_greedy = false,
+        double runtime_limit_seconds = -1.0,
+        double memory_limit_mb = -1.0
     ) {
         if (!has_prepared_data) {
             throw std::runtime_error(
@@ -2687,6 +3097,8 @@ public:
             lambda,
             depth_budget,
             rashomon_mult,
+            second_rashomon_mult,
+            multiplier_step_size,
             lookahead_k,
             use_multipass_flag,
             rule_list_mode_flag,
@@ -2698,11 +3110,13 @@ public:
             initial_feats,
             refinement_width,
             max_refinement_rounds,
-            increase_proxy_anytime,
+            proxy_refinement_mode,
             continuous_proxy_in_lickety,
             continuous_proxy_in_depthd_exact,
             continuous_proxy_in_greedy,
-            prepared_continuous_starts
+            prepared_continuous_starts,
+            runtime_limit_seconds,
+            memory_limit_mb
         );
     }
 
@@ -2917,11 +3331,13 @@ public:
     shared_ptr<TreeTrieNode> anytime_continuous_rset(
         int8_t depth_budget,
         double rashomon_mult,
+        double second_rashomon_mult,
+        double multiplier_step_size,
         const std::vector<int>& proxy_threshold_features,
         const std::vector<int>& initial_active_threshold_features,
         int refinement_width,
         int max_refinement_rounds = -1,
-        bool increase_proxy_anytime = false,
+        int proxy_refinement_mode = 0,
         bool continuous_proxy_in_lickety = false,
         bool continuous_proxy_in_depthd_exact = false,
         bool continuous_proxy_in_greedy = false
@@ -2936,7 +3352,26 @@ public:
             throw std::runtime_error("depth_budget must be nonnegative.");
         }
 
-        const int first_cont = first_continuous_feature_();
+        if (
+            proxy_refinement_mode < 0 ||
+            proxy_refinement_mode > 2
+        ) {
+            throw std::runtime_error(
+                "proxy_refinement_mode must be 0, 1, or 2."
+            );
+        }
+
+        if (
+            second_rashomon_mult > rashomon_mult &&
+            multiplier_step_size <= 0.0
+        ) {
+            throw std::runtime_error(
+                "multiplier_step_size must be positive when extending "
+                "to a larger second multiplier."
+            );
+        }
+
+                const int first_cont = first_continuous_feature_();
 
         // B_bin = ordinary non-continuous binary features.
         std::vector<int> B_bin;
@@ -3032,6 +3467,10 @@ public:
             (1.0 + rashomon_mult) * (double)P_root
         );
 
+        // don't allow early stopping in the initial solve
+        const bool limits_were_active = resource_limits_active_;
+        resource_limits_active_ = false;
+
         shared_ptr<TreeTrieNode> G_min = construct_trie(
             root,
             depth_budget,
@@ -3041,11 +3480,22 @@ public:
             &B_active
         );
 
+        resource_limits_active_ = limits_were_active;
+
+        
+
 
         int refinement_round = 0;
         while (!active_contains_all_threshold_columns_(B_active)) {
             if (max_refinement_rounds >= 0 &&
                 refinement_round >= max_refinement_rounds) {
+                break;
+            }
+
+            if (resource_limit_reached_()) {
+                std::cout
+                    << "Resource limit reached; "
+                    << "stopping threshold refinement.\n";
                 break;
             }
 
@@ -3090,17 +3540,132 @@ public:
         anytime_mode_active_ = false;
         anytime_lickety_first_split_cache.clear();
 
+        // after all active-threshold refinement is done, we could consider increasing epsilon
+        int current_budget = eps_abs;
+
+        if (
+            second_rashomon_mult > rashomon_mult &&
+            !resource_limit_reached_()
+        ) {
+            const int final_budget = static_cast<int>(
+                std::llround(
+                    (1.0 + second_rashomon_mult) *
+                    static_cast<double>(P_root)
+                )
+            );
+
+            double current_multiplier = rashomon_mult;
+
+            while (
+                current_budget < final_budget &&
+                !resource_limit_reached_()
+            ) {
+                current_multiplier = std::min(
+                    second_rashomon_mult,
+                    current_multiplier + multiplier_step_size
+                );
+
+                int next_budget = static_cast<int>(
+                    std::llround(
+                        (1.0 + current_multiplier) *
+                        static_cast<double>(P_root)
+                    )
+                );
+
+                // rounding can otherwise make a multiplier step produce
+                // the same integer budget.
+                if (next_budget <= current_budget) {
+                    next_budget = current_budget + 1;
+                }
+
+                next_budget = std::min(
+                    next_budget,
+                    final_budget
+                );
+
+                std::cout
+                    << "Extending anytime multiplier to "
+                    << current_multiplier
+                    << " with objective bound "
+                    << next_budget
+                    << "\n";
+
+                // extend_result_to_budget_ operates on result, so make sure it
+                // points to the current anytime root.
+                result = G_min;
+
+                extend_result_to_budget_(
+                    depth_budget,
+                    next_budget,
+                    root,
+                    root_pk,
+                    root_cpath,
+                    B_active
+                );
+
+                G_min = result;
+                current_budget = next_budget;
+            }
+
+            if (resource_limit_reached_()) {
+                std::cout
+                    << "Resource limit reached; "
+                    << "stopping multiplier extension.\n";
+            }
+        }
+
+
         // after all active-threshold refinement is done, optionally increase the
         // proxy lookahead. This can recover splits that were previously pruned by
         // a weaker proxy. The root graph G_min is kept and extended in place.
-        if (increase_proxy_anytime) {
+        // in auto mode, we will decide whether to do this or not
+
+        bool proxy_refinement_stopped_early = false;
+        if (proxy_refinement_mode != 0) {
 
             const int old_lookahead_init = lookahead_init;
             const int final_refinement_lookahead = std::max<int>(lookahead_init, depth_budget - 2); // d-1 is optimal at depth d, but we never evaluate at the root again, always one split lower
 
+            int automatic_refinement_round = 0;
+
             for (int next_k = lookahead_init + 1;
                 next_k <= final_refinement_lookahead;
                 ++next_k) {
+
+                if (resource_limit_reached_()) {
+                    std::cout
+                        << "Resource limit reached; "
+                        << "stopping proxy refinement.\n";
+                    proxy_refinement_stopped_early = true;
+                    break;
+                }
+
+                if (proxy_refinement_mode == 2) {
+                    double previous_round_seconds = elapsed_resource_seconds_();
+                    double previous_round_memory_mb = current_memory_mb_();
+
+                    const double scale =
+                        std::ldexp(1.0, automatic_refinement_round);
+
+                    const bool time_ok =
+                        runtime_limit_seconds_ < 0.0 ||
+                        previous_round_seconds / runtime_limit_seconds_
+                            <= scale / 500.0;
+
+                    const bool memory_ok =
+                        memory_limit_mb_ < 0.0 ||
+                        previous_round_memory_mb / memory_limit_mb_
+                            <= scale / 37.0;
+
+                    if (!time_ok || !memory_ok) {
+                        std::cout
+                            << "Further refinement deemed too expensive for automatic "
+                            << ".\n";
+
+                        proxy_refinement_stopped_early = true;
+                        break;
+                    }
+                }
 
                 lookahead_init = (int8_t)next_k;
 
@@ -3137,6 +3702,51 @@ public:
                     B_active,
                     visited
                 );
+
+                ++automatic_refinement_round;
+            }
+
+            // special correction:
+            // Lickety uses all continuous thresholds, but later things use a binarization
+            // in this case, things become optimal 1 lookahead later
+            // instead of not clamping as much, we shift the caches down by one
+            const bool needs_one_level_proxy_shift =
+                !use_restricted_lickety_proxy_() &&
+                use_restricted_greedy_proxy_();
+
+            if (
+                !proxy_refinement_stopped_early &&
+                needs_one_level_proxy_shift &&
+                !resource_limit_reached_()
+            ) {
+                std::cout
+                    << "Moving continuous Lickety proxy objectives "
+                    << "down one lookahead level.\n";
+
+                shift_proxy_strength_down_one_();
+
+                // same two cache clears as before
+                continuous_proxy_completion_cache.clear();
+                trie_cache.clear();
+
+                RefineVisited visited;
+                visited.reserve(1024);
+
+                RefineGraphDfs(
+                    G_min,
+                    root,
+                    depth_budget,
+                    root_pk,
+                    root_cpath,
+                    B_active,
+                    visited
+                );
+
+                if (resource_limit_reached_()) {
+                    std::cout
+                        << "Resource limit reached during corrected "
+                        << "proxy refinement.\n";
+                }
             }
 
             // restore the user's original lookahead setting for external consistency
@@ -3164,7 +3774,7 @@ public:
         anytime_mode_active_ = false;
 
         result = G_min;
-        obj_bound = eps_abs;
+        obj_bound = current_budget;
         best_objective = P_root;
         trained_depth_budget = depth_budget;
 
@@ -4032,6 +4642,7 @@ private:
         anytime_mode_active_ = false;
 
         continuous_proxy_completion_cache.clear();
+        continuous_proxy_completion_cache.rehash(0);
         
 
         mask_ids = MaskIdTable();
@@ -4312,7 +4923,17 @@ private:
                     );
                 }
 
-                if (LR.first && LR.second) {
+               if (
+                    !children_have_feasible_pair_(
+                        LR.first,
+                        LR.second,
+                        budget
+                    )
+                ) {
+                    if (resource_limit_reached_()) {
+                        return;
+                    }
+                } else {
                     node->add_split(feat, LR.first, LR.second);
                 }
 
@@ -4464,6 +5085,41 @@ private:
 
         --it;
         return *it;
+    }
+
+    // not just does it exist, but does it have either leaves or a split. this will guarantee every node in the graph leads to a solution by induction
+    static bool node_has_solution_(
+        const std::shared_ptr<TreeTrieNode>& node
+    ) {
+        return node &&
+            (
+                !node->leaves.empty() ||
+                !node->splits.empty()
+            );
+    }
+
+    // we actually need to guarantee that there is a solution within the budget
+    static bool children_have_feasible_pair_(
+        const std::shared_ptr<TreeTrieNode>& left,
+        const std::shared_ptr<TreeTrieNode>& right,
+        int parent_budget
+    ) {
+        if (!node_has_solution_(left) ||
+            !node_has_solution_(right)) {
+            return false;
+        }
+
+        if (
+            left->min_objective ==
+                std::numeric_limits<int>::max() ||
+            right->min_objective ==
+                std::numeric_limits<int>::max()
+        ) {
+            return false;
+        }
+
+        return left->min_objective <=
+            parent_budget - right->min_objective;
     }
 
     // this algorithm is a combined version of InitAndPrune and EnumContFeature
@@ -4650,7 +5306,13 @@ private:
                 );
             }
 
-            if (!LR.first || !LR.second) {
+            if (
+                !children_have_feasible_pair_(
+                    LR.first,
+                    LR.second,
+                    budget
+                )
+            ) {
                 return false;
             }
 
@@ -4736,7 +5398,12 @@ private:
                         : !(lossL > budget - gamma && lossR > budget - gamma);
 
                 if (feasible) {
-                    resolve_threshold(feat, lossL, lossR);
+                    const bool resolved =
+                        resolve_threshold(feat, lossL, lossR);
+                    // if it failed (probably becauase of resources), check if we are out of resources, and then stop
+                    if (!resolved && resource_limit_reached_()) {
+                        return;
+                    }
                 }
             }
         }
@@ -4812,8 +5479,16 @@ private:
                 feasible = !(lossL > budget - gamma && lossR > budget - gamma);
             }
 
+            
             if (feasible) {
-                resolve_threshold(feat, lossL, lossR);
+                const bool resolved =
+                    resolve_threshold(feat, lossL, lossR);
+
+                // similarly, if it failed, we're probably out of resources, if so, stop
+                if (!resolved && resource_limit_reached_()) {
+                    return;
+                }
+
                 add_pruned_interval(pos, pos);
                 continue;
             }
@@ -4885,7 +5560,14 @@ private:
                         ? it_split->right->min_objective
                         : std::numeric_limits<int>::max();
 
-                    resolve_threshold(feat, lossL, lossR);
+
+                    // same deal
+                    const bool resolved =
+                        resolve_threshold(feat, lossL, lossR);
+
+                    if (!resolved && resource_limit_reached_()) {
+                        return;
+                    }
                 }
 
                 if (i <= mid - 1) {
@@ -5029,7 +5711,12 @@ private:
             }
 
             if (feasible) {
-                resolve_threshold(feat, lossL, lossR);
+                const bool resolved = resolve_threshold(feat, lossL, lossR);
+
+                // same thing
+                if (!resolved && resource_limit_reached_()) {
+                    return;
+                }
 
                 if (i <= mid - 1) {
                     Q.push_back({i, mid - 1});
@@ -5256,19 +5943,31 @@ private:
                     &B_active,
                     true
                 );
-                if (LR.first && LR.second) {
+
+                if (
+                    !children_have_feasible_pair_(
+                        LR.first,
+                        LR.second,
+                        budget
+                    )
+                ) {
+                    if (resource_limit_reached_()) {
+                        return;
+                    }
+                } else {
                     s.left = LR.first;
                     s.right = LR.second;
 
-                    if (s.left && s.right) {
-                        const int min_sum = s.left->min_objective + s.right->min_objective;
+                    const int min_sum =
+                        s.left->min_objective +
+                        s.right->min_objective;
 
-                        if (min_sum < G->min_objective) {
-                            G->min_objective = min_sum;
-                        }
-
+                    if (min_sum < G->min_objective) {
+                        G->min_objective = min_sum;
                     }
                 }
+
+                
             }
         }
 
@@ -5803,20 +6502,21 @@ private:
                     );
                 }
 
-                if (LR.first && LR.second) {
+                if (
+                    !children_have_feasible_pair_(
+                        LR.first,
+                        LR.second,
+                        budget
+                    )
+                ) {
+                    if (resource_limit_reached_()) {
+                        return;
+                    }
+                } else {
                     // persistent successful split storage.
                     // feat is the actual threshold-column index.
                     node->add_split(feat, LR.first, LR.second);
-
-                    // if (evaluated_use_min_objectives) {
-                    //     evaluated[feat] = {
-                    //         LR.first->min_objective,
-                    //         LR.second->min_objective
-                    //     };
-                    // } else {
-                    //     evaluated[feat] = {lossL, lossR};
-                    // }
-                } 
+                }
 
                 if (i <= feat - 1) {
                     Q.push_back({i, feat - 1});
@@ -6176,9 +6876,9 @@ private:
 
     // the expected implementation of ContinuousRSet. here, we have active_thresholds (active_features) and directly extend a given node (or we can look up a better one if it exists).
     shared_ptr<TreeTrieNode> construct_trie_extend(shared_ptr<TreeTrieNode> node, const Packed& mask, int8_t depth, int budget, const PathKey& pk, const ContinuousPath& cpath = empty_continuous_path(), const std::vector<int>* active_features = nullptr, bool launched_by_anytime = false) {
-        if (!node) {
-            return construct_trie(mask, depth, budget, pk, cpath,  active_features);
-        }
+        // if (!node) {
+        //     return construct_trie(mask, depth, budget, pk, cpath,  active_features);
+        // }
 
         const uint64_t k = key_of_subproblem(mask, pk);
         K2 key{k, depth};
@@ -6193,19 +6893,19 @@ private:
             }
         }
 
-        if (!node) { // no node was given and nothing was found in the cache if we were caching so how can i extend it
-            return construct_trie(
-                mask,
-                depth,
-                budget,
-                pk,
-                cpath,
-                active_features
-            );
+        if (node && !launched_by_anytime && budget <= node->budget) {
+            return node;
         }
 
-        if (!launched_by_anytime && budget <= node->budget) {
-            return node;
+        if (resource_limit_reached_()) {
+            return node_has_solution_(node) // note that if node is null we preserve that, we don't make an empty node. this ensures solve siblings knows if there is a valid solution or not
+                ? node
+                : nullptr;
+        }
+
+        if (!node) { // no node was given and nothing was found in the cache if we were caching so how can i extend it
+            // could call construct_trie, lets just make the node
+            node = std::make_shared<TreeTrieNode>();
         }
 
         node->budget = budget;
@@ -6286,6 +6986,10 @@ private:
         }
 
         if (depth == 0 || budget < 2 * gamma) {
+            if (!node_has_solution_(node)) {
+                return nullptr;
+            }
+
             if (trie_cache_enabled) trie_cache.emplace(key, node);
             return node;
         }
@@ -6353,6 +7057,11 @@ private:
                     R,
                     already_split
                 );
+            }
+            if (resource_limit_reached_()) {
+                return node_has_solution_(node)
+                    ? node
+                    : nullptr;
             }
         }
 
@@ -6441,14 +7150,28 @@ private:
                     active_features
                 );
 
+                if (
+                    !children_have_feasible_pair_(
+                        LR.first,
+                        LR.second,
+                        budget
+                    )
+                ) {
+                    if (resource_limit_reached_()) {
+                        return node_has_solution_(node)
+                            ? node
+                            : nullptr;
+                    }
+
+                    continue;
+                }
+
                 it->left = LR.first;
                 it->right = LR.second;
 
-                if (it->left && it->right) {
-                    const int min_sum = it->left->min_objective + it->right->min_objective;
-                    if (min_sum < node->min_objective) {
-                        node->min_objective = min_sum;
-                    }
+                const int min_sum = it->left->min_objective + it->right->min_objective;
+                if (min_sum < node->min_objective) {
+                    node->min_objective = min_sum;
                 }
 
                 continue;
@@ -6535,12 +7258,39 @@ private:
             );
 
             // the left and right TreeTrieNode (OR nodes) to be added to the AND/OR graph being built
-            if (!LR.first || !LR.second) continue; // safeguard, especially needed if we allow non-injective keys
-            
+            //if (!LR.first || !LR.second) continue; // safeguard, especially needed if we allow non-injective keys
+            // we aren't going to return a flag that says if we ran out of resources or not, but we should return null if we ran out of resources
+            // so if we get null, we just have to check our resources and find out
+            if (
+                !children_have_feasible_pair_(
+                    LR.first,
+                    LR.second,
+                    budget
+                )
+            ) {
+                if (resource_limit_reached_()) {
+                    const bool has_solution =
+                        !node->leaves.empty() ||
+                        !node->splits.empty();
+
+                    return has_solution ? node : nullptr;
+                }
+
+                continue;
+            }
+
             node->add_split(f, LR.first, LR.second); // add split with left and right subtries
         }
 
-        if (trie_cache_enabled) trie_cache.emplace(key, node);
+        if (!node_has_solution_(node)) {
+            return nullptr;
+        }
+
+
+        if (trie_cache_enabled) {
+            trie_cache.emplace(key, node);
+        }
+
         return node;
     }
 
@@ -6671,6 +7421,20 @@ private:
                             *cpathLp,
                             *cpathRp
                         );
+                        
+                        if (
+                            !children_have_feasible_pair_(
+                                LR.first,
+                                LR.second,
+                                budget
+                            )
+                        ) {
+                            if (resource_limit_reached_()) {
+                                return;
+                            }
+
+                            continue;
+                        }
 
                         it->left = LR.first;
                         it->right = LR.second;
@@ -6807,20 +7571,21 @@ private:
                     *cpathRp
                 );
 
-                if (LR.first && LR.second) {
+                if (
+                    !children_have_feasible_pair_(
+                        LR.first,
+                        LR.second,
+                        budget
+                    )
+                ) {
+                    if (resource_limit_reached_()) {
+                        return;
+                    }
+                } else {
                     // persistent successful split storage.
                     // feat is the actual threshold-column index.
                     node->add_split(feat, LR.first, LR.second);
-
-                    // if (evaluated_use_min_objectives) {
-                    //     evaluated[feat] = {
-                    //         LR.first->min_objective,
-                    //         LR.second->min_objective
-                    //     };
-                    // } else {
-                    //     evaluated[feat] = {lossL, lossR};
-                    // }
-                } 
+                }
 
                 if (i <= feat - 1) {
                     Q.push_back({i, feat - 1});

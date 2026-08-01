@@ -303,6 +303,7 @@ class PRAXIS:
         depth_budget=5,
         first_rashomon_mult=0.01,
         second_rashomon_mult=0.03,
+        multiplier_step_size=0.01,
         multiplicative_slack=0.0,
         key_mode="hash",
         lookahead_k=1,
@@ -321,6 +322,8 @@ class PRAXIS:
         continuous_starts=None,
         trie_cache_enabled=True,
         stronger_rollout=False,
+        runtime_limit_seconds=-1.0,
+        memory_limit_mb=-1.0,
     ):
         X = np.asarray(X, dtype=np.uint8)
         y = np.asarray(y, dtype=int)
@@ -348,6 +351,17 @@ class PRAXIS:
         if second_rashomon_mult < 0:
             raise ValueError(
                 "second_rashomon_mult must be nonnegative."
+            )
+
+        multiplier_step_size = float(multiplier_step_size)
+
+        if (
+            second_rashomon_mult > first_rashomon_mult
+            and multiplier_step_size <= 0
+        ):
+            raise ValueError(
+                "multiplier_step_size must be positive when "
+                "second_rashomon_mult is larger than first_rashomon_mult."
             )
 
         n_features = X.shape[1]
@@ -409,6 +423,7 @@ class PRAXIS:
             int(depth_budget),
             first_rashomon_mult,
             second_rashomon_mult,
+            multiplier_step_size,
             float(multiplicative_slack),
             key_mode_parsed,
             bool(trie_cache_enabled),
@@ -427,6 +442,8 @@ class PRAXIS:
             bool(restrict_proxy_in_greedy),
             continuous_starts_vec,
             bool(stronger_rollout),
+            float(runtime_limit_seconds),
+            float(memory_limit_mb),
         )
 
         return self
@@ -438,6 +455,8 @@ class PRAXIS:
         lambda_reg=0.01,
         depth_budget=5,
         rashomon_mult=0.01,
+        second_rashomon_mult=None,
+        multiplier_step_size=0.01,
         multiplicative_slack=0.0,
         key_mode="hash",
         lookahead_k=1,
@@ -453,12 +472,14 @@ class PRAXIS:
         initial_active_threshold_features=None,
         refinement_width=1,
         max_refinement_rounds=-1,
-        increase_proxy_anytime=False,
+        proxy_refinement_mode=0,
         continuous_proxy_in_lickety=False,
         continuous_proxy_in_depthd_exact=False,
         continuous_proxy_in_greedy=False,
         continuous_starts=None,
         trie_cache_enabled=True,
+        runtime_limit_seconds=-1.0,
+        memory_limit_mb=-1.0,
     ):
         X = np.asarray(X, dtype=np.uint8)
         y = np.asarray(y, dtype=int)
@@ -473,15 +494,49 @@ class PRAXIS:
                 f"X rows={X.shape[0]}"
             )
 
+        rashomon_mult = float(rashomon_mult)
+
+        if second_rashomon_mult is None:
+            second_rashomon_mult = rashomon_mult
+        else:
+            second_rashomon_mult = float(second_rashomon_mult)
+
+        multiplier_step_size = float(multiplier_step_size)
+
+        if rashomon_mult < 0:
+            raise ValueError("rashomon_mult must be nonnegative.")
+
+        if second_rashomon_mult < 0:
+            raise ValueError("second_rashomon_mult must be nonnegative.")
+
+        if (
+            second_rashomon_mult > rashomon_mult
+            and multiplier_step_size <= 0
+        ):
+            raise ValueError(
+                "multiplier_step_size must be positive when "
+                "second_rashomon_mult exceeds rashomon_mult."
+            )
+
+        proxy_refinement_mode = int(proxy_refinement_mode)
+        if proxy_refinement_mode not in (0, 1, 2):
+            raise ValueError(
+                "proxy_refinement_mode must be 0, 1, or 2."
+            )
+
         n_features = X.shape[1]
 
         if continuous_starts is None:
             continuous_starts_vec = []
         else:
-            continuous_starts_vec = [int(v) for v in continuous_starts]
-            continuous_starts_vec = sorted(set(continuous_starts_vec))
+            continuous_starts_vec = sorted(
+                set(int(v) for v in continuous_starts)
+            )
 
-            bad = [v for v in continuous_starts_vec if v < 0 or v >= n_features]
+            bad = [
+                v for v in continuous_starts_vec
+                if v < 0 or v >= n_features
+            ]
             if bad:
                 raise ValueError(
                     f"continuous_starts contains invalid feature indices {bad}; "
@@ -491,8 +546,9 @@ class PRAXIS:
         if proxy_threshold_features is None:
             proxy_threshold_features_vec = []
         else:
-            proxy_threshold_features_vec = [int(v) for v in proxy_threshold_features]
-            proxy_threshold_features_vec = sorted(set(proxy_threshold_features_vec))
+            proxy_threshold_features_vec = sorted(
+                set(int(v) for v in proxy_threshold_features)
+            )
 
             bad = [
                 v for v in proxy_threshold_features_vec
@@ -500,18 +556,15 @@ class PRAXIS:
             ]
             if bad:
                 raise ValueError(
-                    f"proxy_threshold_features contains invalid feature indices {bad}; "
-                    f"valid range is [0, {n_features - 1}]"
+                    "proxy_threshold_features contains invalid feature "
+                    f"indices {bad}; valid range is [0, {n_features - 1}]"
                 )
 
         if initial_active_threshold_features is None:
             initial_active_threshold_features_vec = []
         else:
-            initial_active_threshold_features_vec = [
-                int(v) for v in initial_active_threshold_features
-            ]
             initial_active_threshold_features_vec = sorted(
-                set(initial_active_threshold_features_vec)
+                set(int(v) for v in initial_active_threshold_features)
             )
 
             bad = [
@@ -526,16 +579,22 @@ class PRAXIS:
                 )
 
         proxy_style_int = parse_proxy_style(proxy_style)
-        greedy_heur_int = parse_heuristic_for_greedy(heuristic_for_greedy)
-        greedy_cont_mode = parse_greedy_continuous_mode(greedy_continuous_mode)
-
+        greedy_heur_int = parse_heuristic_for_greedy(
+            heuristic_for_greedy
+        )
+        greedy_cont_mode = parse_greedy_continuous_mode(
+            greedy_continuous_mode
+        )
         key_mode_parsed = parse_key_mode(key_mode)
+
         self._model.fit_anytime(
             X,
             y,
             float(lambda_reg),
             int(depth_budget),
-            float(rashomon_mult),
+            rashomon_mult,
+            second_rashomon_mult,
+            multiplier_step_size,
             float(multiplicative_slack),
             key_mode_parsed,
             bool(trie_cache_enabled),
@@ -552,11 +611,13 @@ class PRAXIS:
             initial_active_threshold_features_vec,
             int(refinement_width),
             int(max_refinement_rounds),
-            bool(increase_proxy_anytime),
+            proxy_refinement_mode,
             bool(continuous_proxy_in_lickety),
             bool(continuous_proxy_in_depthd_exact),
             bool(continuous_proxy_in_greedy),
             continuous_starts_vec,
+            float(runtime_limit_seconds),
+            float(memory_limit_mb),
         )
 
         return self
@@ -607,7 +668,7 @@ class PRAXIS:
                 )
 
         if X_initial_active is None:
-            X_initial_active = np.empty((n, 0), dtype=np.uint8)
+            X_initial_active = y.reshape(-1, 1).astype(np.uint8)
         else:
             X_initial_active = np.asarray(
                 X_initial_active,
@@ -623,6 +684,9 @@ class PRAXIS:
                     "X_initial_active rows must match X_num rows: "
                     f"got {X_initial_active.shape[0]} vs {n}"
                 )
+
+        if X_initial_active.shape[1] == 0:
+            X_initial_active = y.reshape(-1, 1).astype(np.uint8)
 
         if X_proxy_active is None:
             X_proxy_active = np.empty((n, 0), dtype=np.uint8)
@@ -726,6 +790,7 @@ class PRAXIS:
         depth_budget=5,
         first_rashomon_mult=0.01,
         second_rashomon_mult=0.03,
+        multiplier_step_size=0.01,
         multiplicative_slack=0.0,
         key_mode="hash",
         lookahead_k=1,
@@ -742,6 +807,8 @@ class PRAXIS:
         restrict_proxy_in_greedy=False,
         trie_cache_enabled=True,
         stronger_rollout=False,
+        runtime_limit_seconds=-1.0,
+        memory_limit_mb=-1.0,
     ):
         first_rashomon_mult = float(first_rashomon_mult)
         second_rashomon_mult = float(second_rashomon_mult)
@@ -754,6 +821,17 @@ class PRAXIS:
         if second_rashomon_mult < 0:
             raise ValueError(
                 "second_rashomon_mult must be nonnegative."
+            )
+
+        multiplier_step_size = float(multiplier_step_size)
+
+        if (
+            second_rashomon_mult > first_rashomon_mult
+            and multiplier_step_size <= 0
+        ):
+            raise ValueError(
+                "multiplier_step_size must be positive when "
+                "second_rashomon_mult is larger than first_rashomon_mult."
             )
 
         proxy_style_int = parse_proxy_style(proxy_style)
@@ -773,6 +851,7 @@ class PRAXIS:
             int(depth_budget),
             first_rashomon_mult,
             second_rashomon_mult,
+            multiplier_step_size,
             float(multiplicative_slack),
             key_mode_parsed,
             bool(trie_cache_enabled),
@@ -789,6 +868,8 @@ class PRAXIS:
             bool(restrict_proxy_in_depthd_exact),
             bool(restrict_proxy_in_greedy),
             bool(stronger_rollout),
+            float(runtime_limit_seconds),
+            float(memory_limit_mb),
         )
 
         return self
@@ -798,6 +879,8 @@ class PRAXIS:
         lambda_reg=0.01,
         depth_budget=5,
         rashomon_mult=0.01,
+        second_rashomon_mult=None,
+        multiplier_step_size=0.01,
         multiplicative_slack=0.0,
         key_mode="hash",
         lookahead_k=1,
@@ -813,37 +896,76 @@ class PRAXIS:
         initial_active_threshold_features=None,
         refinement_width=1,
         max_refinement_rounds=-1,
-        increase_proxy_anytime=False,
+        proxy_refinement_mode=0,
         continuous_proxy_in_lickety=False,
         continuous_proxy_in_depthd_exact=False,
         continuous_proxy_in_greedy=False,
         trie_cache_enabled=True,
+        runtime_limit_seconds=-1.0,
+        memory_limit_mb=-1.0,
     ):
+        rashomon_mult = float(rashomon_mult)
+
+        if second_rashomon_mult is None:
+            second_rashomon_mult = rashomon_mult
+        else:
+            second_rashomon_mult = float(second_rashomon_mult)
+
+        multiplier_step_size = float(multiplier_step_size)
+
+        if rashomon_mult < 0:
+            raise ValueError("rashomon_mult must be nonnegative.")
+
+        if second_rashomon_mult < 0:
+            raise ValueError(
+                "second_rashomon_mult must be nonnegative."
+            )
+
+        if (
+            second_rashomon_mult > rashomon_mult
+            and multiplier_step_size <= 0
+        ):
+            raise ValueError(
+                "multiplier_step_size must be positive when "
+                "second_rashomon_mult exceeds rashomon_mult."
+            )
+
+        proxy_refinement_mode = int(proxy_refinement_mode)
+        if proxy_refinement_mode not in (0, 1, 2):
+            raise ValueError(
+                "proxy_refinement_mode must be 0, 1, or 2."
+            )
+
         proxy_style_int = parse_proxy_style(proxy_style)
-        greedy_heur_int = parse_heuristic_for_greedy(heuristic_for_greedy)
-        greedy_cont_mode = parse_greedy_continuous_mode(greedy_continuous_mode)
+        greedy_heur_int = parse_heuristic_for_greedy(
+            heuristic_for_greedy
+        )
+        greedy_cont_mode = parse_greedy_continuous_mode(
+            greedy_continuous_mode
+        )
 
         if proxy_threshold_features is None:
             proxy_threshold_features_vec = []
         else:
-            proxy_threshold_features_vec = [int(v) for v in proxy_threshold_features]
-            proxy_threshold_features_vec = sorted(set(proxy_threshold_features_vec))
+            proxy_threshold_features_vec = sorted(
+                set(int(v) for v in proxy_threshold_features)
+            )
 
         if initial_active_threshold_features is None:
             initial_active_threshold_features_vec = []
         else:
-            initial_active_threshold_features_vec = [
-                int(v) for v in initial_active_threshold_features
-            ]
             initial_active_threshold_features_vec = sorted(
-                set(initial_active_threshold_features_vec)
+                set(int(v) for v in initial_active_threshold_features)
             )
 
         key_mode_parsed = parse_key_mode(key_mode)
+
         self._model.fit_prepared_anytime(
             float(lambda_reg),
             int(depth_budget),
-            float(rashomon_mult),
+            rashomon_mult,
+            second_rashomon_mult,
+            multiplier_step_size,
             float(multiplicative_slack),
             key_mode_parsed,
             bool(trie_cache_enabled),
@@ -860,10 +982,12 @@ class PRAXIS:
             initial_active_threshold_features_vec,
             int(refinement_width),
             int(max_refinement_rounds),
-            bool(increase_proxy_anytime),
+            proxy_refinement_mode,
             bool(continuous_proxy_in_lickety),
             bool(continuous_proxy_in_depthd_exact),
             bool(continuous_proxy_in_greedy),
+            float(runtime_limit_seconds),
+            float(memory_limit_mb),
         )
 
         return self
@@ -1242,27 +1366,48 @@ class PRAXIS:
         X_num,
         y,
         X_bin=None,
-        X_active=None,
+        X_proxy_active=None,
+        X_initial_active=None,
         n_boot=10,
         lambda_reg=0.01,
         depth_budget=5,
         rashomon_mult=0.03,
+        second_rashomon_mult=None,
+        multiplier_step_size=0.01,
         lookahead_k=1,
         seed=0,
         memory_efficient=False,
         use_anytime_fit=False,
         refinement_width=1,
         max_refinement_rounds=-1,
+        proxy_refinement_mode=0,
+        continuous_proxy_in_lickety=True,
+        continuous_proxy_in_depthd_exact=True,
+        continuous_proxy_in_greedy=True,
+        use_budget_refinement=True,
+        guarantee_rule_list_recovery=False,
+        proxy_style=0,
+        majority_leaf_only=False,
+        cache_early_exits=False,
+        proxy_caching=True,
+        runtime_limit_seconds=-1.0,
+        memory_limit_mb=-1.0,
     ):
         X_num = np.asarray(X_num, dtype=np.float64)
         y = np.asarray(y, dtype=int)
 
         if X_num.ndim != 2:
-            raise ValueError(f"X_num must be 2D, got shape {X_num.shape}")
+            raise ValueError(
+                f"X_num must be 2D, got shape {X_num.shape}"
+            )
+
         if y.ndim != 1:
-            raise ValueError(f"y must be 1D, got shape {y.shape}")
+            raise ValueError(
+                f"y must be 1D, got shape {y.shape}"
+            )
 
         n = X_num.shape[0]
+
         if y.shape[0] != n:
             raise ValueError(
                 f"y length must match X_num rows: got len(y)={y.shape[0]}, "
@@ -1273,39 +1418,123 @@ class PRAXIS:
             X_bin = np.empty((n, 0), dtype=np.uint8)
         else:
             X_bin = np.asarray(X_bin, dtype=np.uint8)
+
             if X_bin.ndim != 2:
-                raise ValueError(f"X_bin must be 2D, got shape {X_bin.shape}")
-            if X_bin.shape[0] != n:
                 raise ValueError(
-                    f"X_bin rows must match X_num rows: got {X_bin.shape[0]} vs {n}"
+                    f"X_bin must be 2D, got shape {X_bin.shape}"
                 )
 
-        if X_active is None:
-            X_active = np.empty((n, 0), dtype=np.uint8)
-        else:
-            X_active = np.asarray(X_active, dtype=np.uint8)
-            if X_active.ndim != 2:
-                raise ValueError(f"X_active must be 2D, got shape {X_active.shape}")
-            if X_active.shape[0] != n:
+            if X_bin.shape[0] != n:
                 raise ValueError(
-                    f"X_active rows must match X_num rows: got {X_active.shape[0]} vs {n}"
+                    f"X_bin rows must match X_num rows: "
+                    f"got {X_bin.shape[0]} vs {n}"
                 )
+
+        if X_proxy_active is None:
+            X_proxy_active = np.empty(
+                (n, 0),
+                dtype=np.uint8,
+            )
+        else:
+            X_proxy_active = np.asarray(
+                X_proxy_active,
+                dtype=np.uint8,
+            )
+
+            if X_proxy_active.ndim != 2:
+                raise ValueError(
+                    "X_proxy_active must be 2D, "
+                    f"got shape {X_proxy_active.shape}"
+                )
+
+            if X_proxy_active.shape[0] != n:
+                raise ValueError(
+                    "X_proxy_active rows must match X_num rows: "
+                    f"got {X_proxy_active.shape[0]} vs {n}"
+                )
+
+        if X_initial_active is None:
+            X_initial_active = np.empty(
+                (n, 0),
+                dtype=np.uint8,
+            )
+        else:
+            X_initial_active = np.asarray(
+                X_initial_active,
+                dtype=np.uint8,
+            )
+
+            if X_initial_active.ndim != 2:
+                raise ValueError(
+                    "X_initial_active must be 2D, "
+                    f"got shape {X_initial_active.shape}"
+                )
+
+            if X_initial_active.shape[0] != n:
+                raise ValueError(
+                    "X_initial_active rows must match X_num rows: "
+                    f"got {X_initial_active.shape[0]} vs {n}"
+                )
+
+        rashomon_mult = float(rashomon_mult)
+
+        if second_rashomon_mult is None:
+            second_rashomon_mult = rashomon_mult
+        else:
+            second_rashomon_mult = float(
+                second_rashomon_mult
+            )
+
+        multiplier_step_size = float(multiplier_step_size)
+
+        if (
+            second_rashomon_mult > rashomon_mult
+            and multiplier_step_size <= 0
+        ):
+            raise ValueError(
+                "multiplier_step_size must be positive when "
+                "second_rashomon_mult exceeds rashomon_mult."
+            )
+
+        proxy_refinement_mode = int(proxy_refinement_mode)
+
+        if proxy_refinement_mode not in (0, 1, 2):
+            raise ValueError(
+                "proxy_refinement_mode must be 0, 1, or 2."
+            )
+
+        proxy_style_int = parse_proxy_style(proxy_style)
 
         self._rid_out = _rid_subtractive_continuous_core(
             X_num,
             X_bin,
             y,
-            X_active,
+            X_proxy_active,
+            X_initial_active,
             int(n_boot),
             float(lambda_reg),
             int(depth_budget),
-            float(rashomon_mult),
+            rashomon_mult,
+            second_rashomon_mult,
+            multiplier_step_size,
             int(lookahead_k),
             int(seed),
             bool(memory_efficient),
             bool(use_anytime_fit),
             int(refinement_width),
             int(max_refinement_rounds),
+            proxy_refinement_mode,
+            bool(continuous_proxy_in_lickety),
+            bool(continuous_proxy_in_depthd_exact),
+            bool(continuous_proxy_in_greedy),
+            bool(use_budget_refinement),
+            bool(guarantee_rule_list_recovery),
+            int(proxy_style_int),
+            bool(majority_leaf_only),
+            bool(cache_early_exits),
+            bool(proxy_caching),
+            float(runtime_limit_seconds),
+            float(memory_limit_mb),
         )
 
         return self._rid_out
