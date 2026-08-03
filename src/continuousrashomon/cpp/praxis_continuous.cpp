@@ -15,6 +15,7 @@
 #include <map>
 #include <span>
 #include <chrono>
+#include <tuple>
 
 #include <fstream>
 
@@ -1847,6 +1848,258 @@ public:
         return greedy_continuous_mode == GreedyContinuousMode::BINARY ? 0 : 1;
     }
 
+    // return the internal feature index at which each continuous group begins
+    std::vector<int> get_continuous_starts() const {
+        if (has_prepared_data) {
+            return prepared_continuous_starts;
+        }
+
+        return continuous_starts;
+    }
+
+    // return the number of continuous feature groups.
+    int get_num_continuous_groups() const {
+        if (has_prepared_data) {
+            return static_cast<int>(
+                prepared_continuous_starts.size()
+            );
+        }
+
+        return static_cast<int>(continuous_starts.size());
+    }
+
+    // return the exclusive end index of a continuous feature group
+    int get_continuous_group_end(int continuous_group) const {
+        const std::vector<int>& starts =
+            has_prepared_data
+                ? prepared_continuous_starts
+                : continuous_starts;
+
+        if (
+            continuous_group < 0 ||
+            continuous_group >= static_cast<int>(starts.size())
+        ) {
+            throw std::runtime_error(
+                "continuous_group is out of range."
+            );
+        }
+
+        if (continuous_group + 1 < static_cast<int>(starts.size())) {
+            return starts[
+                static_cast<std::size_t>(continuous_group + 1)
+            ];
+        }
+
+        if (has_prepared_data) {
+            return static_cast<int>(
+                prepared_X_col_major.size()
+            );
+        }
+
+        return n_features;
+    }
+
+    // return the actual <= cutpoints for one continuous group.
+    std::vector<double> get_continuous_cutpoints(
+        int continuous_group
+    ) const {
+        if (
+            continuous_group < 0 ||
+            continuous_group >= static_cast<int>(
+                numerical_unique_values_for_greedy.size()
+            )
+        ) {
+            throw std::runtime_error(
+                "continuous_group is out of range or threshold metadata "
+                "is unavailable."
+            );
+        }
+
+        const auto& stored_values =
+            numerical_unique_values_for_greedy[
+                static_cast<std::size_t>(continuous_group)
+            ];
+
+        if (stored_values.size() <= 1) {
+            return {};
+        }
+
+        return std::vector<double>(
+            stored_values.begin(),
+            stored_values.end() - 1
+        );
+    }
+
+    // given an internal binarized feature index, return:
+    // continuous_group, offset within that group, cutpoint (as in <=cutpoint)
+  
+    std::tuple<int, int, double>
+    get_continuous_threshold_info(
+        int internal_feature
+    ) const {
+        const std::vector<int>& starts =
+            has_prepared_data
+                ? prepared_continuous_starts
+                : continuous_starts;
+
+        const int total_features =
+            has_prepared_data
+                ? static_cast<int>(prepared_X_col_major.size())
+                : n_features;
+
+        if (
+            internal_feature < 0 ||
+            internal_feature >= total_features
+        ) {
+            throw std::runtime_error(
+                "internal_feature is out of range."
+            );
+        }
+
+        if (
+            starts.empty() ||
+            internal_feature < starts.front()
+        ) {
+            throw std::runtime_error(
+                "internal_feature is an ordinary binary feature, "
+                "not a continuous threshold feature."
+            );
+        }
+
+        auto upper = std::upper_bound(
+            starts.begin(),
+            starts.end(),
+            internal_feature
+        );
+
+        const int continuous_group =
+            static_cast<int>(
+                std::distance(starts.begin(), upper)
+            ) - 1;
+
+        if (continuous_group < 0) {
+            throw std::logic_error(
+                "Failed to locate continuous group."
+            );
+        }
+
+        const int start =
+            starts[static_cast<std::size_t>(continuous_group)];
+
+        const int end =
+            continuous_group + 1 < static_cast<int>(starts.size())
+                ? starts[
+                    static_cast<std::size_t>(continuous_group + 1)
+                ]
+                : total_features;
+
+        if (internal_feature < start || internal_feature >= end) {
+            throw std::logic_error(
+                "Internal feature does not fall inside its inferred "
+                "continuous group."
+            );
+        }
+
+        const int offset = internal_feature - start;
+
+        const auto cutpoints =
+            get_continuous_cutpoints(continuous_group);
+
+        if (offset < 0 || offset >= static_cast<int>(cutpoints.size())) {
+            throw std::logic_error(
+                "Continuous feature offset does not match stored cutpoints."
+            );
+        }
+
+        return std::make_tuple(
+            continuous_group,
+            offset,
+            cutpoints[static_cast<std::size_t>(offset)]
+        );
+    }
+
+    // encode one numerical value using every <= cutpoint in a continuous group.
+    // for cutpoints [1.0, 2.0, 3.0]
+    // value 2.0 produces [0, 1, 1]
+    std::vector<uint8_t> encode_continuous_value(
+        int continuous_group,
+        double value
+    ) const {
+        if (!std::isfinite(value)) {
+            throw std::runtime_error(
+                "value must be finite."
+            );
+        }
+
+        const auto cutpoints =
+            get_continuous_cutpoints(continuous_group);
+
+        std::vector<uint8_t> encoded;
+        encoded.reserve(cutpoints.size());
+
+        for (double cutpoint : cutpoints) {
+            encoded.push_back(
+                value <= cutpoint
+                    ? static_cast<uint8_t>(1)
+                    : static_cast<uint8_t>(0)
+            );
+        }
+
+        return encoded;
+    }
+
+    // return: is_continuous, continuous_group, offset, cutpoint
+    // for an ordinary binary feature: (false, -1, -1, NaN)
+    std::tuple<bool, int, int, double>
+    get_internal_feature_info(
+        int internal_feature
+    ) const {
+        const std::vector<int>& starts =
+            has_prepared_data
+                ? prepared_continuous_starts
+                : continuous_starts;
+
+        const int total_features =
+            has_prepared_data
+                ? static_cast<int>(prepared_X_col_major.size())
+                : n_features;
+
+        if (
+            internal_feature < 0 ||
+            internal_feature >= total_features
+        ) {
+            throw std::runtime_error(
+                "internal_feature is out of range."
+            );
+        }
+
+        if (
+            starts.empty() ||
+            internal_feature < starts.front()
+        ) {
+            return std::make_tuple(
+                false,
+                -1,
+                -1,
+                std::numeric_limits<double>::quiet_NaN()
+            );
+        }
+
+        const auto [group, offset, cutpoint] =
+            get_continuous_threshold_info(internal_feature);
+
+        return std::make_tuple(
+            true,
+            group,
+            offset,
+            cutpoint
+        );
+    }
+
+
+
+
+
     // basic graph statistics for the anytime algorithm or for compact storage evaluation
     size_t count_graph_features() const {
         if (!result) {
@@ -3083,13 +3336,7 @@ public:
                 ? prepared_initial_active_features
                 : initial_active_threshold_features;
 
-        if (initial_feats.empty() &&
-            !prepared_continuous_starts.empty()) {
-            throw std::runtime_error(
-                "Anytime enumeration needs at least one "
-                "initial continuous threshold anchor."
-            );
-        }
+  
 
         fit_anytime(
             prepared_X_col_major,

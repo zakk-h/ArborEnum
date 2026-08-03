@@ -195,12 +195,433 @@ def parse_heuristic_for_greedy(heuristic_for_greedy):
         f"Supported: 0/1/2, or one of: {allowed}"
     )
 
+
+_PROXY_MODE_MAP = {
+    "continuous": "continuous",
+    "full": "continuous",
+    "unrestricted": "continuous",
+
+    "hybrid": "hybrid",
+    "lickety_continuous": "hybrid",
+    "continuous_lickety": "hybrid",
+
+    "binarized": "binarized",
+    "binary": "binarized",
+    "restricted": "binarized",
+}
+
+_PROXY_REFINEMENT_MAP = {
+    "off": 0,
+    "none": 0,
+    "never": 0,
+    "on": 1,
+    "always": 1,
+    "auto": 2,
+    "automatic": 2,
+}
+
+
+def parse_proxy_mode(proxy_mode):
+    key = _normalize_key(proxy_mode)
+    if key not in _PROXY_MODE_MAP:
+        raise ValueError(
+            "proxy_mode must be 'continuous', 'hybrid', or 'binarized'."
+        )
+    return _PROXY_MODE_MAP[key]
+
+
+def parse_proxy_refinement(proxy_refinement):
+    if isinstance(proxy_refinement, (int, np.integer)):
+        value = int(proxy_refinement)
+        if value in (0, 1, 2):
+            return value
+        raise ValueError(
+            "proxy_refinement as an integer must be 0, 1, or 2."
+        )
+
+    key = _normalize_key(proxy_refinement)
+    if key not in _PROXY_REFINEMENT_MAP:
+        raise ValueError(
+            "proxy_refinement must be 'off', 'on', or 'auto'."
+        )
+    return _PROXY_REFINEMENT_MAP[key]
+
+
+def _proxy_mode_settings(proxy_mode):
+    mode = parse_proxy_mode(proxy_mode)
+
+    if mode == "continuous":
+        return {
+            "mode": mode,
+            "restrict_lickety": False,
+            "restrict_depthd": False,
+            "restrict_greedy": False,
+            "continuous_lickety": True,
+            "continuous_depthd": True,
+            "continuous_greedy": True,
+            "needs_proxy_binarization": False,
+        }
+
+    if mode == "hybrid":
+        return {
+            "mode": mode,
+            "restrict_lickety": False,
+            "restrict_depthd": True,
+            "restrict_greedy": True,
+            "continuous_lickety": True,
+            "continuous_depthd": False,
+            "continuous_greedy": False,
+            "needs_proxy_binarization": True,
+        }
+
+    return {
+        "mode": mode,
+        "restrict_lickety": True,
+        "restrict_depthd": True,
+        "restrict_greedy": True,
+        "continuous_lickety": False,
+        "continuous_depthd": False,
+        "continuous_greedy": False,
+        "needs_proxy_binarization": True,
+    }
+
+
+def _as_2d_numeric_array(X, name):
+    if hasattr(X, "to_numpy"):
+        X = X.to_numpy()
+
+    X = np.asarray(X)
+
+    if X.ndim != 2:
+        raise ValueError(f"{name} must be 2D, got shape {X.shape}")
+
+    try:
+        X = X.astype(np.float64, copy=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{name} must contain only numerical values."
+        ) from exc
+
+    if not np.all(np.isfinite(X)):
+        raise ValueError(
+            f"{name} contains NaN or infinite values."
+        )
+
+    return X
+
+
+def _split_binary_and_continuous(
+    X,
+    binary_unique_threshold=7,
+):
+    X = _as_2d_numeric_array(X, "X")
+
+    binary_columns = []
+    binary_feature_specs = []
+
+    numerical_columns = []
+    numerical_feature_indices = []
+
+    for j in range(X.shape[1]):
+        column = X[:, j]
+        unique = np.unique(column)
+
+        if unique.size <= 1:
+            continue
+
+        if unique.size <= binary_unique_threshold:
+            for threshold in unique[:-1]:
+                binary_columns.append(
+                    (column <= threshold).astype(np.uint8)
+                )
+
+                binary_feature_specs.append(
+                    {
+                        "original_feature": j,
+                        "cutpoint": float(threshold),
+                    }
+                )
+        else:
+            numerical_columns.append(
+                column.astype(np.float64, copy=False)
+            )
+
+            numerical_feature_indices.append(j)
+
+    n = X.shape[0]
+
+    X_bin = (
+        np.column_stack(binary_columns).astype(
+            np.uint8,
+            copy=False,
+        )
+        if binary_columns
+        else np.empty((n, 0), dtype=np.uint8)
+    )
+
+    X_num = (
+        np.column_stack(numerical_columns).astype(
+            np.float64,
+            copy=False,
+        )
+        if numerical_columns
+        else np.empty((n, 0), dtype=np.float64)
+    )
+
+    return (
+        X,
+        X_bin,
+        X_num,
+        binary_feature_specs,
+        numerical_feature_indices,
+    )
+
+
+def _optional_binary_matrix(X, n, name):
+    if X is None:
+        return np.empty((n, 0), dtype=np.uint8)
+
+    X = np.asarray(X, dtype=np.uint8)
+
+    if X.ndim != 2:
+        raise ValueError(f"{name} must be 2D, got shape {X.shape}")
+
+    if X.shape[0] != n:
+        raise ValueError(
+            f"{name} rows must match X rows: got {X.shape[0]} vs {n}"
+        )
+
+    return X
+
+
+def _resolve_proxy_matrix(
+    X_original,
+    y,
+    X_proxy,
+    proxy_settings,
+    proxy_features_n_estimators,
+    proxy_features_max_depth,
+    proxy_features_random_state,
+    proxy_features_column_elimination,
+):
+    X_proxy = _optional_binary_matrix(
+        X_proxy,
+        X_original.shape[0],
+        "X_proxy",
+    )
+
+    if (
+        proxy_settings["needs_proxy_binarization"]
+        and X_proxy.shape[1] < 2
+    ):
+        X_proxy = ThresholdGuessBinarizer(
+            n_estimators=int(proxy_features_n_estimators),
+            max_depth=int(proxy_features_max_depth),
+            random_state=int(proxy_features_random_state),
+            column_elimination=bool(proxy_features_column_elimination),
+        ).fit_transform(
+            X_original,
+            y,
+        ).astype(np.uint8, copy=False)
+
+    return X_proxy
+
 class PRAXIS:
     def __init__(self):
         self._model = _PRAXISCore()
         self._rid_out = None
 
+        self.binary_feature_specs_ = None
+        self.continuous_feature_indices_ = None
+        self.n_features_in_ = None
+
     def fit(
+        self,
+        X,
+        y,
+        *,
+        X_proxy=None,
+        X_initial=None,
+        early_stopping=False,
+        proxy_mode="hybrid",
+        greedy_continuous_mode="binary",
+        binary_unique_threshold=2,
+        proxy_features_n_estimators=150,
+        proxy_features_max_depth=2,
+        proxy_features_random_state=0,
+        proxy_features_column_elimination=True,
+        lambda_reg=0.01,
+        depth_budget=5,
+        rashomon_mult=0.01,
+        second_rashomon_mult=None,
+        multiplier_step_size=0.01,
+        lookahead_k=1,
+        proxy_refinement="auto",
+        refinement_width=1,
+        max_refinement_rounds=-1,
+        runtime_limit_seconds=-1.0,
+        memory_limit_mb=-1.0,
+        max_number_thresholds_per_feature=None,
+        multiplicative_slack=0.0,
+        key_mode="hash",
+        proxy_style=0,
+        use_budget_refinement=True,
+        guarantee_rule_list_recovery=False,
+        majority_leaf_only=False,
+        cache_early_exits=False,
+        heuristic_for_greedy=1,
+        proxy_caching=True,
+        trie_cache_enabled=True,
+        stronger_rollout=False,
+        root_budget=None,
+        rashomon_mode=True,
+    ):
+        # fit directly from a mixed numerical matrix.
+        # columns with at most binary_unique_threshold unique values are
+        # threshold-binarized and treated as ordinary binary features. columns
+        # with more unique values are treated as continuous features.
+        # proxy_mode: continuous, hybrid (greedy subroutine is binarized), or binarized (everything is binarized)
+        # early_stopping=False runs the deterministic continuous algorithm.
+        # early_stopping=True runs the anytime algorithm (with some small overhead)
+        
+        (X_original, X_bin, X_num, self.binary_feature_specs_, self.continuous_feature_indices_,) = _split_binary_and_continuous(
+            X,
+            binary_unique_threshold=binary_unique_threshold,
+        )
+
+        y = np.asarray(y, dtype=int)
+        if y.ndim != 1:
+            raise ValueError(f"y must be 1D, got shape {y.shape}")
+        if y.shape[0] != X_original.shape[0]:
+            raise ValueError(
+                f"y length must match X rows: got {y.shape[0]} vs "
+                f"{X_original.shape[0]}"
+            )
+
+        proxy_settings = _proxy_mode_settings(proxy_mode)
+
+        X_proxy = _resolve_proxy_matrix(
+            X_original=X_original,
+            y=y,
+            X_proxy=X_proxy,
+            proxy_settings=proxy_settings,
+            proxy_features_n_estimators=proxy_features_n_estimators,
+            proxy_features_max_depth=proxy_features_max_depth,
+            proxy_features_random_state=proxy_features_random_state,
+            proxy_features_column_elimination=proxy_features_column_elimination,
+        )
+
+        n = X_original.shape[0]
+
+        if X_initial is None:
+            if early_stopping and X_num.shape[1] > 0:
+                if proxy_settings["mode"] == "binarized":
+                    X_initial = X_proxy
+                else:
+                    X_initial = y.reshape(-1, 1).astype(np.uint8)
+            else:
+                X_initial = np.empty((n, 0), dtype=np.uint8)
+        else:
+            X_initial = _optional_binary_matrix(
+                X_initial,
+                n,
+                "X_initial",
+            )
+
+        if not early_stopping and (
+            float(runtime_limit_seconds) >= 0.0
+            or float(memory_limit_mb) >= 0.0
+        ):
+            raise ValueError(
+                "runtime_limit_seconds and memory_limit_mb are only "
+                "available when early_stopping=True."
+            )
+
+        self.prepare_continuous_data(
+            X_num=X_num,
+            X_bin=X_bin,
+            y=y,
+            X_initial_active=X_initial,
+            X_proxy_active=X_proxy,
+            max_number_thresholds_per_feature=(
+                max_number_thresholds_per_feature
+            ),
+        )
+
+        self.n_features_in_ = X_original.shape[1]
+
+        if early_stopping:
+            return self.fit_prepared_anytime(
+                lambda_reg=lambda_reg,
+                depth_budget=depth_budget,
+                rashomon_mult=rashomon_mult,
+                second_rashomon_mult=second_rashomon_mult,
+                multiplier_step_size=multiplier_step_size,
+                multiplicative_slack=multiplicative_slack,
+                key_mode=key_mode,
+                lookahead_k=lookahead_k,
+                proxy_style=proxy_style,
+                use_budget_refinement=use_budget_refinement,
+                guarantee_rule_list_recovery=(
+                    guarantee_rule_list_recovery
+                ),
+                majority_leaf_only=majority_leaf_only,
+                cache_early_exits=cache_early_exits,
+                heuristic_for_greedy=heuristic_for_greedy,
+                greedy_continuous_mode=greedy_continuous_mode,
+                proxy_caching=proxy_caching,
+                proxy_threshold_features=None,
+                initial_active_threshold_features=None,
+                refinement_width=refinement_width,
+                max_refinement_rounds=max_refinement_rounds,
+                proxy_refinement_mode=parse_proxy_refinement(
+                    proxy_refinement
+                ),
+                continuous_proxy_in_lickety=(
+                    proxy_settings["continuous_lickety"]
+                ),
+                continuous_proxy_in_depthd_exact=(
+                    proxy_settings["continuous_depthd"]
+                ),
+                continuous_proxy_in_greedy=(
+                    proxy_settings["continuous_greedy"]
+                ),
+                trie_cache_enabled=trie_cache_enabled,
+                runtime_limit_seconds=runtime_limit_seconds,
+                memory_limit_mb=memory_limit_mb,
+            )
+
+        return self.fit_prepared(
+            lambda_reg=lambda_reg,
+            depth_budget=depth_budget,
+            rashomon_mult=rashomon_mult,
+            multiplicative_slack=multiplicative_slack,
+            key_mode=key_mode,
+            lookahead_k=lookahead_k,
+            proxy_style=proxy_style,
+            root_budget=root_budget,
+            use_budget_refinement=use_budget_refinement,
+            guarantee_rule_list_recovery=guarantee_rule_list_recovery,
+            majority_leaf_only=majority_leaf_only,
+            cache_early_exits=cache_early_exits,
+            heuristic_for_greedy=heuristic_for_greedy,
+            greedy_continuous_mode=greedy_continuous_mode,
+            proxy_caching=proxy_caching,
+            restrict_proxy_in_lickety=(
+                proxy_settings["restrict_lickety"]
+            ),
+            restrict_proxy_in_depthd_exact=(
+                proxy_settings["restrict_depthd"]
+            ),
+            restrict_proxy_in_greedy=(
+                proxy_settings["restrict_greedy"]
+            ),
+            rashomon_mode=rashomon_mode,
+            trie_cache_enabled=trie_cache_enabled,
+            stronger_rollout=stronger_rollout,
+        )
+
+    def fit_binarized(
         self,
         X,
         y,
@@ -294,6 +715,8 @@ class PRAXIS:
             continuous_starts_vec,
             bool(stronger_rollout),
         )
+
+        return self
 
     def fit_then_extend(
         self,
@@ -668,7 +1091,7 @@ class PRAXIS:
                 )
 
         if X_initial_active is None:
-            X_initial_active = y.reshape(-1, 1).astype(np.uint8)
+            X_initial_active = np.empty((n, 0), dtype=np.uint8)
         else:
             X_initial_active = np.asarray(
                 X_initial_active,
@@ -684,9 +1107,6 @@ class PRAXIS:
                     "X_initial_active rows must match X_num rows: "
                     f"got {X_initial_active.shape[0]} vs {n}"
                 )
-
-        if X_initial_active.shape[1] == 0:
-            X_initial_active = y.reshape(-1, 1).astype(np.uint8)
 
         if X_proxy_active is None:
             X_proxy_active = np.empty((n, 0), dtype=np.uint8)
@@ -783,6 +1203,8 @@ class PRAXIS:
             bool(rashomon_mode),
             bool(stronger_rollout),
         )
+
+        return self
 
     def fit_prepared_then_extend(
         self,
@@ -1023,6 +1445,141 @@ class PRAXIS:
         thresh = round((1.0 + mult) * min_obj)
         return sum(cnt for obj, cnt in hist if obj <= thresh)
 
+    def get_continuous_starts(self):
+        # return the internal column index at which each continuous threshold group begins.
+        return list(self._model.get_continuous_starts())
+
+
+    def get_num_continuous_groups(self):
+        return int(self._model.get_num_continuous_groups())
+
+
+    def get_continuous_group_end(self, continuous_group):
+        return int(
+            self._model.get_continuous_group_end(
+                int(continuous_group)
+            )
+        )
+
+
+    def get_continuous_cutpoints(self, continuous_group):
+        # return the ordered cutpoints for one continuous feature group.
+        # internal offset j represents: value <= cutpoints[j]
+        return np.asarray(
+            self._model.get_continuous_cutpoints(
+                int(continuous_group)
+            ),
+            dtype=np.float64,
+        )
+
+
+    def get_continuous_threshold_info(self, internal_feature):
+        # return continuous_group, offset_within_group, cutpoint
+        group, offset, cutpoint = (
+            self._model.get_continuous_threshold_info(
+                int(internal_feature)
+            )
+        )
+
+        return int(group), int(offset), float(cutpoint)
+
+
+    def get_internal_feature_info(self, internal_feature):
+        # return a dictionary describing one internal binary feature
+        is_continuous, group, offset, cutpoint = (
+            self._model.get_internal_feature_info(
+                int(internal_feature)
+            )
+        )
+
+        if not is_continuous:
+            return {
+                "kind": "binary",
+                "internal_feature": int(internal_feature),
+                "continuous_group": None,
+                "offset": None,
+                "cutpoint": None,
+            }
+
+        return {
+            "kind": "continuous_threshold",
+            "internal_feature": int(internal_feature),
+            "continuous_group": int(group),
+            "offset": int(offset),
+            "cutpoint": float(cutpoint),
+        }
+
+
+    def encode_continuous_value(self, continuous_group, value):
+        # encode one numerical value over all cutpoints for the selected continuous group.
+
+        return np.asarray(
+            self._model.encode_continuous_value(
+                int(continuous_group),
+                float(value),
+            ),
+            dtype=np.uint8,
+        )
+
+    def transform(self, X):
+        if (
+            self.binary_feature_specs_ is None
+            or self.continuous_feature_indices_ is None
+        ):
+            raise RuntimeError(
+                "Raw-data transformation is available only after "
+                "calling the high-level fit(X, y, ...)."
+            )
+
+        X = _as_2d_numeric_array(X, "X")
+
+        if X.shape[1] != self.n_features_in_:
+            raise ValueError(
+                f"X has {X.shape[1]} features, but the model was fitted "
+                f"with {self.n_features_in_}."
+            )
+
+        binary_parts = []
+
+        for spec in self.binary_feature_specs_:
+            column = spec["original_feature"]
+            cutpoint = spec["cutpoint"]
+
+            binary_parts.append(
+                (X[:, column] <= cutpoint).astype(np.uint8)
+            )
+
+        continuous_parts = []
+
+        for group, original_column in enumerate(
+            self.continuous_feature_indices_
+        ):
+            cutpoints = self.get_continuous_cutpoints(group)
+
+            values = X[:, original_column]
+
+            continuous_parts.append(
+                (values[:, None] <= cutpoints[None, :]).astype(
+                    np.uint8
+                )
+            )
+
+        pieces = []
+
+        if binary_parts:
+            pieces.append(np.column_stack(binary_parts))
+
+        if continuous_parts:
+            pieces.extend(continuous_parts)
+
+        if not pieces:
+            return np.empty((X.shape[0], 0), dtype=np.uint8)
+
+        return np.column_stack(pieces).astype(
+            np.uint8,
+            copy=False,
+        )
+
 
     # WARNING: 1-indexed unlike features
     def get_tree_paths(self, tree_index: int):
@@ -1057,24 +1614,90 @@ class PRAXIS:
         return out, preds
     
     def get_predictions(self, tree_index: int, X):
-        X = np.asarray(X, dtype=np.uint8)
-        return self._model.get_predictions(int(tree_index), X)
+        X_internal = self.transform(X)
 
-    def get_all_predictions(self, X, stack: bool = False):
-        X = np.asarray(X, dtype=np.uint8)
-        return self._model.get_all_predictions(X, bool(stack))
+        return self._model.get_predictions(
+            int(tree_index),
+            X_internal,
+        )
+
+
+    def get_all_predictions(self, X, stack=False):
+        X_internal = self.transform(X)
+
+        return self._model.get_all_predictions(
+            X_internal,
+            bool(stack),
+        )
+    
+    def get_internal_feature_names(self, feature_names=None):
+        if feature_names is None:
+            feature_names = [
+                f"f{j}" for j in range(self.n_features_in_)
+            ]
+        else:
+            feature_names = list(feature_names)
+
+        if len(feature_names) != self.n_features_in_:
+            raise ValueError(
+                f"feature_names must have length "
+                f"{self.n_features_in_}."
+            )
+
+        names = []
+
+        # low-cardinality threshold columns created in Python.
+        for spec in self.binary_feature_specs_:
+            original_feature = int(spec["original_feature"])
+            cutpoint = float(spec["cutpoint"])
+
+            names.append(
+                f"{feature_names[original_feature]} <= {cutpoint:g}"
+            )
+
+        # continuous threshold columns created in C++.
+        for group, original_feature in enumerate(
+            self.continuous_feature_indices_
+        ):
+            cutpoints = self.get_continuous_cutpoints(group)
+
+            for cutpoint in cutpoints:
+                names.append(
+                    f"{feature_names[original_feature]} <= {cutpoint:g}"
+                )
+
+        return names
     
     def plot_tree(self, tree_index: int, feature_names=None, figsize=(8, 6), ax=None, title=None, show=True):
         paths, preds = self.get_tree_paths(tree_index)
 
-        # feature names if not given
         if feature_names is None:
-            encodings = [abs(v) for path in paths for v in path]
-            if encodings:
-                max_f = max(encodings) - 1  # convert back to 0-based now that we don't need sign
+            if (
+                self.binary_feature_specs_ is not None
+                and self.continuous_feature_indices_ is not None
+            ):
+                feature_names = self.get_internal_feature_names()
             else:
-                max_f = -1
-            feature_names = [f"f{j}" for j in range(max_f + 1)]
+                # feature names if not given
+                encodings = [
+                    abs(v)
+                    for path in paths
+                    for v in path
+                ]
+
+                max_f = max(encodings) - 1 if encodings else -1  # convert back to 0-based now that we don't need sign
+                feature_names = [
+                    f"f{j}" for j in range(max_f + 1)
+                ]
+        else:
+            # public users will definitely pass original raw feature names.
+            if len(feature_names) == self.n_features_in_:
+                feature_names = self.get_internal_feature_names(
+                    feature_names
+                )
+            else:
+                # for advanced users
+                feature_names = list(feature_names)
 
         # convert path representation into an explicit tree structure
         class Node:
@@ -1331,7 +1954,277 @@ class PRAXIS:
     def training_samples_with_multiple_reachable_predictions(self):
         return self._model.training_samples_with_multiple_reachable_predictions()
 
+    @staticmethod
+    def _prepare_rid_input(X):
+        X = _as_2d_numeric_array(X, "X")
+
+        constant_indices = []
+        binary_indices = []
+        continuous_indices = []
+
+        for j in range(X.shape[1]):
+            n_unique = np.unique(X[:, j]).size
+
+            if n_unique <= 1:
+                constant_indices.append(j)
+            elif n_unique == 2:
+                binary_indices.append(j)
+            else:
+                continuous_indices.append(j)
+
+        # matching internal order
+        retained_indices = binary_indices + continuous_indices
+
+        if not retained_indices:
+            raise ValueError(
+                "RID requires at least one nonconstant feature."
+            )
+
+        X_rid = X[:, retained_indices]
+
+        return (
+            X,
+            X_rid,
+            retained_indices,
+            constant_indices,
+            binary_indices,
+            continuous_indices,
+        )
+
+    def _resolve_rid_feature_names(self, feature_names=None):
+        rid_out = self._require_rid()
+        n_rid_features = len(rid_out["mean_sub_mr"])
+
+        if feature_names is None:
+            if hasattr(self, "rid_feature_names_"):
+                names = list(self.rid_feature_names_)
+            else:
+                names = [f"f{j}" for j in range(n_rid_features)]
+        else:
+            names = list(feature_names)
+
+            # the user supplied names for the original raw matrix.
+            if (
+                hasattr(self, "rid_feature_indices_")
+                and len(names) != n_rid_features
+            ):
+                max_original_index = max(self.rid_feature_indices_)
+
+                if len(names) <= max_original_index:
+                    raise ValueError(
+                        "feature_names is too short for the original "
+                        "feature indices used by RID."
+                    )
+
+                names = [
+                    names[j]
+                    for j in self.rid_feature_indices_
+                ]
+
+        if len(names) != n_rid_features:
+            raise ValueError(
+                f"RID has {n_rid_features} nonconstant features, "
+                f"but feature_names has length {len(names)}."
+            )
+
+        return names
+
     def compute_rid(
+        self,
+        X,
+        y,
+        *,
+        X_proxy=None,
+        X_initial=None,
+        early_stopping=False,
+        proxy_mode="hybrid",
+        greedy_continuous_mode="binary",
+        proxy_features_n_estimators=150,
+        proxy_features_max_depth=2,
+        proxy_features_random_state=0,
+        proxy_features_column_elimination=True,
+        n_boot=10,
+        lambda_reg=0.01,
+        depth_budget=5,
+        rashomon_mult=0.03,
+        second_rashomon_mult=None,
+        multiplier_step_size=0.01,
+        lookahead_k=1,
+        seed=0,
+        memory_efficient=False,
+        proxy_refinement="auto",
+        refinement_width=1,
+        max_refinement_rounds=-1,
+        runtime_limit_seconds=-1.0,
+        memory_limit_mb=-1.0,
+        max_number_thresholds_per_feature=None,
+        use_budget_refinement=True,
+        guarantee_rule_list_recovery=False,
+        proxy_style=0,
+        majority_leaf_only=False,
+        cache_early_exits=False,
+        heuristic_for_greedy=1,
+        proxy_caching=True,
+    ):
+
+        if hasattr(X, "columns"):
+            original_feature_names = list(X.columns)
+        else:
+            original_feature_names = [
+                f"f{j}" for j in range(np.asarray(X).shape[1])
+            ]
+        
+        (
+            X_original,
+            X_rid,
+            self.rid_feature_indices_,
+            self.rid_constant_feature_indices_,
+            rid_binary_original_indices,
+            rid_continuous_original_indices,
+        ) = self._prepare_rid_input(X)
+
+        self.rid_feature_names_ = [
+            original_feature_names[j]
+            for j in self.rid_feature_indices_
+        ]
+
+        self.rid_constant_feature_names_ = [
+            original_feature_names[j]
+            for j in self.rid_constant_feature_indices_
+        ]
+
+        (
+            _,
+            X_bin,
+            X_num,
+            rid_binary_feature_specs,
+            rid_continuous_feature_indices,
+        ) = _split_binary_and_continuous(
+            X_rid,
+            binary_unique_threshold=2,
+        )
+
+
+
+        y = np.asarray(y, dtype=int)
+        if y.ndim != 1:
+            raise ValueError(f"y must be 1D, got shape {y.shape}")
+        if y.shape[0] != X_original.shape[0]:
+            raise ValueError(
+                f"y length must match X rows: got {y.shape[0]} vs "
+                f"{X_original.shape[0]}"
+            )
+
+        proxy_settings = _proxy_mode_settings(proxy_mode)
+
+        X_proxy = _resolve_proxy_matrix(
+            X_original=X_rid,
+            y=y,
+            X_proxy=X_proxy,
+            proxy_settings=proxy_settings,
+            proxy_features_n_estimators=(
+                proxy_features_n_estimators
+            ),
+            proxy_features_max_depth=(
+                proxy_features_max_depth
+            ),
+            proxy_features_random_state=(
+                proxy_features_random_state
+            ),
+            proxy_features_column_elimination=(
+                proxy_features_column_elimination
+            ),
+        )
+
+        n = X_original.shape[0]
+
+        if X_initial is None:
+            if early_stopping and X_num.shape[1] > 0:
+                if proxy_settings["mode"] == "binarized":
+                    X_initial = X_proxy
+                else:
+                    X_initial = y.reshape(-1, 1).astype(np.uint8)
+            else:
+                X_initial = np.empty((n, 0), dtype=np.uint8)
+        else:
+            X_initial = _optional_binary_matrix(
+                X_initial,
+                n,
+                "X_initial",
+            )
+
+        if not early_stopping and (
+            float(runtime_limit_seconds) >= 0.0
+            or float(memory_limit_mb) >= 0.0
+        ):
+            raise ValueError(
+                "runtime_limit_seconds and memory_limit_mb are only "
+                "available when early_stopping=True."
+            )
+
+        if second_rashomon_mult is None:
+            second_rashomon_mult = float(rashomon_mult)
+
+        if max_number_thresholds_per_feature is None:
+            max_thresholds = -1
+        else:
+            max_thresholds = int(
+                max_number_thresholds_per_feature
+            )
+            if max_thresholds <= 0:
+                raise ValueError(
+                    "max_number_thresholds_per_feature must be "
+                    "positive or None."
+                )
+
+        expected_rid_features = (
+            X_bin.shape[1] + X_num.shape[1]
+        )
+
+        if expected_rid_features != len(self.rid_feature_indices_):
+            raise RuntimeError(
+                "Internal RID feature grouping does not match the "
+                "retained original features."
+            )
+
+        self._rid_out = _rid_subtractive_continuous_core(
+            X_num,
+            X_bin,
+            y,
+            X_proxy,
+            X_initial,
+            int(n_boot),
+            float(lambda_reg),
+            int(depth_budget),
+            float(rashomon_mult),
+            float(second_rashomon_mult),
+            float(multiplier_step_size),
+            int(lookahead_k),
+            int(seed),
+            bool(memory_efficient),
+            bool(early_stopping),
+            int(refinement_width),
+            int(max_refinement_rounds),
+            parse_proxy_refinement(proxy_refinement),
+            bool(proxy_settings["continuous_lickety"]),
+            bool(proxy_settings["continuous_depthd"]),
+            bool(proxy_settings["continuous_greedy"]),
+            bool(use_budget_refinement),
+            bool(guarantee_rule_list_recovery),
+            int(parse_proxy_style(proxy_style)),
+            bool(majority_leaf_only),
+            bool(cache_early_exits),
+            int(parse_heuristic_for_greedy(heuristic_for_greedy)),
+            parse_greedy_continuous_mode(greedy_continuous_mode),
+            bool(proxy_caching),
+            int(max_thresholds),
+            float(runtime_limit_seconds),
+            float(memory_limit_mb),
+        )
+
+        return self._rid_out
+
+    def compute_rid_binarized(
         self,
         X,
         y,
@@ -1361,7 +2254,7 @@ class PRAXIS:
         )
         return self._rid_out
 
-    def compute_rid_continuous(
+    def compute_rid_continuous_low_level(
         self,
         X_num,
         y,
@@ -1389,7 +2282,10 @@ class PRAXIS:
         proxy_style=0,
         majority_leaf_only=False,
         cache_early_exits=False,
+        heuristic_for_greedy=1,
+        greedy_continuous_mode="binary",
         proxy_caching=True,
+        max_number_thresholds_per_feature=None,
         runtime_limit_seconds=-1.0,
         memory_limit_mb=-1.0,
     ):
@@ -1505,6 +2401,18 @@ class PRAXIS:
 
         proxy_style_int = parse_proxy_style(proxy_style)
 
+        if max_number_thresholds_per_feature is None:
+            max_thresholds = -1
+        else:
+            max_thresholds = int(
+                max_number_thresholds_per_feature
+            )
+            if max_thresholds <= 0:
+                raise ValueError(
+                    "max_number_thresholds_per_feature must be "
+                    "positive or None."
+                )
+
         self._rid_out = _rid_subtractive_continuous_core(
             X_num,
             X_bin,
@@ -1532,7 +2440,12 @@ class PRAXIS:
             int(proxy_style_int),
             bool(majority_leaf_only),
             bool(cache_early_exits),
+            int(parse_heuristic_for_greedy(heuristic_for_greedy)),
+            parse_greedy_continuous_mode(
+                greedy_continuous_mode
+            ),
             bool(proxy_caching),
+            int(max_thresholds),
             float(runtime_limit_seconds),
             float(memory_limit_mb),
         )
@@ -1546,16 +2459,42 @@ class PRAXIS:
     
     def rid_plot_mean(self, feature_names=None, **kwargs):
         rid_out = self._require_rid()
-        return rid_plot_mean(rid_out, feature_names=feature_names, **kwargs)
+        feature_names = self._resolve_rid_feature_names(
+            feature_names
+        )
+
+        return rid_plot_mean(
+            rid_out,
+            feature_names=feature_names,
+            **kwargs,
+        )
+
 
     def rid_plot_violin(self, feature_names=None, **kwargs):
         rid_out = self._require_rid()
-        return rid_plot_violin(rid_out, feature_names=feature_names, **kwargs)
+        feature_names = self._resolve_rid_feature_names(
+            feature_names
+        )
+
+        return rid_plot_violin(
+            rid_out,
+            feature_names=feature_names,
+            **kwargs,
+        )
+
 
     def rid_plot_cdfs(self, feature_names=None, **kwargs):
         rid_out = self._require_rid()
-        return rid_plot_cdfs(rid_out, feature_names=feature_names, **kwargs)
-    
+        feature_names = self._resolve_rid_feature_names(
+            feature_names
+        )
+
+        return rid_plot_cdfs(
+            rid_out,
+            feature_names=feature_names,
+            **kwargs,
+        )
+        
     @staticmethod
     def _require_binary_predictions(preds):
         a = np.asarray(preds)
@@ -1568,7 +2507,6 @@ class PRAXIS:
         # returns p_i per sample, the proportion of models predicting 1 - require binary predicitons
         # tree_indices : iterable[int] | None. if none, uses all trees, otherwise averages over the tree indices provided.
        
-        X = np.asarray(X, dtype=np.uint8)
 
         if tree_indices is None:
             P = self.get_all_predictions(X, stack=True)
@@ -1585,7 +2523,6 @@ class PRAXIS:
 
     def get_variance_per_sample(self, X, tree_indices=None):
         # returns per-sample variance of hard predictions across trees: p_i(1-p_i)
-        X = np.asarray(X, dtype=np.uint8)
 
         if tree_indices is None:
             P = self.get_all_predictions(X, stack=True)  # (T, N)

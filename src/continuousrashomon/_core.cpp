@@ -92,27 +92,62 @@ numpy_int_1d_to_vector(
 static int
 find_closest_full_binary_column(
     const std::vector<std::vector<uint8_t>>& X_full,
-    const std::vector<uint8_t>& active_col
+    const std::vector<uint8_t>& active_col,
+    int first_candidate_feature = 0
 ) {
-    const int n = (int)X_full.size();
+    const int n = static_cast<int>(X_full.size());
+
     if (n == 0) {
-        throw std::runtime_error("X_full has zero rows.");
+        throw std::runtime_error(
+            "X_full has zero rows."
+        );
     }
 
-    const int d = (int)X_full[0].size();
-    if ((int)active_col.size() != n) {
-        throw std::runtime_error("active_col length does not match X_full rows.");
+    const int d =
+        static_cast<int>(X_full[0].size());
+
+    if (static_cast<int>(active_col.size()) != n) {
+        throw std::runtime_error(
+            "active_col length does not match X_full rows."
+        );
+    }
+
+    if (
+        first_candidate_feature < 0 ||
+        first_candidate_feature >= d
+    ) {
+        throw std::runtime_error(
+            "No eligible full binary columns are available "
+            "for snapping."
+        );
     }
 
     int best_idx = -1;
-    int best_dist = std::numeric_limits<int>::max();
+    int best_dist =
+        std::numeric_limits<int>::max();
 
-    for (int f = 0; f < d; ++f) {
+    for (
+        int f = first_candidate_feature;
+        f < d;
+        ++f
+    ) {
         int dist = 0;
 
         for (int i = 0; i < n; ++i) {
-            const uint8_t a = active_col[(std::size_t)i] ? 1 : 0;
-            const uint8_t b = X_full[(std::size_t)i][(std::size_t)f] ? 1 : 0;
+            const uint8_t a =
+                active_col[static_cast<std::size_t>(i)]
+                    ? 1
+                    : 0;
+
+            const uint8_t b =
+                X_full[
+                    static_cast<std::size_t>(i)
+                ][
+                    static_cast<std::size_t>(f)
+                ]
+                    ? 1
+                    : 0;
+
             dist += (a != b);
         }
 
@@ -120,12 +155,17 @@ find_closest_full_binary_column(
             best_dist = dist;
             best_idx = f;
 
-            if (best_dist == 0) break;
+            if (best_dist == 0) {
+                break;
+            }
         }
     }
 
     if (best_idx < 0) {
-        throw std::runtime_error("Failed to snap active feature to full binarized feature.");
+        throw std::runtime_error(
+            "Failed to snap active feature to a full "
+            "binarized feature."
+        );
     }
 
     return best_idx;
@@ -1268,6 +1308,58 @@ PYBIND11_MODULE(_core, m) {
         )
 
         .def(
+            "get_continuous_starts",
+            &PRAXIS::get_continuous_starts,
+            "Return the internal start index of each continuous threshold group."
+        )
+
+        .def(
+            "get_num_continuous_groups",
+            &PRAXIS::get_num_continuous_groups,
+            "Return the number of continuous feature groups."
+        )
+
+        .def(
+            "get_continuous_group_end",
+            &PRAXIS::get_continuous_group_end,
+            py::arg("continuous_group"),
+            "Return the exclusive internal end index of a continuous group."
+        )
+
+        .def(
+            "get_continuous_cutpoints",
+            &PRAXIS::get_continuous_cutpoints,
+            py::arg("continuous_group"),
+            "Return the ordered <= cutpoints for a continuous group."
+        )
+
+        .def(
+            "get_continuous_threshold_info",
+            &PRAXIS::get_continuous_threshold_info,
+            py::arg("internal_feature"),
+            "Return (continuous_group, offset, cutpoint) for an internal "
+            "continuous threshold feature."
+        )
+
+        .def(
+            "get_internal_feature_info",
+            &PRAXIS::get_internal_feature_info,
+            py::arg("internal_feature"),
+            "Return (is_continuous, continuous_group, offset, cutpoint) "
+            "for an internal feature."
+        )
+
+        .def(
+            "encode_continuous_value",
+            &PRAXIS::encode_continuous_value,
+            py::arg("continuous_group"),
+            py::arg("value"),
+            "Encode one numerical value over all <= cutpoints in a "
+            "continuous feature group."
+        )
+
+
+        .def(
             "training_samples_with_multiple_reachable_predictions",
             [](const PRAXIS &self) {
                 return self.training_samples_with_multiple_reachable_predictions();
@@ -1368,23 +1460,28 @@ PYBIND11_MODULE(_core, m) {
         [](
             py::array_t<
                 double,
-                py::array::c_style | py::array::forcecast
+                py::array::c_style |
+                py::array::forcecast
             > X_num,
             py::array_t<
                 uint8_t,
-                py::array::c_style | py::array::forcecast
+                py::array::c_style |
+                py::array::forcecast
             > X_bin,
             py::array_t<
                 int,
-                py::array::c_style | py::array::forcecast
+                py::array::c_style |
+                py::array::forcecast
             > y,
             py::array_t<
                 uint8_t,
-                py::array::c_style | py::array::forcecast
+                py::array::c_style |
+                py::array::forcecast
             > X_proxy_active,
             py::array_t<
                 uint8_t,
-                py::array::c_style | py::array::forcecast
+                py::array::c_style |
+                py::array::forcecast
             > X_initial_active,
             int n_boot,
             double lambda_reg,
@@ -1407,13 +1504,21 @@ PYBIND11_MODULE(_core, m) {
             int proxy_style,
             bool majority_leaf_only,
             bool cache_cheap_subproblems,
+            int greedy_split_mode,
+            std::string greedy_continuous_mode,
             bool proxy_caching,
+            int max_number_thresholds_per_feature,
             double runtime_limit_seconds,
             double memory_limit_mb
         ) {
-            py::buffer_info num_info = X_num.request();
-            py::buffer_info bin_info = X_bin.request();
-            py::buffer_info yinfo = y.request();
+            py::buffer_info num_info =
+                X_num.request();
+
+            py::buffer_info bin_info =
+                X_bin.request();
+
+            py::buffer_info yinfo =
+                y.request();
 
             py::buffer_info proxy_active_info =
                 X_proxy_active.request();
@@ -1422,15 +1527,21 @@ PYBIND11_MODULE(_core, m) {
                 X_initial_active.request();
 
             if (num_info.ndim != 2) {
-                throw std::runtime_error("X_num must be 2D.");
+                throw std::runtime_error(
+                    "X_num must be 2D."
+                );
             }
 
             if (bin_info.ndim != 2) {
-                throw std::runtime_error("X_bin must be 2D.");
+                throw std::runtime_error(
+                    "X_bin must be 2D."
+                );
             }
 
             if (yinfo.ndim != 1) {
-                throw std::runtime_error("y must be 1D.");
+                throw std::runtime_error(
+                    "y must be 1D."
+                );
             }
 
             if (proxy_active_info.ndim != 2) {
@@ -1458,44 +1569,58 @@ PYBIND11_MODULE(_core, m) {
                 static_cast<int>(bin_info.shape[1]);
 
             const int n_proxy_active =
-                static_cast<int>(proxy_active_info.shape[0]);
+                static_cast<int>(
+                    proxy_active_info.shape[0]
+                );
 
             const int p_proxy_active =
-                static_cast<int>(proxy_active_info.shape[1]);
+                static_cast<int>(
+                    proxy_active_info.shape[1]
+                );
 
             const int n_initial_active =
-                static_cast<int>(initial_active_info.shape[0]);
+                static_cast<int>(
+                    initial_active_info.shape[0]
+                );
 
             const int p_initial_active =
-                static_cast<int>(initial_active_info.shape[1]);
+                static_cast<int>(
+                    initial_active_info.shape[1]
+                );
 
             const int n_y =
                 static_cast<int>(yinfo.shape[0]);
 
             if (n_num != n_bin) {
                 throw std::runtime_error(
-                    "X_num and X_bin must have the same number "
-                    "of rows."
+                    "X_num and X_bin must have the same "
+                    "number of rows."
                 );
             }
 
             if (n_proxy_active != n_num) {
                 throw std::runtime_error(
-                    "X_proxy_active and X_num must have the "
-                    "same number of rows."
+                    "X_proxy_active and X_num must have "
+                    "the same number of rows."
                 );
             }
 
             if (n_initial_active != n_num) {
                 throw std::runtime_error(
-                    "X_initial_active and X_num must have the "
-                    "same number of rows."
+                    "X_initial_active and X_num must have "
+                    "the same number of rows."
                 );
             }
 
             if (n_y != n_num) {
                 throw std::runtime_error(
                     "y length must match X_num/X_bin rows."
+                );
+            }
+
+            if (max_number_thresholds_per_feature == 0) {
+                throw std::runtime_error(
+                    "max_number_thresholds_per_feature must be positive or -1."
                 );
             }
 
@@ -1511,10 +1636,14 @@ PYBIND11_MODULE(_core, m) {
                 static_cast<int*>(yinfo.ptr);
 
             auto* proxy_active_ptr =
-                static_cast<uint8_t*>(proxy_active_info.ptr);
+                static_cast<uint8_t*>(
+                    proxy_active_info.ptr
+                );
 
             auto* initial_active_ptr =
-                static_cast<uint8_t*>(initial_active_info.ptr);
+                static_cast<uint8_t*>(
+                    initial_active_info.ptr
+                );
 
             std::vector<int> y_vec(
                 y_ptr,
@@ -1527,7 +1656,9 @@ PYBIND11_MODULE(_core, m) {
             );
 
             for (int i = 0; i < n; ++i) {
-                X_full[static_cast<std::size_t>(i)].reserve(
+                X_full[
+                    static_cast<std::size_t>(i)
+                ].reserve(
                     static_cast<std::size_t>(
                         p_bin + p_num * 8
                     )
@@ -1543,10 +1674,12 @@ PYBIND11_MODULE(_core, m) {
 
             std::vector<int> continuous_starts;
 
-            // ordinary binary features
+            // Ordinary binary features.
             for (int j = 0; j < p_bin; ++j) {
                 const int col_idx =
-                    static_cast<int>(X_full[0].size());
+                    static_cast<int>(
+                        X_full[0].size()
+                    );
 
                 groups.push_back(
                     std::vector<int>{col_idx}
@@ -1556,7 +1689,9 @@ PYBIND11_MODULE(_core, m) {
                     const uint8_t value =
                         bin_ptr[
                             static_cast<std::size_t>(i) *
-                            static_cast<std::size_t>(p_bin) +
+                            static_cast<std::size_t>(
+                                p_bin
+                            ) +
                             static_cast<std::size_t>(j)
                         ];
 
@@ -1566,15 +1701,20 @@ PYBIND11_MODULE(_core, m) {
                 }
             }
 
-            // fully threshold-binarize numerical features
+            const int first_continuous_feature =
+                static_cast<int>(
+                    X_full[0].size()
+                );
+
+            // Fully threshold-binarize numerical features.
             for (int j = 0; j < p_num; ++j) {
-                std::vector<double> vals;
-                vals.reserve(
+                std::vector<double> raw_values;
+                raw_values.reserve(
                     static_cast<std::size_t>(n)
                 );
 
                 for (int i = 0; i < n; ++i) {
-                    vals.push_back(
+                    raw_values.push_back(
                         num_ptr[
                             static_cast<std::size_t>(i) *
                             static_cast<std::size_t>(p_num) +
@@ -1583,45 +1723,155 @@ PYBIND11_MODULE(_core, m) {
                     );
                 }
 
+                std::vector<double> unique_values =
+                    raw_values;
+
                 std::sort(
-                    vals.begin(),
-                    vals.end()
+                    unique_values.begin(),
+                    unique_values.end()
                 );
 
-                vals.erase(
+                unique_values.erase(
                     std::unique(
-                        vals.begin(),
-                        vals.end()
+                        unique_values.begin(),
+                        unique_values.end()
                     ),
-                    vals.end()
+                    unique_values.end()
                 );
 
-                // constant numerical feature has no threshold
-                if (vals.size() <= 1) {
+                if (unique_values.size() <= 1) {
+                    continue;
+                }
+
+                std::vector<double> thresholds;
+
+                const int candidate_count =
+                    static_cast<int>(
+                        unique_values.size()
+                    ) - 1;
+
+                if (
+                    max_number_thresholds_per_feature < 0 ||
+                    candidate_count <=
+                        max_number_thresholds_per_feature
+                ) {
+                    thresholds.assign(
+                        unique_values.begin(),
+                        unique_values.end() - 1
+                    );
+                } else {
+                    std::vector<double> sorted_values =
+                        raw_values;
+
+                    std::sort(
+                        sorted_values.begin(),
+                        sorted_values.end()
+                    );
+
+                    thresholds.reserve(
+                        static_cast<std::size_t>(
+                            max_number_thresholds_per_feature
+                        )
+                    );
+
+                    for (
+                        int q = 1;
+                        q <= max_number_thresholds_per_feature;
+                        ++q
+                    ) {
+                        const double probability =
+                            static_cast<double>(q) /
+                            static_cast<double>(
+                                max_number_thresholds_per_feature + 1
+                            );
+
+                        const double position =
+                            probability *
+                            static_cast<double>(n - 1);
+
+                        int lo =
+                            static_cast<int>(
+                                std::floor(position)
+                            );
+
+                        int hi =
+                            static_cast<int>(
+                                std::ceil(position)
+                            );
+
+                        lo = std::max(
+                            0,
+                            std::min(lo, n - 1)
+                        );
+
+                        hi = std::max(
+                            0,
+                            std::min(hi, n - 1)
+                        );
+
+                        const double fraction =
+                            position -
+                            static_cast<double>(lo);
+
+                        const double threshold =
+                            sorted_values[
+                                static_cast<std::size_t>(lo)
+                            ] * (1.0 - fraction) +
+                            sorted_values[
+                                static_cast<std::size_t>(hi)
+                            ] * fraction;
+
+                        if (
+                            threshold >= unique_values.front() &&
+                            threshold < unique_values.back()
+                        ) {
+                            thresholds.push_back(
+                                threshold
+                            );
+                        }
+                    }
+
+                    std::sort(
+                        thresholds.begin(),
+                        thresholds.end()
+                    );
+
+                    thresholds.erase(
+                        std::unique(
+                            thresholds.begin(),
+                            thresholds.end()
+                        ),
+                        thresholds.end()
+                    );
+                }
+
+                if (thresholds.empty()) {
                     continue;
                 }
 
                 const int group_start =
-                    static_cast<int>(X_full[0].size());
+                    static_cast<int>(
+                        X_full[0].size()
+                    );
 
-                continuous_starts.push_back(group_start);
+                continuous_starts.push_back(
+                    group_start
+                );
 
                 std::vector<int> this_group;
-                this_group.reserve(vals.size() - 1);
+                this_group.reserve(
+                    thresholds.size()
+                );
 
-                // threshold columns are x <= unique value,
-                // excluding the maximum unique value.
-                for (
-                    std::size_t q = 0;
-                    q + 1 < vals.size();
-                    ++q
-                ) {
-                    const double threshold = vals[q];
-
+                for (double threshold : thresholds) {
                     const int col_idx =
-                        static_cast<int>(X_full[0].size());
+                        static_cast<int>(
+                            X_full[0].size()
+                        );
 
-                    this_group.push_back(col_idx);
+                    this_group.push_back(
+                        col_idx
+                    );
 
                     for (int i = 0; i < n; ++i) {
                         const double xij =
@@ -1654,8 +1904,9 @@ PYBIND11_MODULE(_core, m) {
                 );
             }
 
-            // snap proxy columns separately.
-            std::vector<int> proxy_threshold_features;
+            std::vector<int>
+                proxy_threshold_features;
+
             proxy_threshold_features.reserve(
                 static_cast<std::size_t>(
                     p_proxy_active
@@ -1678,13 +1929,16 @@ PYBIND11_MODULE(_core, m) {
                                 p_proxy_active
                             ) +
                             static_cast<std::size_t>(a)
-                        ] ? 1 : 0;
+                        ]
+                            ? 1
+                            : 0;
                 }
 
                 proxy_threshold_features.push_back(
                     find_closest_full_binary_column(
                         X_full,
-                        active_col
+                        active_col,
+                        0
                     )
                 );
             }
@@ -1693,7 +1947,6 @@ PYBIND11_MODULE(_core, m) {
                 proxy_threshold_features
             );
 
-            // snap initial enumeration columns
             std::vector<int>
                 initial_active_threshold_features;
 
@@ -1703,7 +1956,21 @@ PYBIND11_MODULE(_core, m) {
                 )
             );
 
-            for (int a = 0; a < p_initial_active; ++a) {
+            if (
+                p_initial_active > 0 &&
+                continuous_starts.empty()
+            ) {
+                throw std::runtime_error(
+                    "X_initial_active was provided, but "
+                    "X_num produced no continuous thresholds."
+                );
+            }
+
+            for (
+                int a = 0;
+                a < p_initial_active;
+                ++a
+            ) {
                 std::vector<uint8_t> active_col(
                     static_cast<std::size_t>(n),
                     0
@@ -1719,13 +1986,16 @@ PYBIND11_MODULE(_core, m) {
                                 p_initial_active
                             ) +
                             static_cast<std::size_t>(a)
-                        ] ? 1 : 0;
+                        ]
+                            ? 1
+                            : 0;
                 }
 
                 initial_active_threshold_features.push_back(
                     find_closest_full_binary_column(
                         X_full,
-                        active_col
+                        active_col,
+                        first_continuous_feature
                     )
                 );
             }
@@ -1740,16 +2010,21 @@ PYBIND11_MODULE(_core, m) {
                 !continuous_proxy_in_greedy;
 
             if (
-                use_anytime_fit &&
                 !continuous_starts.empty() &&
                 any_proxy_is_restricted &&
                 proxy_threshold_features.empty()
             ) {
                 throw std::runtime_error(
-                    "Anytime continuous RID requires nonempty X_proxy_active "
-                    "when any proxy is restricted."
+                    "Continuous RID requires nonempty "
+                    "X_proxy_active when any proxy "
+                    "component is restricted."
                 );
             }
+
+            const int greedy_continuous_mode_int =
+                parse_greedy_continuous_mode(
+                    greedy_continuous_mode
+                );
 
             RIDResult r =
                 compute_rid_subtractive_mr_bootstrap(
@@ -1776,6 +2051,8 @@ PYBIND11_MODULE(_core, m) {
                     proxy_style,
                     majority_leaf_only,
                     cache_cheap_subproblems,
+                    greedy_split_mode,
+                    greedy_continuous_mode_int,
                     proxy_caching,
                     proxy_refinement_mode,
                     continuous_proxy_in_lickety,
@@ -1786,9 +2063,15 @@ PYBIND11_MODULE(_core, m) {
                 );
 
             py::dict out;
-            out["mean_sub_mr"] = r.mean_sub_mr;
-            out["cdf_x"] = r.cdf_x;
-            out["cdf_p"] = r.cdf_p;
+
+            out["mean_sub_mr"] =
+                r.mean_sub_mr;
+
+            out["cdf_x"] =
+                r.cdf_x;
+
+            out["cdf_p"] =
+                r.cdf_p;
 
             out["proxy_threshold_features"] =
                 proxy_threshold_features;
@@ -1830,10 +2113,14 @@ PYBIND11_MODULE(_core, m) {
         py::arg("proxy_style") = 0,
         py::arg("majority_leaf_only") = false,
         py::arg("cache_cheap_subproblems") = false,
+        py::arg("greedy_split_mode") = 1,
+        py::arg("greedy_continuous_mode") = "binary",
         py::arg("proxy_caching") = true,
+        py::arg("max_number_thresholds_per_feature") = -1,
         py::arg("runtime_limit_seconds") = -1.0,
         py::arg("memory_limit_mb") = -1.0
     );
 
-
+    
+    
 }

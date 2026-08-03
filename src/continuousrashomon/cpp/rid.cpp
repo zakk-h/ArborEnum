@@ -183,6 +183,8 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
     int proxy_style = 0,
     bool majority_leaf_only = false,
     bool cache_cheap_subproblems = false,
+    int greedy_split_mode = 1,
+    int greedy_continuous_mode = 0,
     bool proxy_caching = true,
     int proxy_refinement_mode = 0,
     bool continuous_proxy_in_lickety = true,
@@ -199,10 +201,6 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
             ? rashomon_mult
             : second_rashomon_mult;
 
-    const std::vector<int>& resolved_initial_active_features =
-        initial_active_threshold_features.empty()
-            ? proxy_threshold_features
-            : initial_active_threshold_features;
 
     // build var->cols mapping.
     // if no binning map is provided, assume no relationship between binary features
@@ -249,14 +247,26 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
 
         PRAXIS model;
 
-        if (use_anytime_fit) {
-            if (!continuous_starts.empty() && proxy_threshold_features.empty()) {
-                throw std::runtime_error(
-                    "Anytime RID needs nonempty proxy_threshold_features. "
-                    "Pass X_active to the continuous RID wrapper so active columns can be snapped."
-                );
-            }
+        model.set_greedy_split_mode(greedy_split_mode);
+        model.set_greedy_continuous_mode(greedy_continuous_mode);
 
+        const bool any_proxy_is_restricted =
+            !continuous_proxy_in_lickety ||
+            !continuous_proxy_in_depthd_exact ||
+            !continuous_proxy_in_greedy;
+
+        if (
+            !continuous_starts.empty() &&
+            any_proxy_is_restricted &&
+            proxy_threshold_features.empty()
+        ) {
+            throw std::runtime_error(
+                "Continuous RID requires nonempty proxy_threshold_features "
+                "when any proxy component is restricted."
+            );
+        }
+
+        if (use_anytime_fit) {
             model.fit_anytime(
                 Xcol,
                 yb,
@@ -273,7 +283,7 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
                 cache_cheap_subproblems,
                 proxy_caching,
                 proxy_threshold_features,
-                resolved_initial_active_features,
+                initial_active_threshold_features,
                 refinement_width,
                 max_refinement_rounds,
                 proxy_refinement_mode,
@@ -293,16 +303,16 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
                 rashomon_mult,
                 lookahead_k,
                 -1,                           // root_budget
-                true,                         // use_multipass
-                false,                        // rule_list_mode
-                0,                            // proxy_style
-                false,                        // majority_leaf_only
-                false,                        // cache_cheap_subproblems
-                true,                         // proxy_caching
-                proxy_threshold_features,           // allowed_proxy_features
-                !proxy_threshold_features.empty(),                        // restrict_proxy_in_lickety
-                !proxy_threshold_features.empty(),                        // restrict_proxy_in_depthd_exact
-                !proxy_threshold_features.empty(),                        // restrict_proxy_in_greedy
+                use_multipass,
+                rule_list_mode,
+                proxy_style,
+                majority_leaf_only,
+                cache_cheap_subproblems,
+                proxy_caching,
+                proxy_threshold_features,    // allowed_proxy_features
+                !continuous_proxy_in_lickety,
+                !continuous_proxy_in_depthd_exact,
+                !continuous_proxy_in_greedy,
                 true,                         // rashomon_mode
                 continuous_starts,
                 false
