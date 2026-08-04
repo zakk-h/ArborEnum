@@ -43,7 +43,7 @@ jobs:
 
           CIBW_TEST_COMMAND: >-
             python -c "import arborenum;
-            from arborenum import PRAXIS;
+            from arborenum import ArborEnum;
             print('ArborEnum import ok')"
 
         run: python -m cibuildwheel --output-dir wheelhouse
