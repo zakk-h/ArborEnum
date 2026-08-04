@@ -1,0 +1,729 @@
+// implementation for the Rashomon importance distribution - not one of our
+// contributions but still integrated with the method.
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <iostream>
+#include <map>
+#include <random>
+#include <stdexcept>
+#include <vector>
+
+using std::cout;
+
+struct RIDResult {
+    std::vector<double> mean_sub_mr;
+    std::vector<std::vector<double>> cdf_x;
+    std::vector<std::vector<double>> cdf_p;
+
+    // optional output. When return_joint_samples=true, there is one row per
+    // tree per bootstrap. Columns 0..V-1 are the feature importances and the
+    // final column is the tree's probability weight.
+    std::vector<std::vector<double>> feature_importance_weight_samples;
+};
+
+static inline void bootstrap_indices(
+    int n,
+    std::mt19937_64& rng,
+    std::vector<int>& idx
+) {
+    std::uniform_int_distribution<int> unif(0, n - 1);
+    idx.resize((std::size_t)n);
+
+    for (int i = 0; i < n; ++i) {
+        idx[(std::size_t)i] = unif(rng);
+    }
+}
+
+static inline void make_bootstrap_dataset(
+    const std::vector<std::vector<uint8_t>>& X,
+    const std::vector<int>& y,
+    const std::vector<int>& idx,
+    std::vector<std::vector<uint8_t>>& Xb,
+    std::vector<int>& yb
+) {
+    const int n = (int)idx.size();
+    const int d = (int)X[0].size();
+
+    Xb.assign((std::size_t)n, std::vector<uint8_t>((std::size_t)d));
+    yb.assign((std::size_t)n, 0);
+
+    for (int i = 0; i < n; ++i) {
+        const int source = idx[(std::size_t)i];
+        Xb[(std::size_t)i] = X[(std::size_t)source];
+        yb[(std::size_t)i] = y[(std::size_t)source];
+    }
+}
+
+static inline void make_bootstrap_vector_int(
+    const std::vector<int>& values,
+    const std::vector<int>& idx,
+    std::vector<int>& bootstrapped_values
+) {
+    const int n = (int)idx.size();
+    bootstrapped_values.assign((std::size_t)n, 0);
+
+    for (int i = 0; i < n; ++i) {
+        bootstrapped_values[(std::size_t)i] =
+            values[(std::size_t)idx[(std::size_t)i]];
+    }
+}
+
+static inline void rowmajor_to_colmajor_bool(
+    const std::vector<std::vector<uint8_t>>& X_row,
+    std::vector<std::vector<bool>>& X_col
+) {
+    const int n = (int)X_row.size();
+    const int d = (int)X_row[0].size();
+
+    X_col.assign(
+        (std::size_t)d,
+        std::vector<bool>((std::size_t)n, false)
+    );
+
+    for (int i = 0; i < n; ++i) {
+        const auto& row = X_row[(std::size_t)i];
+
+        for (int j = 0; j < d; ++j) {
+            X_col[(std::size_t)j][(std::size_t)i] =
+                row[(std::size_t)j] != 0;
+        }
+    }
+}
+
+static inline void make_permutation(
+    int n,
+    std::mt19937_64& rng,
+    std::vector<int>& permutation
+) {
+    permutation.resize((std::size_t)n);
+
+    for (int i = 0; i < n; ++i) {
+        permutation[(std::size_t)i] = i;
+    }
+
+    std::shuffle(permutation.begin(), permutation.end(), rng);
+}
+
+// scramble one original variable represented by one or more binary columns.
+// every column in the block receives the same row permutation, preserving the
+// internal consistency of a threshold-binarized continuous variable.
+static inline void scramble_block_inplace(
+    std::vector<std::vector<uint8_t>>& X,
+    const std::vector<int>& columns,
+    const std::vector<int>& permutation,
+    std::vector<std::vector<uint8_t>>& saved_columns
+) {
+    const int n = (int)X.size();
+
+    saved_columns.assign(
+        columns.size(),
+        std::vector<uint8_t>((std::size_t)n)
+    );
+
+    for (std::size_t column_position = 0;
+         column_position < columns.size();
+         ++column_position) {
+        const int column = columns[column_position];
+
+        for (int i = 0; i < n; ++i) {
+            saved_columns[column_position][(std::size_t)i] =
+                X[(std::size_t)i][(std::size_t)column];
+        }
+    }
+
+    for (std::size_t column_position = 0;
+         column_position < columns.size();
+         ++column_position) {
+        const int column = columns[column_position];
+
+        for (int i = 0; i < n; ++i) {
+            X[(std::size_t)i][(std::size_t)column] =
+                saved_columns[column_position]
+                    [(std::size_t)permutation[(std::size_t)i]];
+        }
+    }
+}
+
+static inline void restore_block_inplace(
+    std::vector<std::vector<uint8_t>>& X,
+    const std::vector<int>& columns,
+    const std::vector<std::vector<uint8_t>>& saved_columns
+) {
+    const int n = (int)X.size();
+
+    for (std::size_t column_position = 0;
+         column_position < columns.size();
+         ++column_position) {
+        const int column = columns[column_position];
+
+        for (int i = 0; i < n; ++i) {
+            X[(std::size_t)i][(std::size_t)column] =
+                saved_columns[column_position][(std::size_t)i];
+        }
+    }
+}
+
+// evaluation-time objective used by subtractive model reliance.
+// the training leaf penalty is unchanged by evaluation-time permutation and
+// therefore cancels in scrambled minus original loss. With deferral enabled,
+// the remaining evaluation objective is:
+// misclassifications + round(eta_defer * number_of_deferrals).
+static inline int rid_eval_objective_from_mis_def(
+    int misclassifications,
+    int deferrals,
+    bool use_deferral,
+    double eta_defer
+) {
+    if (!use_deferral) {
+        return misclassifications;
+    }
+
+    return misclassifications
+        + (int)std::llround(eta_defer * (double)deferrals);
+}
+
+RIDResult compute_rid_subtractive_mr_bootstrap(
+    const std::vector<std::vector<uint8_t>>& X_row_major,
+    const std::vector<int>& y,
+    int n_bootstraps,
+    int n_scramble_evals,
+    double lambda,
+    int depth_budget,
+    double rashomon_mult,
+    int lookahead_k,
+    uint64_t seed,
+    bool memory_efficient,
+    const std::vector<std::vector<int>>& binning_map_vars = {},
+    const std::vector<int>& continuous_starts = {},
+    bool use_anytime_fit = false,
+    double second_rashomon_mult = -1.0,
+    double multiplier_step_size = 0.01,
+    const std::vector<int>& proxy_threshold_features = {},
+    const std::vector<int>& initial_active_threshold_features = {},
+    int refinement_width = 1,
+    int max_refinement_rounds = -1,
+    bool use_multipass = true,
+    bool rule_list_mode = false,
+    int proxy_style = 0,
+    bool majority_leaf_only = false,
+    bool cache_cheap_subproblems = false,
+    int greedy_split_mode = 1,
+    int greedy_continuous_mode = 0,
+    bool proxy_caching = true,
+    int proxy_refinement_mode = 0,
+    bool continuous_proxy_in_lickety = true,
+    bool continuous_proxy_in_depthd_exact = true,
+    bool continuous_proxy_in_greedy = true,
+    double runtime_limit_seconds = -1.0,
+    double memory_limit_mb = -1.0,
+    bool use_deferral = false,
+    double eta_defer = 0.0,
+    const std::vector<int>& bb_pred = {},
+    bool return_joint_samples = false
+) {
+    // retained for API compatibility. both modes now use the scalar packed-trie
+    // extractors, which are substantially more memory efficient than storing
+    // prediction vectors. there is no longer a slower per-tree prediction path.
+    (void)memory_efficient;
+
+    const int n_full = (int)X_row_major.size();
+
+    if (n_full == 0) {
+        throw std::runtime_error(
+            "compute_rid_subtractive_mr_bootstrap: X is empty."
+        );
+    }
+
+    if (n_bootstraps <= 0) {
+        throw std::runtime_error(
+            "compute_rid_subtractive_mr_bootstrap: "
+            "n_bootstraps must be positive."
+        );
+    }
+
+    if (n_scramble_evals <= 0) {
+        throw std::runtime_error(
+            "compute_rid_subtractive_mr_bootstrap: "
+            "n_scramble_evals must be positive."
+        );
+    }
+
+    if (!std::isfinite(lambda) || lambda < 0.0) {
+        throw std::runtime_error(
+            "compute_rid_subtractive_mr_bootstrap: "
+            "lambda must be finite and nonnegative."
+        );
+    }
+
+    if (!std::isfinite(rashomon_mult) || rashomon_mult < 0.0) {
+        throw std::runtime_error(
+            "compute_rid_subtractive_mr_bootstrap: "
+            "rashomon_mult must be finite and nonnegative."
+        );
+    }
+
+    const int d = (int)X_row_major[0].size();
+
+    if (d == 0) {
+        throw std::runtime_error(
+            "compute_rid_subtractive_mr_bootstrap: X has zero columns."
+        );
+    }
+
+    for (int i = 0; i < n_full; ++i) {
+        if ((int)X_row_major[(std::size_t)i].size() != d) {
+            throw std::runtime_error(
+                "compute_rid_subtractive_mr_bootstrap: "
+                "X must be rectangular."
+            );
+        }
+    }
+
+    if ((int)y.size() != n_full) {
+        throw std::runtime_error(
+            "compute_rid_subtractive_mr_bootstrap: "
+            "y has a different number of rows than X."
+        );
+    }
+
+    if (use_deferral) {
+        if ((int)bb_pred.size() != n_full) {
+            throw std::runtime_error(
+                "compute_rid_subtractive_mr_bootstrap: "
+                "use_deferral=true requires bb_pred with the same "
+                "number of rows as X and y."
+            );
+        }
+
+        if (!std::isfinite(eta_defer) || eta_defer < 0.0) {
+            throw std::runtime_error(
+                "compute_rid_subtractive_mr_bootstrap: "
+                "eta_defer must be finite and nonnegative."
+            );
+        }
+    }
+
+    const double resolved_second_rashomon_mult =
+        second_rashomon_mult < 0.0
+            ? rashomon_mult
+            : second_rashomon_mult;
+
+    if (!std::isfinite(resolved_second_rashomon_mult) ||
+        resolved_second_rashomon_mult < rashomon_mult) {
+        throw std::runtime_error(
+            "compute_rid_subtractive_mr_bootstrap: "
+            "second_rashomon_mult must be at least rashomon_mult."
+        );
+    }
+
+    // build original-variable -> internal binary-column mapping. When no map is
+    // provided, every binary column is treated as a separate variable.
+    std::vector<std::vector<int>> variable_columns;
+
+    if (!binning_map_vars.empty()) {
+        variable_columns = binning_map_vars;
+    } else {
+        variable_columns.resize((std::size_t)d);
+
+        for (int j = 0; j < d; ++j) {
+            variable_columns[(std::size_t)j] = {j};
+        }
+    }
+
+    for (const auto& columns : variable_columns) {
+        if (columns.empty()) {
+            throw std::runtime_error(
+                "compute_rid_subtractive_mr_bootstrap: "
+                "binning_map_vars contains an empty variable block."
+            );
+        }
+
+        for (int column : columns) {
+            if (column < 0 || column >= d) {
+                throw std::runtime_error(
+                    "compute_rid_subtractive_mr_bootstrap: "
+                    "binning_map_vars contains an out-of-range column."
+                );
+            }
+        }
+    }
+
+    const int number_of_variables = (int)variable_columns.size();
+
+    std::mt19937_64 rng(seed);
+
+    RIDResult output;
+    output.mean_sub_mr.assign((std::size_t)number_of_variables, 0.0);
+    output.cdf_x.assign((std::size_t)number_of_variables, {});
+    output.cdf_p.assign((std::size_t)number_of_variables, {});
+
+    // each map stores probability mass directly on the normalized,
+    // scramble-averaged importance values.
+    std::vector<std::map<double, double>> mass_by_importance(
+        (std::size_t)number_of_variables
+    );
+
+    for (int bootstrap = 0; bootstrap < n_bootstraps; ++bootstrap) {
+        std::vector<int> bootstrap_idx;
+        bootstrap_indices(n_full, rng, bootstrap_idx);
+
+        std::vector<std::vector<uint8_t>> X_bootstrap;
+        std::vector<int> y_bootstrap;
+
+        make_bootstrap_dataset(
+            X_row_major,
+            y,
+            bootstrap_idx,
+            X_bootstrap,
+            y_bootstrap
+        );
+
+        std::vector<int> bb_pred_bootstrap;
+        if (use_deferral) {
+            make_bootstrap_vector_int(
+                bb_pred,
+                bootstrap_idx,
+                bb_pred_bootstrap
+            );
+        }
+
+        const int n = (int)X_bootstrap.size();
+
+        std::vector<std::vector<bool>> X_col_major;
+        rowmajor_to_colmajor_bool(X_bootstrap, X_col_major);
+
+        ArborEnum model;
+        model.set_greedy_split_mode(greedy_split_mode);
+        model.set_greedy_continuous_mode(greedy_continuous_mode);
+
+        const bool any_proxy_is_restricted =
+            !continuous_proxy_in_lickety ||
+            !continuous_proxy_in_depthd_exact ||
+            !continuous_proxy_in_greedy;
+
+        if (!continuous_starts.empty() &&
+            any_proxy_is_restricted &&
+            proxy_threshold_features.empty()) {
+            throw std::runtime_error(
+                "Continuous RID requires nonempty proxy_threshold_features "
+                "when any proxy component is restricted."
+            );
+        }
+
+        if (use_anytime_fit) {
+            model.fit_anytime(
+                X_col_major,
+                y_bootstrap,
+                lambda,
+                static_cast<int8_t>(depth_budget),
+                rashomon_mult,
+                resolved_second_rashomon_mult,
+                multiplier_step_size,
+                static_cast<int8_t>(lookahead_k),
+                use_multipass,
+                rule_list_mode,
+                proxy_style,
+                majority_leaf_only,
+                cache_cheap_subproblems,
+                proxy_caching,
+                proxy_threshold_features,
+                initial_active_threshold_features,
+                refinement_width,
+                max_refinement_rounds,
+                proxy_refinement_mode,
+                continuous_proxy_in_lickety,
+                continuous_proxy_in_depthd_exact,
+                continuous_proxy_in_greedy,
+                continuous_starts,
+                runtime_limit_seconds,
+                memory_limit_mb,
+                use_deferral,
+                eta_defer,
+                bb_pred_bootstrap
+            );
+        } else {
+            model.fit(
+                X_col_major,
+                y_bootstrap,
+                lambda,
+                static_cast<int8_t>(depth_budget),
+                rashomon_mult,
+                static_cast<int8_t>(lookahead_k),
+                -1,                            // root_budget
+                use_multipass,
+                rule_list_mode,
+                proxy_style,
+                majority_leaf_only,
+                cache_cheap_subproblems,
+                proxy_caching,
+                proxy_threshold_features,     // allowed_proxy_features
+                !continuous_proxy_in_lickety,
+                !continuous_proxy_in_depthd_exact,
+                !continuous_proxy_in_greedy,
+                true,                          // rashomon_mode
+                continuous_starts,
+                false,                         // stronger_rollout_flag
+                use_deferral,
+                eta_defer,
+                bb_pred_bootstrap
+            );
+        }
+
+        if (!model.result) {
+            continue;
+        }
+
+        // the first epsilon off of min objective, refinement just boosts approximation quality
+        const int budget_override = std::min(
+            model.result->budget,
+            static_cast<int>(std::llround(
+                (1.0 + rashomon_mult) *
+                static_cast<double>(model.result->min_objective)
+            ))
+        );
+
+        std::vector<int> original_misclassifications;
+
+        if (use_deferral) {
+            original_misclassifications =
+                model.get_all_misclassifications_packed_trie(
+                    X_bootstrap,
+                    y_bootstrap,
+                    budget_override,
+                    bb_pred_bootstrap
+                );
+        } else {
+            original_misclassifications =
+                model.get_all_misclassifications_packed_trie(
+                    X_bootstrap,
+                    y_bootstrap,
+                    budget_override
+                );
+        }
+
+        std::vector<int> original_deferrals;
+
+        if (use_deferral) {
+            original_deferrals =
+                model.get_all_deferrals_packed_trie(
+                    X_bootstrap,
+                    budget_override
+                );
+
+            if (original_deferrals.size() !=
+                original_misclassifications.size()) {
+                throw std::runtime_error(
+                    "RID deferral extraction returned different numbers of "
+                    "misclassification and deferral entries."
+                );
+            }
+        }
+
+        const uint64_t number_of_trees =
+            (uint64_t)original_misclassifications.size();
+
+        if (number_of_trees == 0) {
+            continue;
+        }
+
+        cout << "Finished RID bootstrap: "
+             << (bootstrap + 1)
+             << " / "
+             << n_bootstraps
+             << " with "
+             << number_of_trees
+             << " trees\n";
+
+        std::vector<int> original_eval_objectives(
+            (std::size_t)number_of_trees,
+            0
+        );
+
+        for (uint64_t tree = 0; tree < number_of_trees; ++tree) {
+            const int deferrals = use_deferral
+                ? original_deferrals[(std::size_t)tree]
+                : 0;
+
+            original_eval_objectives[(std::size_t)tree] =
+                rid_eval_objective_from_mis_def(
+                    original_misclassifications[(std::size_t)tree],
+                    deferrals,
+                    use_deferral,
+                    eta_defer
+                );
+        }
+
+        const double tree_weight =
+            1.0 /
+            ((double)n_bootstraps * (double)number_of_trees);
+
+        std::size_t joint_sample_offset = 0;
+
+        if (return_joint_samples) {
+            joint_sample_offset =
+                output.feature_importance_weight_samples.size();
+
+            output.feature_importance_weight_samples.resize(
+                joint_sample_offset + (std::size_t)number_of_trees,
+                std::vector<double>(
+                    (std::size_t)number_of_variables + 1,
+                    0.0
+                )
+            );
+
+            for (uint64_t tree = 0; tree < number_of_trees; ++tree) {
+                output.feature_importance_weight_samples[
+                    joint_sample_offset + (std::size_t)tree
+                ][(std::size_t)number_of_variables] = tree_weight;
+            }
+        }
+
+        // reuse these buffers across every variable and scramble.
+        std::vector<std::vector<uint8_t>> saved_columns;
+        std::vector<int> permutation;
+
+        for (int variable = 0;
+             variable < number_of_variables;
+             ++variable) {
+            const std::vector<int>& columns =
+                variable_columns[(std::size_t)variable];
+
+            // O(number_of_trees) memory, independent of n_scramble_evals.
+            std::vector<int64_t> summed_objective_differences(
+                (std::size_t)number_of_trees,
+                0
+            );
+
+            for (int scramble = 0;
+                 scramble < n_scramble_evals;
+                 ++scramble) {
+                make_permutation(n, rng, permutation);
+
+                scramble_block_inplace(
+                    X_bootstrap,
+                    columns,
+                    permutation,
+                    saved_columns
+                );
+
+                std::vector<int> scrambled_misclassifications;
+
+                if (use_deferral) {
+                    scrambled_misclassifications =
+                        model.get_all_misclassifications_packed_trie(
+                            X_bootstrap,
+                            y_bootstrap,
+                            budget_override,
+                            bb_pred_bootstrap
+                        );
+                } else {
+                    scrambled_misclassifications =
+                        model.get_all_misclassifications_packed_trie(
+                            X_bootstrap,
+                            y_bootstrap,
+                            budget_override
+                        );
+                }
+
+                std::vector<int> scrambled_deferrals;
+
+                if (use_deferral) {
+                    scrambled_deferrals =
+                        model.get_all_deferrals_packed_trie(
+                            X_bootstrap,
+                            budget_override
+                        );
+
+                    if (scrambled_deferrals.size() !=
+                        scrambled_misclassifications.size()) {
+                        throw std::runtime_error(
+                            "RID deferral extraction returned different "
+                            "numbers of scrambled misclassification and "
+                            "deferral entries."
+                        );
+                    }
+                }
+
+                if ((uint64_t)scrambled_misclassifications.size() !=
+                    number_of_trees) {
+                    throw std::runtime_error(
+                        "RID scalar extraction returned a different tree "
+                        "count after scrambling. The original and scrambled "
+                        "collectors must use identical traversal order."
+                    );
+                }
+
+                for (uint64_t tree = 0;
+                     tree < number_of_trees;
+                     ++tree) {
+                    const int deferrals = use_deferral
+                        ? scrambled_deferrals[(std::size_t)tree]
+                        : 0;
+
+                    const int scrambled_eval_objective =
+                        rid_eval_objective_from_mis_def(
+                            scrambled_misclassifications[(std::size_t)tree],
+                            deferrals,
+                            use_deferral,
+                            eta_defer
+                        );
+
+                    summed_objective_differences[(std::size_t)tree] +=
+                        (int64_t)scrambled_eval_objective
+                        - (int64_t)original_eval_objectives
+                            [(std::size_t)tree];
+                }
+
+                restore_block_inplace(
+                    X_bootstrap,
+                    columns,
+                    saved_columns
+                );
+            }
+
+            for (uint64_t tree = 0;
+                 tree < number_of_trees;
+                 ++tree) {
+                const double importance =
+                    (double)summed_objective_differences[(std::size_t)tree]
+                    /
+                    ((double)n * (double)n_scramble_evals);
+
+                output.mean_sub_mr[(std::size_t)variable] +=
+                    tree_weight * importance;
+
+                mass_by_importance[(std::size_t)variable][importance] +=
+                    tree_weight;
+
+                if (return_joint_samples) {
+                    output.feature_importance_weight_samples[
+                        joint_sample_offset + (std::size_t)tree
+                    ][(std::size_t)variable] = importance;
+                }
+            }
+        }
+    }
+
+    for (int variable = 0;
+         variable < number_of_variables;
+         ++variable) {
+        const auto& mass = mass_by_importance[(std::size_t)variable];
+
+        output.cdf_x[(std::size_t)variable].reserve(mass.size());
+        output.cdf_p[(std::size_t)variable].reserve(mass.size());
+
+        double cumulative_probability = 0.0;
+
+        for (const auto& [importance, probability] : mass) {
+            cumulative_probability += probability;
+
+            output.cdf_x[(std::size_t)variable].push_back(importance);
+            output.cdf_p[(std::size_t)variable].push_back(
+                cumulative_probability
+            );
+        }
+    }
+
+    return output;
+}
