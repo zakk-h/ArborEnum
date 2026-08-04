@@ -1,6 +1,0 @@
-Metadata-Version: 2.4
-Name: continuousrashomon
-Version: 0.1.0
-Summary: Mixed binary/continuous PRAXIS Rashomon set solver
-Requires-Python: >=3.9
-Requires-Dist: numpy

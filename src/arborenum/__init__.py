@@ -1,8 +1,8 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.patches import FancyBboxPatch, Circle
+from matplotlib.patches import Circle
 from matplotlib.lines import Line2D
-from matplotlib.cm import get_cmap
+from matplotlib import colormaps
 from ._core import (
     ArborEnum as _ArborEnumCore,
     rid_subtractive_model_reliance as _rid_subtractive_core,
@@ -3270,7 +3270,7 @@ def rid_plot_cdfs(
     else:
         fig = ax.figure
 
-    cmap = get_cmap(cmap_name)
+    cmap = colormaps[cmap_name]
     colors = [cmap(i % 20) for i in range(V)]
 
     for j in range(V):
