@@ -1,42 +1,75 @@
+import faulthandler
 import platform
 import sys
 import traceback
 
+faulthandler.enable()
+
+
+def log(*args, **kwargs):
+    print(*args, **kwargs, flush=True)
+
 
 def main() -> None:
-    print("=" * 72)
-    print("ArborEnum wheel smoke test")
-    print("=" * 72)
-    print("Python executable:", sys.executable)
-    print("Python version:", sys.version)
-    print("Platform:", platform.platform())
-    print("Machine:", platform.machine())
+    log("=" * 72)
+    log("ArborEnum wheel smoke test")
+    log("=" * 72)
+    log("Python executable:", sys.executable)
+    log("Python version:", sys.version)
+    log("Platform:", platform.platform())
+    log("Machine:", platform.machine())
 
     try:
-        print("\nImporting arborenum...")
+        log("\nImporting numpy...")
+        import numpy
+        log("numpy:", numpy.__version__)
+
+        log("\nImporting pandas...")
+        import pandas
+        log("pandas:", pandas.__version__)
+
+        log("\nImporting matplotlib...")
+        import matplotlib
+        log("matplotlib:", matplotlib.__version__)
+
+        log("\nImporting sklearn...")
+        import sklearn
+        log("scikit-learn:", sklearn.__version__)
+
+        log("\nImporting compiled extension directly...")
+        from arborenum import _core
+        log("_core location:", _core.__file__)
+
+        log("\nImporting arborenum...")
         import arborenum
+        log("arborenum location:", arborenum.__file__)
+        log("arborenum exports:", sorted(dir(arborenum)))
 
-        print("arborenum location:", arborenum.__file__)
-        print("arborenum exports:", sorted(dir(arborenum)))
-
-        print("\nImporting public classes...")
+        log("\nImporting public classes...")
         from arborenum import ArborEnum, ThresholdGuessBinarizer
 
-        print("ArborEnum:", ArborEnum)
-        print("ThresholdGuessBinarizer:", ThresholdGuessBinarizer)
+        log("ArborEnum:", ArborEnum)
+        log("ThresholdGuessBinarizer:", ThresholdGuessBinarizer)
 
-        print("\nInstantiating public classes...")
+        log("\nInstantiating ArborEnum...")
         model = ArborEnum()
+        log("ArborEnum instance:", type(model))
+
+        log("\nInstantiating ThresholdGuessBinarizer...")
         binarizer = ThresholdGuessBinarizer()
+        log("ThresholdGuessBinarizer instance:", type(binarizer))
 
-        print("ArborEnum instance:", type(model))
-        print("ThresholdGuessBinarizer instance:", type(binarizer))
-        print("\nArborEnum wheel smoke test passed.")
+        log("\nArborEnum wheel smoke test passed.")
 
-    except BaseException:
-        print("\nArborEnum wheel smoke test failed.", file=sys.stderr)
-        print("Full exception:", file=sys.stderr)
-        traceback.print_exc()
+    except BaseException as exc:
+        log(
+            "\nArborEnum wheel smoke test failed:",
+            type(exc).__name__,
+            repr(exc),
+            file=sys.stderr,
+        )
+        traceback.print_exc(file=sys.stderr)
+        sys.stderr.flush()
         raise
 
 

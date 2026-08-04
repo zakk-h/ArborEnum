@@ -48,10 +48,11 @@ jobs:
           CIBW_ARCHS_WINDOWS: "AMD64"
           CIBW_ARCHS_MACOS: "auto"
 
-          CIBW_BUILD_VERBOSITY: "1"
+          CIBW_BUILD_VERBOSITY: "3"
+          CIBW_TEST_ENVIRONMENT: "PYTHONUNBUFFERED=1"
 
           CIBW_TEST_COMMAND: >-
-            python {project}/tests/wheel_smoke_test.py
+            python -u -X faulthandler {project}/tests/wheel_smoke_test.py
 
         run: python -m cibuildwheel --output-dir wheelhouse
 
