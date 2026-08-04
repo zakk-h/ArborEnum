@@ -17,6 +17,9 @@ ArborEnum finds collections of accurate, interpretable classification trees rath
 ```bash
 pip install arborenum
 ```
+## Full Usage 
+
+See the [example notebook](https://github.com/zakk-h/ArborEnum/blob/main/examples/example.ipynb) for a complete walkthrough.
 
 ## Basic usage
 
@@ -43,18 +46,18 @@ y = df.pop("label").to_numpy(dtype=np.int32)
 X = df
 ```
 
-## Deterministic enumeration
+## Standard enumeration
 
 We recommend keeping all of these parameters for a high-quality approximation. Only change `lambda_reg`, `depth_budget`, and `rashomon_mult` depending on the Rashomon set you want.
 
 For an exact Rashomon set, use `proxy_mode="continuous"` and `lookahead_k=depth_budget - 1`.
 
 ```python
-deterministic_model = ArborEnum()
+standard_model = ArborEnum()
 
 start = time.perf_counter()
 
-deterministic_model.fit(
+standard_model.fit(
     X,
     y,
 
@@ -85,8 +88,8 @@ deterministic_model.fit(
 elapsed = time.perf_counter() - start
 
 print("elapsed seconds:", f"{elapsed:.2f}")
-print("minimum objective:", deterministic_model.get_min_objective())
-print("number of trees:", deterministic_model.count_trees())
+print("minimum objective:", standard_model.get_min_objective())
+print("number of trees:", standard_model.count_trees())
 ```
 
 ### Proxy modes
@@ -156,7 +159,7 @@ Tree indices range from `0` to `model.count_trees() - 1`.
 
 ```python
 for model, model_name in [
-    (deterministic_model, "Deterministic ArborEnum"),
+    (standard_model, "Standard ArborEnum"),
     (anytime_model, "Anytime ArborEnum"),
 ]:
     number_of_trees = int(model.count_trees())
@@ -220,7 +223,7 @@ rid_result = rid_model.compute_rid(
     X,
     y,
 
-    # Use False for deterministic RID construction.
+    # Use False for standard RID construction.
     early_stopping=True,
 
     proxy_mode="hybrid",
@@ -331,3 +334,7 @@ model.fit(
 ```
 
 Using `"hybrid"` or `"binarized"`, a smaller `lookahead_k`, or a threshold cap gives an approximate variant. Hash-based keys are designed to be memory-efficient with virtually no risk of collisions; use `key_mode="exact"` when exact subproblem identity is required.
+
+## More Examples
+
+See the [example notebook](https://github.com/zakk-h/ArborEnum/blob/main/examples/example.ipynb) for a complete walkthrough.
