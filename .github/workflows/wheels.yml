@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   build_wheels:
-    name: Build wheels on ${{ matrix.os }}
+    name: ${{ matrix.os }} / CPython ${{ matrix.python }}
     runs-on: ${{ matrix.os }}
 
     strategy:
@@ -22,10 +22,17 @@ jobs:
           - macos-15-intel
           - macos-15
 
+        python:
+          - "39"
+          - "310"
+          - "311"
+          - "312"
+          - "313"
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up workflow Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -33,30 +40,27 @@ jobs:
       - name: Install cibuildwheel
         run: python -m pip install --upgrade pip cibuildwheel
 
-      - name: Build wheels
+      - name: Build and test wheel
         env:
-          CIBW_BUILD: "cp39-* cp310-* cp311-* cp312-* cp313-*"
+          CIBW_BUILD: "cp${{ matrix.python }}-*"
           CIBW_SKIP: "*-musllinux_*"
 
           CIBW_ARCHS_WINDOWS: "AMD64"
           CIBW_ARCHS_MACOS: "auto"
 
+          CIBW_BUILD_VERBOSITY: "1"
+
           CIBW_TEST_COMMAND: >-
-            python -c "import sys;
-            print(sys.version);
-            import arborenum;
-            print(arborenum.__file__);
-            print(dir(arborenum));
-            from arborenum import ArborEnum;
-            print('ArborEnum import ok')"
+            python {project}/tests/wheel_smoke_test.py
 
         run: python -m cibuildwheel --output-dir wheelhouse
 
-      - name: Upload wheels as workflow artifacts
+      - name: Upload wheel
         uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ matrix.os }}
+          name: wheels-${{ matrix.os }}-cp${{ matrix.python }}
           path: wheelhouse/*.whl
+          if-no-files-found: error
 
   build_sdist:
     name: Build source distribution
@@ -80,10 +84,14 @@ jobs:
         with:
           name: sdist
           path: dist/*.tar.gz
+          if-no-files-found: error
 
   publish_pypi:
     name: Publish to PyPI
-    needs: [build_wheels, build_sdist]
+    needs:
+      - build_wheels
+      - build_sdist
+
     runs-on: ubuntu-22.04
 
     environment:
