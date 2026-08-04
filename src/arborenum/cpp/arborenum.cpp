@@ -3947,18 +3947,30 @@ public:
 
             // one shared map for this entire DAG traversal.
             // it is discarded after this refinement round.
-            RefineVisited visited;
-            visited.reserve(1024);
+            if (!G_min) {
+                // RefineGraphDfs doesn't handle nulls, we have to rerun the graph algorithm with more features
+                G_min = construct_trie(
+                    root,
+                    depth_budget,
+                    eps_abs,
+                    root_pk,
+                    root_cpath,
+                    &B_active
+                );
+            } else {
+                RefineVisited visited;
+                visited.reserve(1024);
 
-            RefineGraphDfs(
-                G_min,
-                root,
-                depth_budget,
-                root_pk,
-                root_cpath,
-                B_active,
-                visited
-            );
+                RefineGraphDfs(
+                    G_min,
+                    root,
+                    depth_budget,
+                    root_pk,
+                    root_cpath,
+                    B_active,
+                    visited
+                );
+            }
 
             ++refinement_round;
         }

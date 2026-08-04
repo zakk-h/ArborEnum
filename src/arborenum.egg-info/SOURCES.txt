@@ -1,3 +1,4 @@
+MANIFEST.in
 pyproject.toml
 setup.py
 src/arborenum/__init__.py
@@ -8,3 +9,5 @@ src/arborenum.egg-info/SOURCES.txt
 src/arborenum.egg-info/dependency_links.txt
 src/arborenum.egg-info/requires.txt
 src/arborenum.egg-info/top_level.txt
+src/arborenum/cpp/arborenum.cpp
+src/arborenum/cpp/rid.cpp

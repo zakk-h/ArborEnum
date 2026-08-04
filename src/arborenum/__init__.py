@@ -551,7 +551,13 @@ class ArborEnum:
         # proxy_mode: continuous, hybrid (greedy subroutine is binarized), or binarized (everything is binarized)
         # early_stopping=False runs the deterministic continuous algorithm.
         # early_stopping=True runs the anytime algorithm (with some small overhead)
-        
+        if hasattr(X, "columns"):
+            self.feature_names_in_ = list(X.columns)
+        else:
+            self.feature_names_in_ = [
+                f"f{j}" for j in range(np.asarray(X).shape[1])
+            ]
+
         (X_original, X_bin, X_num, self.binary_feature_specs_, self.continuous_feature_indices_,) = _split_binary_and_continuous(
             X,
             binary_unique_threshold=binary_unique_threshold,
@@ -1614,7 +1620,11 @@ class ArborEnum:
     def get_tree_objective(self, tree_index: int):
         obj, obj_norm = self._model.get_tree_objective(int(tree_index))
         return obj, obj_norm
-    
+
+    def get_tree_num_leaves(self, tree_index: int) -> int:
+        paths, _ = self.get_tree_paths(tree_index)
+        return len(paths)
+        
     def count_trees_within_mult(self, mult: float) -> int:
         hist = self.get_root_histogram()
         min_obj = self.get_min_objective()
@@ -1916,7 +1926,7 @@ class ArborEnum:
                 self.binary_feature_specs_ is not None
                 and self.continuous_feature_indices_ is not None
             ):
-                feature_names = self.get_internal_feature_names()
+                feature_names = self.get_internal_feature_names(self.feature_names_in_)
             else:
                 # feature names if not given
                 encodings = [
@@ -2250,42 +2260,58 @@ class ArborEnum:
         )
 
     def _resolve_rid_feature_names(self, feature_names=None):
-        rid_out = self._require_rid()
-        n_rid_features = len(rid_out["mean_sub_mr"])
+        self._require_rid()
 
         if feature_names is None:
-            if hasattr(self, "rid_feature_names_"):
-                names = list(self.rid_feature_names_)
-            else:
-                names = [f"f{j}" for j in range(n_rid_features)]
-        else:
-            names = list(feature_names)
+            return list(self.rid_feature_names_)
 
-            # the user supplied names for the original raw matrix.
-            if (
-                hasattr(self, "rid_feature_indices_")
-                and len(names) != n_rid_features
-            ):
-                max_original_index = max(self.rid_feature_indices_)
+        feature_names = list(feature_names)
 
-                if len(names) <= max_original_index:
-                    raise ValueError(
-                        "feature_names is too short for the original "
-                        "feature indices used by RID."
-                    )
-
-                names = [
-                    names[j]
-                    for j in self.rid_feature_indices_
-                ]
-
-        if len(names) != n_rid_features:
+        if len(feature_names) != self.rid_n_original_features_:
             raise ValueError(
-                f"RID has {n_rid_features} nonconstant features, "
-                f"but feature_names has length {len(names)}."
+                "feature_names must contain one name for every column "
+                "in the original dataset, in the original dataset order. "
+                f"Expected {self.rid_n_original_features_} names, "
+                f"received {len(feature_names)}."
             )
 
-        return names
+        return [
+            feature_names[j]
+            for j in self.rid_feature_indices_
+        ]
+
+    def _resolve_rid_feature(self, feature, feature_names):
+        if isinstance(feature, (int, np.integer)):
+            feature = int(feature)
+
+            if feature < 0 or feature >= len(feature_names):
+                raise IndexError(
+                    f"RID feature index {feature} is outside "
+                    f"[0, {len(feature_names) - 1}]."
+                )
+
+            return feature
+
+        feature = str(feature)
+
+        matches = [
+            j
+            for j, name in enumerate(feature_names)
+            if name == feature
+        ]
+
+        if not matches:
+            raise ValueError(
+                f"Unknown RID feature {feature!r}. "
+                f"Available features are: {feature_names}"
+            )
+
+        if len(matches) > 1:
+            raise ValueError(
+                f"RID feature name {feature!r} is not unique."
+            )
+
+        return matches[0]
 
     def compute_rid(
         self,
@@ -2336,6 +2362,8 @@ class ArborEnum:
             original_feature_names = [
                 f"f{j}" for j in range(np.asarray(X).shape[1])
             ]
+
+        self.rid_n_original_features_ = len(original_feature_names)
         
         (
             X_original,
@@ -2970,10 +2998,25 @@ class ArborEnum:
             feature_names
         )
 
+        feature_a_index = self._resolve_rid_feature(
+            feature_a,
+            feature_names,
+        )
+
+        feature_b_index = self._resolve_rid_feature(
+            feature_b,
+            feature_names,
+        )
+
+        if feature_a_index == feature_b_index:
+            raise ValueError(
+                "feature_a and feature_b must refer to different features."
+            )
+
         return rid_plot_pair(
             rid_out,
-            feature_a,
-            feature_b,
+            feature_a_index,
+            feature_b_index,
             feature_names=feature_names,
             **kwargs,
         )
