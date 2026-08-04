@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "arborenum"
-version = "0.1.6"
+version = "0.1.8"
 description = "Exact, approximate, and anytime decision tree Rashomon sets over binary and continuous features"
 requires-python = ">=3.9"
 dependencies = [
