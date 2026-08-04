@@ -311,6 +311,37 @@ def _as_2d_numeric_array(X, name):
 
     return X
 
+def _shift_column_values_to_midpoints(column):
+    # replace each observed value except the maximum with the midpoint
+    # between it and the next distinct observed value.
+    # used for training because splits are directly on unique values in the cpp
+
+    column = np.asarray(column, dtype=np.float64)
+    unique = np.unique(column)
+
+    if unique.size <= 1:
+        return column
+
+    left = unique[:-1]
+    right = unique[1:]
+
+    midpoints = left + 0.5 * (right - left)
+
+    valid = (
+        np.isfinite(midpoints)
+        & (midpoints > left)
+        & (midpoints < right)
+    )
+
+    shifted_unique = unique.copy()
+    shifted_unique[:-1] = np.where(
+        valid,
+        midpoints,
+        left,
+    )
+
+    positions = np.searchsorted(unique, column)
+    return shifted_unique[positions]
 
 def _split_binary_and_continuous(
     X,
@@ -331,8 +362,26 @@ def _split_binary_and_continuous(
         if unique.size <= 1:
             continue
 
+        left = unique[:-1]
+        right = unique[1:]
+
+        thresholds = left + 0.5 * (right - left)
+
+        valid = (
+            np.isfinite(thresholds)
+            & (thresholds > left)
+            & (thresholds < right)
+        )
+
+        thresholds = np.where(
+            valid,
+            thresholds,
+            left,
+        )
+
         if unique.size <= binary_unique_threshold:
-            for threshold in unique[:-1]:
+            # python directly creates the midpoint threshold columns for low cardinality features
+            for threshold in thresholds:
                 binary_columns.append(
                     (column <= threshold).astype(np.uint8)
                 )
@@ -343,9 +392,19 @@ def _split_binary_and_continuous(
                         "cutpoint": float(threshold),
                     }
                 )
+
         else:
+            # shift each observed level so the existing C++ threshold
+            # generation (split on unique values) produces the midpoint cutpoints.
+            shifted_column = _shift_column_values_to_midpoints(
+                column
+            )
+
             numerical_columns.append(
-                column.astype(np.float64, copy=False)
+                shifted_column.astype(
+                    np.float64,
+                    copy=False,
+                )
             )
 
             numerical_feature_indices.append(j)
