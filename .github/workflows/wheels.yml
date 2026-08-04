@@ -36,13 +36,17 @@ jobs:
       - name: Build wheels
         env:
           CIBW_BUILD: "cp39-* cp310-* cp311-* cp312-* cp313-*"
-          CIBW_SKIP: "pp* *-musllinux_*"
+          CIBW_SKIP: "*-musllinux_*"
 
           CIBW_ARCHS_WINDOWS: "AMD64"
           CIBW_ARCHS_MACOS: "auto"
 
           CIBW_TEST_COMMAND: >-
-            python -c "import arborenum;
+            python -c "import sys;
+            print(sys.version);
+            import arborenum;
+            print(arborenum.__file__);
+            print(dir(arborenum));
             from arborenum import ArborEnum;
             print('ArborEnum import ok')"
 
