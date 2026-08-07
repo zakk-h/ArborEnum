@@ -1454,6 +1454,23 @@ PYBIND11_MODULE(_core, m) {
         )
 
         .def(
+            "alternating_optimization",
+            &ArborEnum::alternating_optimization,
+            py::arg("max_iterations") = 10,
+            "Refine the reconstructed single tree using bottom-up "
+            "TAO-style alternating optimization."
+        )
+
+        .def(
+            "get_tree_objective",
+            [](const ArborEnum &self, std::uint64_t tree_index) {
+                auto obj_pair = self.get_ith_tree_objective(tree_index);
+                return py::make_tuple(obj_pair.first, obj_pair.second);
+            },
+            py::arg("tree_index")
+        )
+
+        .def(
             "get_tree_objective",
             [](const ArborEnum &self, std::uint64_t tree_index) {
                 auto obj_pair = self.get_ith_tree_objective(tree_index);

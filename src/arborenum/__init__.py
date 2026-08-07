@@ -1690,6 +1690,13 @@ class ArborEnum:
         thresh = round((1.0 + mult) * min_obj)
         return sum(cnt for obj, cnt in hist if obj <= thresh)
 
+    def alternating_optimization(self, max_iterations=10):
+        return int(
+            self._model.alternating_optimization(
+                int(max_iterations)
+            )
+        )
+
     def get_continuous_starts(self):
         # return the internal column index at which each continuous threshold group begins.
         return list(self._model.get_continuous_starts())

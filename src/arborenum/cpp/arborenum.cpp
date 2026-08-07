@@ -949,6 +949,10 @@ private:
     unordered_map<K2, int, K2::Hash> anytime_lickety_first_split_cache;
     bool anytime_mode_active_ = false;
 
+    // Optional tao-style refinement of the reconstructed single tree - only in single tree node.
+    // when non-null, single-tree prediction and path extraction use this refined tree instead of reconstructing again.
+    shared_ptr<PredNode> single_tree_refined_override_;
+
     // enabled only by fit_then_extend and the explicit anytime algorithm.
     // negative values mean that the corresponding limit is disabled.
     bool resource_limits_active_ = false;
@@ -3576,7 +3580,9 @@ public:
             root.w[(size_t)(n_words - 1)] = tail_mask;
 
             const PathKey& root_pk = empty_pk();
-            tree = build_best_tree_from_caches(root, depth_budget, root_pk);
+            tree = single_tree_refined_override_
+                ? single_tree_refined_override_
+                : build_best_tree_from_caches(root, depth_budget, root_pk);
         } 
         // standard rashomon mode
         else {
@@ -3627,7 +3633,9 @@ public:
             const PathKey& root_pk = empty_pk();
             const int8_t depth_budget = trained_depth_budget;
 
-            auto tree = build_best_tree_from_caches(root, depth_budget, root_pk);
+            auto tree = single_tree_refined_override_
+                ? single_tree_refined_override_
+                : build_best_tree_from_caches(root, depth_budget, root_pk);
 
             std::vector<std::vector<int>> paths;
             std::vector<int> preds;
@@ -3644,6 +3652,85 @@ public:
 
         collect_paths(tree.get(), current, paths, preds);
         return {paths, preds};
+    }
+
+
+    // tAO-style alternating optimization for the reconstructed single tree.
+    // each sweep processes internal nodes bottom-up. For a node, descendants are
+    // held fixed. A training sample reaching the node receives a temporary binary
+    // label only when exactly one child subtree classifies it correctly:
+    //   1 -> the current left subtree is correct and the right subtree is wrong
+    //   0 -> the current right subtree is correct and the left subtree is wrong
+    // samples for which both children are correct or both are wrong are omitted.
+    // the temporary classification problem is solved exactly at depth 1 by
+    // scanning every existing binary/continuous-threshold column with packed
+    // bitvectors. Both polarities are considered. if the reversed polarity wins,
+    // the children are swapped so X_bits[f]==1 still follows node->left.
+ 
+    // returns the number of strict node improvements accepted across all sweeps.
+    int alternating_optimization(int max_iterations = 10) {
+        if (result) {
+            throw std::runtime_error(
+                "alternating_optimization is only available in single-tree mode."
+            );
+        }
+        if (trained_depth_budget < 0 || n_samples <= 0) {
+            throw std::runtime_error("Call fit() before alternating_optimization().");
+        }
+        if (max_iterations < 0) {
+            throw std::invalid_argument("max_iterations must be nonnegative.");
+        }
+        if (use_deferral) {
+            throw std::runtime_error(
+                "alternating_optimization currently optimizes classification error only "
+                "and is disabled when deferral is active."
+            );
+        }
+
+        Packed root((size_t)n_words);
+        for (int i = 0; i < n_words - 1; ++i) root.w[(size_t)i] = ~0ULL;
+        root.w[(size_t)(n_words - 1)] = tail_mask;
+
+        // start from the strongest tree currently represented by the caches unless this method has already been called, in which case continue refining the
+        // previous result.
+        if (!single_tree_refined_override_) {
+            const PathKey& root_pk = empty_pk();
+            single_tree_refined_override_ =
+                build_best_tree_from_caches(root, trained_depth_budget, root_pk);
+        }
+
+        int total_improvements = 0;
+
+        for (int iteration = 0; iteration < max_iterations; ++iteration) {
+            std::vector<TaoNodeWork_> work;
+            work.reserve(64);
+            collect_tao_nodes_with_masks_(
+                single_tree_refined_override_.get(),
+                root,
+                0,
+                work
+            );
+
+            std::stable_sort(
+                work.begin(),
+                work.end(),
+                [](const TaoNodeWork_& a, const TaoNodeWork_& b) {
+                    return a.depth > b.depth;
+                }
+            );
+
+            int improvements_this_sweep = 0;
+            for (auto& item : work) {
+                if (optimize_tao_node_(item.node, item.mask)) {
+                    ++improvements_this_sweep;
+                    ++total_improvements;
+                }
+            }
+
+            if (improvements_this_sweep == 0) break;
+        }
+
+        return total_improvements;
     }
 
 
@@ -3670,6 +3757,12 @@ public:
         // }
         if (!result) {
             if (i != 0) throw std::out_of_range("Single-tree mode only supports i==0.");
+
+            if (single_tree_refined_override_) {
+                const int refined = tree_training_objective_raw_(single_tree_refined_override_.get());
+                return {refined, (double)refined / (double)n_samples};
+            }
+
             if (!proxy_caching_enabled) {
                 throw std::runtime_error("Single-tree objective requires proxy_caching_enabled, or recompute objective.");
             }
@@ -5157,6 +5250,7 @@ private:
         greedy_first_split_cache.clear();
         anytime_lickety_first_split_cache.clear();
         anytime_mode_active_ = false;
+        single_tree_refined_override_.reset();
 
         continuous_proxy_completion_cache.clear();
         continuous_proxy_completion_cache.rehash(0);
@@ -13300,6 +13394,211 @@ private:
     }
 
     
+
+    struct TaoNodeWork_ {
+        PredNode* node = nullptr;
+        Packed mask;
+        int depth = 0;
+    };
+
+    struct TaoStumpSolution_ {
+        int feature = -1;
+        bool flipped = false;
+        int errors = std::numeric_limits<int>::max();
+    };
+
+    int predict_training_sample_from_prednode_(const PredNode* node, int row) const {
+        const PredNode* cur = node;
+        while (cur && cur->feature >= 0) {
+            cur = training_value_(row, cur->feature)
+                ? cur->left.get()
+                : cur->right.get();
+        }
+        if (!cur) {
+            throw std::runtime_error("Malformed PredNode tree during TAO refinement.");
+        }
+        if (cur->prediction == DEFER_PREDICTION) {
+            // alternating_optimization currently rejects deferral mode, so this is
+            // only a defensive guard.
+            if (prepared_bb_pred.empty() || row >= (int)prepared_bb_pred.size()) {
+                throw std::runtime_error(
+                    "TAO encountered a defer leaf without training black-box predictions."
+                );
+            }
+            return prepared_bb_pred[(size_t)row];
+        }
+        return cur->prediction;
+    }
+
+    int count_prednode_leaves_(const PredNode* node) const {
+        if (!node) return 0;
+        if (node->feature < 0) return 1;
+        return count_prednode_leaves_(node->left.get())
+             + count_prednode_leaves_(node->right.get());
+    }
+
+    int tree_training_mistakes_(const PredNode* tree) const {
+        int mistakes = 0;
+        for (int row = 0; row < n_samples; ++row) {
+            mistakes += (
+                predict_training_sample_from_prednode_(tree, row)
+                != y_train[(size_t)row]
+            );
+        }
+        return mistakes;
+    }
+
+    int tree_training_objective_raw_(const PredNode* tree) const {
+        return tree_training_mistakes_(tree)
+             + gamma * count_prednode_leaves_(tree);
+    }
+
+    void collect_tao_nodes_with_masks_(
+        PredNode* node,
+        const Packed& mask,
+        int depth,
+        std::vector<TaoNodeWork_>& out
+    ) const {
+        if (!node || node->feature < 0) return;
+
+        out.push_back(TaoNodeWork_{node, mask, depth});
+
+        Packed left_mask((size_t)n_words);
+        Packed right_mask((size_t)n_words);
+        and_bits(mask, X_bits[(size_t)node->feature], left_mask);
+        andnot_bits(mask, X_bits[(size_t)node->feature], right_mask);
+
+        if (left_mask.any()) {
+            collect_tao_nodes_with_masks_(
+                node->left.get(), left_mask, depth + 1, out
+            );
+        }
+        if (right_mask.any()) {
+            collect_tao_nodes_with_masks_(
+                node->right.get(), right_mask, depth + 1, out
+            );
+        }
+    }
+
+    // exact depth-1 classifier for the temporary tao labels. `included` is the
+    // subset participating in this node's classification problem and `want_left`
+    // is the subset whose temporary label is 1. Every X_bits column is scanned,
+    // so all ordinary binary features and every retained continuous threshold are
+    // considered. There is intentionally no cache lookup or insertion here.
+    TaoStumpSolution_ solve_tao_stump_exact_(
+        const Packed& included,
+        const Packed& want_left
+    ) const {
+        TaoStumpSolution_ best;
+
+        const int total = included.count();
+        if (total <= 0) return best;
+
+        const int total_ones = want_left.count();
+        const int total_zeros = total - total_ones;
+
+        for (int f = 0; f < n_features; ++f) {
+            const Packed& split = X_bits[(size_t)f];
+
+            const int true_total = popcount_and(included, split);
+            const int true_ones = popcount_and(want_left, split);
+            const int true_zeros = true_total - true_ones;
+
+            const int false_ones = total_ones - true_ones;
+            const int false_zeros = total_zeros - true_zeros;
+
+            // normal orientation: X_bits[f]==1 -> current left subtree.
+            const int normal_errors = true_zeros + false_ones;
+
+            // reversed orientation: X_bits[f]==1 -> current right subtree.
+            const int flipped_errors = true_ones + false_zeros;
+
+            auto consider = [&](int errors, bool flipped) {
+                if (
+                    errors < best.errors ||
+                    (errors == best.errors &&
+                     (best.feature < 0 || f < best.feature)) ||
+                    (errors == best.errors && f == best.feature &&
+                     best.flipped && !flipped)
+                ) {
+                    best.errors = errors;
+                    best.feature = f;
+                    best.flipped = flipped;
+                }
+            };
+
+            consider(normal_errors, false);
+            consider(flipped_errors, true);
+
+            if (best.errors == 0) {
+                // zero is globally optimal
+                break;
+            }
+        }
+
+        return best;
+    }
+
+    bool optimize_tao_node_(PredNode* node, const Packed& node_mask) const {
+        if (!node || node->feature < 0 || !node->left || !node->right) return false;
+
+        Packed included((size_t)n_words);
+        Packed want_left((size_t)n_words);
+
+        int current_errors = 0;
+
+        // descendants are fixed while optimizing this node. build the temporary
+        // classification problem directly from the two child-subtree predictions.
+        for (int wi = 0; wi < n_words; ++wi) {
+            uint64_t bits = node_mask.w[(size_t)wi];
+            while (bits) {
+#if defined(_MSC_VER)
+                unsigned long bit_index = 0;
+                _BitScanForward64(&bit_index, bits);
+                const int bit = (int)bit_index;
+#else
+                const int bit = __builtin_ctzll(bits);
+#endif
+                const int row = (wi << 6) + bit;
+                bits &= (bits - 1);
+                if (row >= n_samples) continue;
+
+                const int y = y_train[(size_t)row];
+                const bool left_correct =
+                    predict_training_sample_from_prednode_(node->left.get(), row) == y;
+                const bool right_correct =
+                    predict_training_sample_from_prednode_(node->right.get(), row) == y;
+
+                // include iff exactly one child is correct.
+                if (left_correct == right_correct) continue;
+
+                included.w[(size_t)(row >> 6)] |= 1ULL << (row & 63);
+                if (left_correct) {
+                    want_left.w[(size_t)(row >> 6)] |= 1ULL << (row & 63);
+                }
+
+                const bool currently_goes_left = training_value_(row, node->feature);
+                const bool wants_left_now = left_correct;
+                current_errors += (currently_goes_left != wants_left_now);
+            }
+        }
+
+        if (!included.any()) return false;
+
+        const TaoStumpSolution_ best =
+            solve_tao_stump_exact_(included, want_left);
+
+        // strict improvement only
+        if (best.feature < 0 || best.errors >= current_errors) return false;
+
+        node->feature = best.feature;
+        if (best.flipped) {
+            std::swap(node->left, node->right);
+        }
+
+        return true;
+    }
+
     // not used by ArborEnum Rashomon mode, to support giving single decision tree algorithm results in package.
     shared_ptr<PredNode> build_best_tree_from_caches(const Packed& mask, int8_t depth_budget, const PathKey& pk) const {
         const int INF = std::numeric_limits<int>::max();

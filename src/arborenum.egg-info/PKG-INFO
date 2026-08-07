@@ -1,9 +1,351 @@
 Metadata-Version: 2.4
 Name: arborenum
-Version: 0.1.8
+Version: 0.2.1
 Summary: Exact, approximate, and anytime decision tree Rashomon sets over binary and continuous features
 Requires-Python: >=3.9
+Description-Content-Type: text/markdown
 Requires-Dist: numpy
 Requires-Dist: pandas
 Requires-Dist: matplotlib
 Requires-Dist: scikit-learn
+
+# ArborEnum
+
+**Exact, approximate, and anytime enumeration of decision-tree Rashomon sets over continuous features.**
+
+ArborEnum finds collections of accurate, interpretable classification trees rather than returning only a single model. Unlike prior work, it directly supports continuous features as input. Its algorithms span approximate to optimal Rashomon sets, allow either coarse or fully exhaustive treatment of continuous features, and support runtime and memory limits through an anytime algorithm. ArborEnum also integrates the Rashomon Importance Distribution (RID) to provide stable variable-importance estimates across the set of all good models.
+
+## Features
+
+- Enumerate decision trees within a small multiplier beyond a reference objective (for instance, the optimal tree or a tree from a non-optimal proxy algorithm).
+- Work directly with numerical tabular data (continuous features).
+- Use exact, approximate, or anytime enumeration.
+- Inspect objectives, predictions, leaves, and individual tree structures.
+- Compute and visualize Rashomon Importance Distributions.
+
+## Installation
+
+```bash
+pip install arborenum
+```
+## Full Usage 
+
+See the [example notebook](https://github.com/zakk-h/ArborEnum/blob/main/examples/example.ipynb) for a complete walkthrough.
+
+## Basic usage
+
+```python
+import time
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from arborenum import ArborEnum
+```
+
+Load a numerical classification dataset (for instance, a bike rental dataset). Keeping `X` as a pandas DataFrame allows ArborEnum to use the feature names in plots.
+
+```python
+df = pd.read_csv("examples/bike_processed.csv").sample(
+    frac=1.0,
+    replace=True,
+    random_state=0,
+).reset_index(drop=True)
+
+y = df.pop("label").to_numpy(dtype=np.int32)
+X = df
+```
+
+## Standard enumeration
+
+We recommend keeping all of these parameters for a high-quality approximation. Only change `lambda_reg`, `depth_budget`, and `rashomon_mult` depending on the Rashomon set you want.
+
+For an exact Rashomon set, use `proxy_mode="continuous"` and `lookahead_k=depth_budget - 1`.
+
+```python
+standard_model = ArborEnum()
+
+start = time.perf_counter()
+
+standard_model.fit(
+    X,
+    y,
+
+    # Which thresholds the proxy algorithms may use:
+    # "continuous", "hybrid", or "binarized".
+    # We recommend "hybrid" for strong approximation quality and speed.
+    proxy_mode="hybrid",
+
+    # Accuracy-interpretability trade-off.
+    lambda_reg=0.005,
+
+    # Maximum allowed tree depth.
+    depth_budget=5,
+
+    # Rashomon multiplier.
+    rashomon_mult=0.01,
+
+    # Proxy lookahead.
+    lookahead_k=1,
+
+    # None considers every available cutpoint.
+    max_number_thresholds_per_feature=None,
+
+    # "hash" is memory-efficient; "exact" uses exact bit-vector caching.
+    key_mode="hash",
+)
+
+elapsed = time.perf_counter() - start
+
+print("elapsed seconds:", f"{elapsed:.2f}")
+print("minimum objective:", standard_model.get_min_objective())
+print("number of trees:", standard_model.count_trees())
+```
+
+### Proxy modes
+
+- `"continuous"` allows all proxy components to use continuous thresholds.
+- `"hybrid"` dynamically changes between a subset and all thresholds
+- `"binarized"` restricts all proxy components to automatically guessed thresholds.
+
+`"hybrid"` is the recommended default for a strong speed–quality trade-off.
+
+## Anytime enumeration
+
+
+Our anytime algorithm progressively solves for the Rashomon set, adding more and more cutpoints of continuous features over time. This means that it can stop at anytime during the execution and maintain guarantees over a binarization. The anytime algorithm uses the same main optimization settings and adds early stopping, resource limits, proxy refinement, and optional Rashomon-multiplier expansion. The last point means that after we have added all cutpoints, we are able to repeatedly increase the Rashomon multiplier to expand the Rashomon set.
+
+```python
+anytime_model = ArborEnum()
+
+start = time.perf_counter()
+
+anytime_model.fit(
+    X,
+    y,
+
+    early_stopping=True,
+
+    proxy_mode="hybrid",
+    lambda_reg=0.005,
+    depth_budget=5,
+    rashomon_mult=0.01,
+    lookahead_k=1,
+    max_number_thresholds_per_feature=None,
+    key_mode="hash",
+
+    # "on" continually refines the proxy.
+    # "auto" decides whether further refinement is worthwhile.
+    proxy_refinement="auto",
+
+    # After adding all thresholds, optionally extend the budget to match a bigger Rashomon multiplier.
+    second_rashomon_mult=0.03,
+    multiplier_step_size=0.0025,
+
+    runtime_limit_seconds=600,
+    memory_limit_mb=10000,
+)
+
+elapsed = time.perf_counter() - start
+
+print("elapsed seconds:", f"{elapsed:.2f}")
+print("minimum objective:", anytime_model.get_min_objective())
+print("number of trees found in total:", anytime_model.count_trees())
+print(
+    "trees within a 0.01 multiplier:",
+    anytime_model.count_trees_within_mult(0.01),
+)
+print(
+    "trees within a 0.03 multiplier:",
+    anytime_model.count_trees_within_mult(0.03),
+)
+```
+
+Set `second_rashomon_mult=None` when no multiplier expansion is desired.
+
+## Inspecting and plotting trees
+
+Tree indices range from `0` to `model.count_trees() - 1`.
+
+```python
+for model, model_name in [
+    (standard_model, "Standard ArborEnum"),
+    (anytime_model, "Anytime ArborEnum"),
+]:
+    number_of_trees = int(model.count_trees())
+
+    if number_of_trees == 0:
+        print(f"{model_name}: no trees were returned.")
+        continue
+
+    tree_indices = [0]
+
+    if number_of_trees > 1:
+        tree_indices.append(number_of_trees - 1)
+
+    for tree_index in tree_indices:
+        tree_name = "first tree" if tree_index == 0 else "last tree"
+
+        objective, normalized_objective = model.get_tree_objective(
+            tree_index
+        )
+
+        predictions = np.asarray(
+            model.get_predictions(
+                tree_index,
+                X,
+            ),
+            dtype=np.int32,
+        )
+
+        accuracy = np.mean(predictions == y)
+
+        print()
+        print(f"{model_name}: {tree_name}")
+        print("tree index:", tree_index)
+        print("objective:", objective)
+        print("normalized objective:", normalized_objective)
+        print(
+            "number of leaves:",
+            model.get_tree_num_leaves(tree_index),
+        )
+        print("accuracy:", f"{accuracy:.6f}")
+        print("first 10 predictions:", predictions[:10].tolist())
+
+        model.plot_tree(
+            tree_index,
+            title=f"{model_name}: {tree_name}",
+            show=True,
+        )
+
+plt.show()
+```
+## Rashomon Importance Distributions
+
+A Rashomon Importance Distribution describes how feature importance varies across accurate trees rather than reporting importance for only one model. It is also stable because we train Rashomon sets on more than one bootstrap of the dataset.
+
+```python
+rid_model = ArborEnum()
+
+start = time.perf_counter()
+
+rid_result = rid_model.compute_rid(
+    X,
+    y,
+
+    # Use False for standard RID construction.
+    early_stopping=True,
+
+    proxy_mode="hybrid",
+    lambda_reg=0.005,
+    depth_budget=5,
+    rashomon_mult=0.01,
+    lookahead_k=1,
+    max_number_thresholds_per_feature=None,
+
+    proxy_refinement="auto",
+
+    second_rashomon_mult=0.03,
+    multiplier_step_size=0.0025,
+
+    runtime_limit_seconds=600,
+    memory_limit_mb=10000,
+
+    # Number of bootstrap repetitions.
+    n_boot=3,
+
+    # Number of feature permutations evaluated per feature.
+    n_scramble_evals=5,
+
+    # Required for pairwise RID plots.
+    return_joint_samples=True,
+)
+
+elapsed = time.perf_counter() - start
+
+print("elapsed seconds:", f"{elapsed:.2f}")
+```
+
+### RID plots
+
+```python
+rid_model.rid_plot_mean(
+    show=True,
+)
+
+rid_model.rid_plot_violin(
+    show=True,
+)
+
+rid_model.rid_plot_cdfs(
+    show=True,
+)
+```
+
+### Pairwise RID plots
+
+Pass feature names directly as strings. Each point corresponds to a tree in one bootstrapped Rashomon set. The coordinates are the feature importances for those two features.
+
+```python
+feature_pairs = [
+    ("mnth", "hr"),
+    ("holiday", "weekday"),
+    ("temp", "hum"),
+]
+
+for feature_a, feature_b in feature_pairs:
+    print(
+        "plotting:",
+        feature_a,
+        "vs.",
+        feature_b,
+    )
+
+    rid_model.rid_plot_pair(
+        feature_a,
+        feature_b,
+        show=True,
+    )
+
+plt.show()
+```
+
+## Important parameters
+
+| Parameter | Meaning |
+|---|---|
+| `lambda_reg` | Penalty on the number of leaves. Larger values favor smaller trees. |
+| `depth_budget` | Maximum tree depth. |
+| `rashomon_mult` | Relative objective tolerance defining the Rashomon set. |
+| `proxy_mode` | Continuous, hybrid, or binarized proxy threshold configuration. |
+| `lookahead_k` | Proxy lookahead depth. Larger values improve proxy quality but cost more. |
+| `early_stopping` | Enables the anytime algorithm. |
+| `proxy_refinement` | `"off"`, `"on"`, or `"auto"` for making the proxy converge to optimal. |
+| `second_rashomon_mult` | Optional larger multiplier used to expand the Rashomon set to a bigger multiplier |
+| `multiplier_step_size` | Step size for multiplier expansion. |
+| `runtime_limit_seconds` | Runtime limit for anytime refinement and expansion. |
+| `memory_limit_mb` | Memory limit for anytime refinement and expansion. |
+| `max_number_thresholds_per_feature` | Optional cap on continuous cutpoints per feature. |
+
+## Exact versus approximate enumeration
+
+For exact continuous-feature enumeration, use:
+
+```python
+model.fit(
+    X,
+    y,
+    proxy_mode="continuous",
+    lookahead_k=depth_budget - 1,
+    depth_budget=depth_budget,
+    max_number_thresholds_per_feature=None,
+    key_mode="exact",
+)
+```
+
+Using `"hybrid"` or `"binarized"`, a smaller `lookahead_k`, or a threshold cap gives an approximate variant. Hash-based keys are designed to be memory-efficient with virtually no risk of collisions; use `key_mode="exact"` when exact subproblem identity is required.
+
+## More Examples
+
+See the [example notebook](https://github.com/zakk-h/ArborEnum/blob/main/examples/example.ipynb) for a complete walkthrough.
