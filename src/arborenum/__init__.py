@@ -10,9 +10,34 @@ from ._core import (
 )
 from ._threshold_guessing import ThresholdGuessBinarizer
 
+import json
+from pathlib import Path
+from importlib.resources import files
+
 DEFER_PREDICTION = -1
 
 __all__ = ["ArborEnum", "ThresholdGuessBinarizer", "DEFER_PREDICTION"]
+
+def _json_safe(x):
+    if isinstance(x, np.integer):
+        return int(x)
+
+    if isinstance(x, np.floating):
+        return float(x)
+
+    if isinstance(x, np.ndarray):
+        return x.tolist()
+
+    if isinstance(x, dict):
+        return {
+            str(k): _json_safe(v)
+            for k, v in x.items()
+        }
+
+    if isinstance(x, (list, tuple)):
+        return [_json_safe(v) for v in x]
+
+    return x
 
 def _normalize_key(s: str) -> str:
     # lower, trim, and make separators uniform
@@ -726,6 +751,13 @@ class ArborEnum:
                 use_deferral=use_deferral,
                 eta_defer=eta_defer,
             )
+
+        self.lambda_reg_ = float(lambda_reg)
+        self.depth_budget_ = int(depth_budget)
+        self.rashomon_mult_ = float(rashomon_mult)
+        self.multiplicative_slack_ = float(multiplicative_slack)
+        self.lookahead_k_ = int(lookahead_k)
+        self.eta_defer_ = float(eta_defer)
 
         return self.fit_prepared(
             lambda_reg=lambda_reg,
@@ -1983,6 +2015,458 @@ class ArborEnum:
                 )
 
         return names
+
+    def export_andor_graph(self, as_dict=True):
+        g = self._model.export_andor_graph()
+
+        if not as_dict:
+            return g
+
+        return {
+            "root_trie_id": int(g.root_trie_id),
+
+            "trie_nodes": [
+                {
+                    "id": int(node.id),
+                    "budget": int(node.budget),
+                    "min_objective": int(node.min_objective),
+                    "subproblem_size": int(
+                        node.subproblem_size
+                    ),
+                    "leaf_ids": [
+                        int(x)
+                        for x in node.leaf_ids
+                    ],
+                    "split_ids": [
+                        int(x)
+                        for x in node.split_ids
+                    ],
+                }
+                for node in g.trie_nodes
+            ],
+
+            "split_nodes": [
+                {
+                    "id": int(split.id),
+                    "parent_trie_id": int(
+                        split.parent_trie_id
+                    ),
+                    "feature": int(split.feature),
+                    "left_trie_id": int(
+                        split.left_trie_id
+                    ),
+                    "right_trie_id": int(
+                        split.right_trie_id
+                    ),
+                    "min_objective": int(
+                        split.min_objective
+                    ),
+                }
+                for split in g.split_nodes
+            ],
+
+            "leaf_nodes": [
+                {
+                    "id": int(leaf.id),
+                    "parent_trie_id": int(
+                        leaf.parent_trie_id
+                    ),
+                    "prediction": int(
+                        leaf.prediction
+                    ),
+                    "loss": int(leaf.loss),
+                    "subproblem_size": int(
+                        leaf.subproblem_size
+                    ),
+                }
+                for leaf in g.leaf_nodes
+            ],
+        }
+
+    def _get_builder_feature_metadata(
+        self,
+        feature_names=None,
+    ):
+        if self.binary_feature_specs_ is None:
+            raise RuntimeError(
+                "Feature metadata is unavailable. "
+                "Fit ArborEnum through fit(X, y, ...) first."
+            )
+
+        if self.continuous_feature_indices_ is None:
+            raise RuntimeError(
+                "Continuous feature metadata is unavailable."
+            )
+
+        if self.n_features_in_ is None:
+            raise RuntimeError(
+                "Original feature count is unavailable."
+            )
+
+        if feature_names is None:
+            feature_names = list(self.feature_names_in_)
+        else:
+            feature_names = list(feature_names)
+
+        if len(feature_names) != self.n_features_in_:
+            raise ValueError(
+                "feature_names must contain one name for "
+                "every original input feature."
+            )
+
+        # exactly aligned with our internal ids
+        internal_feature_names = (
+            self.get_internal_feature_names(feature_names)
+        )
+
+        thresholds = {}
+        feature_registry = []
+
+        # low cardinality features
+        for internal_feature, spec in enumerate(
+            self.binary_feature_specs_
+        ):
+            original_feature = int(
+                spec["original_feature"]
+            )
+
+            cutpoint = float(spec["cutpoint"])
+
+            thresholds[internal_feature] = cutpoint
+
+            feature_registry.append(
+                {
+                    "internalFeature": internal_feature,
+                    "originalFeature": original_feature,
+                    "originalName": str(
+                        feature_names[original_feature]
+                    ),
+                    "threshold": cutpoint,
+                    "kind": "binary_threshold",
+                    "continuousGroup": None,
+                }
+            )
+
+        # cpp generated continuous groups
+        continuous_groups = {}
+
+        starts = [
+            int(x)
+            for x in self._model.get_continuous_starts()
+        ]
+
+        for group, original_feature in enumerate(
+            self.continuous_feature_indices_
+        ):
+            original_feature = int(original_feature)
+
+            cutpoints = [
+                float(x)
+                for x in self.get_continuous_cutpoints(group)
+            ]
+
+            start = starts[group]
+
+            internal_columns = []
+
+            for offset, cutpoint in enumerate(cutpoints):
+                internal_feature = start + offset
+
+                thresholds[internal_feature] = cutpoint
+                internal_columns.append(internal_feature)
+
+                feature_registry.append(
+                    {
+                        "internalFeature": internal_feature,
+                        "originalFeature": original_feature,
+                        "originalName": str(
+                            feature_names[original_feature]
+                        ),
+                        "threshold": cutpoint,
+                        "kind": "continuous_threshold",
+                        "continuousGroup": group,
+                    }
+                )
+
+            continuous_groups[
+                str(feature_names[original_feature])
+            ] = internal_columns
+
+        # feature_registry[i] describes split.feature == i. this should already be the case by how we went over.
+        feature_registry.sort(
+            key=lambda x: x["internalFeature"]
+        )
+
+        for expected, entry in enumerate(feature_registry):
+            if entry["internalFeature"] != expected:
+                raise RuntimeError(
+                    "Builder feature metadata is not aligned "
+                    "with ArborEnum internal feature indices: "
+                    f"expected {expected}, got "
+                    f"{entry['internalFeature']}."
+                )
+
+        if len(internal_feature_names) != len(
+            feature_registry
+        ):
+            raise RuntimeError(
+                "Internal feature-name count does not match "
+                "the builder feature registry."
+            )
+
+        if len(starts) != len(
+            self.continuous_feature_indices_
+        ):
+            raise RuntimeError(
+                "Continuous-group metadata is inconsistent: "
+                "the number of C++ continuous groups does not "
+                "match continuous_feature_indices_."
+            )
+
+
+        # feature_registry says for each threshold
+        '''
+        internalFeature: 0,
+        originalFeature: 1,
+        originalName: sex,
+        threshold: 0.5,
+        kind: binary_threshold,
+        continuousGroup: None, 
+        '''
+
+        return {
+            "featureRegistry": feature_registry,
+        }
+        
+
+    def save_builder_payload(
+        self,
+        path,
+        *,
+        feature_names=None,
+        feature_descriptions=None,
+        lambda_reg=None,
+        depth_budget=None,
+        rashomon_mult=None,
+        multiplicative_slack=None,
+        lookahead_k=None,
+        root_n=None,
+        gamma=None,
+        eta_defer=None,
+        indent=2,
+    ):
+        graph = self.export_andor_graph(
+            as_dict=True
+        )
+
+        feature_meta = (
+            self._get_builder_feature_metadata(
+                feature_names=feature_names
+            )
+        )
+
+        if lambda_reg is None:
+            lambda_reg = getattr(
+                self,
+                "lambda_reg_",
+                None,
+            )
+
+        if depth_budget is None:
+            depth_budget = getattr(
+                self,
+                "depth_budget_",
+                None,
+            )
+
+        if rashomon_mult is None:
+            rashomon_mult = getattr(
+                self,
+                "rashomon_mult_",
+                None,
+            )
+
+        if multiplicative_slack is None:
+            multiplicative_slack = getattr(
+                self,
+                "multiplicative_slack_",
+                None,
+            )
+
+        if lookahead_k is None:
+            lookahead_k = getattr(
+                self,
+                "lookahead_k_",
+                None,
+            )
+
+        if eta_defer is None:
+            eta_defer = getattr(
+                self,
+                "eta_defer_",
+                None,
+            )
+
+        meta = {
+            **feature_meta,
+
+            "featureDescriptions": feature_descriptions,
+
+            "lambda_reg": lambda_reg,
+            "depth_budget": depth_budget,
+            "rashomon_mult": rashomon_mult,
+            "multiplicative_slack": multiplicative_slack,
+            "lookahead_k": lookahead_k,
+            "root_n": root_n,
+            "gamma": gamma,
+            "eta_defer": eta_defer,
+        }
+
+        root_id = int(
+            graph.get("root_trie_id", 0)
+        )
+
+        root = next(
+            (
+                node
+                for node in graph.get(
+                    "trie_nodes",
+                    [],
+                )
+                if int(node.get("id", -1)) == root_id
+            ),
+            None,
+        )
+
+        if root is not None:
+            meta["root_budget"] = root.get(
+                "budget"
+            )
+
+            meta["root_min_objective"] = root.get(
+                "min_objective"
+            )
+
+            meta["root_subproblem_size"] = root.get(
+                "subproblem_size"
+            )
+
+            if root_n is None:
+                meta["root_n"] = root.get(
+                    "subproblem_size"
+                )
+
+        if (
+            gamma is None
+            and lambda_reg is not None
+            and meta.get("root_n") is not None
+        ):
+            meta["gamma"] = int(
+                round(
+                    float(lambda_reg)
+                    * int(meta["root_n"])
+                )
+            )
+
+        payload = {
+            "graph": graph,
+            "meta": {
+                k: v
+                for k, v in meta.items()
+                if v is not None
+            },
+        }
+
+        path = Path(path)
+
+        path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        path.write_text(
+            json.dumps(
+                _json_safe(payload),
+                indent=indent,
+            ),
+            encoding="utf-8",
+        )
+
+        return path
+
+    def save_builder_html(
+        self,
+        path,
+        **kwargs,
+    ):
+        payload_path = (
+            Path(path).with_suffix(
+                ".payload.json"
+            )
+        )
+
+        self.save_builder_payload(
+            payload_path,
+            **kwargs,
+        )
+
+        payload = json.loads(
+            payload_path.read_text(
+                encoding="utf-8"
+            )
+        )
+
+        payload_path.unlink(
+            missing_ok=True
+        )
+
+        payload_json = json.dumps(payload)
+
+        # prevent accidental closing of the script tag
+        payload_json = payload_json.replace(
+            "</",
+            "<\\/",
+        )
+
+        html = (
+            files(__package__)
+            .joinpath(
+                "builder_static/index.html"
+            )
+            .read_text(
+                encoding="utf-8"
+            )
+        )
+
+        inject = f"""
+        <script>
+        window.ARBORENUM_BUILDER_PAYLOAD = {payload_json};
+        </script>
+        """
+
+        if "</head>" in html:
+            html = html.replace(
+                "</head>",
+                inject + "\n</head>",
+                1,
+            )
+        else:
+            html = inject + html
+
+        path = Path(path)
+
+        path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        path.write_text(
+            html,
+            encoding="utf-8",
+        )
+
+        return path
+
     
     def plot_tree(self, tree_index: int, feature_names=None, figsize=(8, 6), ax=None, title=None, show=True):
         paths, preds = self.get_tree_paths(tree_index)

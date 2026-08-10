@@ -663,6 +663,47 @@ struct SplitNode {
     uint64_t num_valid_trees = 0; // trees contributed by this split under parent's budget
 };
 
+struct ExportLeafNode {
+    int id = -1;
+    int parent_trie_id = -1;
+    int prediction = -1;
+    int loss = 0;
+    int subproblem_size = 0;
+};
+
+struct ExportSplitNode {
+    int id = -1;
+    int parent_trie_id = -1;
+
+    // internal ArborEnum threshold-feature index.
+    int feature = -1;
+
+    int left_trie_id = -1;
+    int right_trie_id = -1;
+
+    // best completion objective if this split is chosen.
+    int min_objective = std::numeric_limits<int>::max();
+};
+
+struct ExportTreeTrieNode {
+    int id = -1;
+
+    int budget = 0;
+    int min_objective = std::numeric_limits<int>::max();
+    int subproblem_size = 0;
+
+    std::vector<int> leaf_ids;
+    std::vector<int> split_ids;
+};
+
+struct ExportANDORGraph {
+    int root_trie_id = -1;
+
+    std::vector<ExportTreeTrieNode> trie_nodes;
+    std::vector<ExportSplitNode> split_nodes;
+    std::vector<ExportLeafNode> leaf_nodes;
+};
+
 // this is existing work. we do not claim it as our contribution, though we will utilize some caching later to create budget-independent nodes.
 // by budget independent, they still will store a budget, but there will not exist multiple different nodes for the same subproblem and remaining depth, but with different budgets.
 // the largest budget which we solve it with is useful metadata, as illustrated in the paper.
@@ -1875,6 +1916,257 @@ public:
         int obj;
         int deferrals;
     };
+
+    ExportANDORGraph export_andor_graph(
+        std::size_t max_trie_nodes = 10000000,
+        std::size_t max_split_nodes = 50000000,
+        std::size_t max_leaf_nodes = 50000000
+    ) const {
+        if (!result) {
+            throw std::runtime_error(
+                "No Rashomon graph exists. Fit ArborEnum first."
+            );
+        }
+
+        ExportANDORGraph out;
+
+        // one exported id per actual TreeTrieNode object.
+        // this preserves DAG sharing: if several paths point to the same
+        // node, they all receive the same exported id.
+        std::unordered_map<const TreeTrieNode*, int> trie_ids;
+
+        auto get_trie_id =
+            [&](const std::shared_ptr<TreeTrieNode>& node) -> int {
+                if (!node) return -1;
+
+                const TreeTrieNode* ptr = node.get();
+
+                auto it = trie_ids.find(ptr);
+                if (it != trie_ids.end()) {
+                    return it->second;
+                }
+
+                if (out.trie_nodes.size() >= max_trie_nodes) {
+                    throw std::runtime_error(
+                        "export_andor_graph exceeded max_trie_nodes."
+                    );
+                }
+
+                const int id =
+                    static_cast<int>(out.trie_nodes.size());
+
+                trie_ids.emplace(ptr, id);
+
+                ExportTreeTrieNode exported;
+                exported.id = id;
+
+                // the rest is filled when this node is processed.
+                out.trie_nodes.push_back(std::move(exported));
+
+                return id;
+            };
+
+        struct StackItem {
+            std::shared_ptr<TreeTrieNode> node;
+            Packed mask;
+        };
+
+        // root training mask.
+        Packed root_mask(static_cast<std::size_t>(n_words));
+
+        for (int w = 0; w < n_words - 1; ++w) {
+            root_mask.w[static_cast<std::size_t>(w)] = ~0ULL;
+        }
+
+        root_mask.w[static_cast<std::size_t>(n_words - 1)] =
+            tail_mask;
+
+        out.root_trie_id = get_trie_id(result);
+
+        std::vector<StackItem> stack;
+        stack.push_back(
+            StackItem{
+                result,
+                std::move(root_mask)
+            }
+        );
+
+        std::unordered_set<const TreeTrieNode*> processed;
+
+        while (!stack.empty()) {
+            StackItem item = std::move(stack.back());
+            stack.pop_back();
+
+            const auto& cur = item.node;
+            if (!cur) continue;
+
+            const TreeTrieNode* ptr = cur.get();
+
+            // prevents a shared DAG node from being exported twice.
+            if (!processed.insert(ptr).second) {
+                continue;
+            }
+
+            const int cur_id = get_trie_id(cur);
+            const int cur_size = item.mask.count();
+
+            // do not hold a reference into out.trie_nodes here (had dangling pointer issue)
+            out.trie_nodes[
+                static_cast<std::size_t>(cur_id)
+            ].budget = cur->budget;
+
+            out.trie_nodes[
+                static_cast<std::size_t>(cur_id)
+            ].min_objective = cur->min_objective;
+
+            out.trie_nodes[
+                static_cast<std::size_t>(cur_id)
+            ].subproblem_size = cur_size;
+
+            // leaf alternatives
+            for (const LeafNode& leaf : cur->leaves) {
+                if (out.leaf_nodes.size() >= max_leaf_nodes) {
+                    throw std::runtime_error(
+                        "export_andor_graph exceeded max_leaf_nodes."
+                    );
+                }
+
+                ExportLeafNode e;
+
+                e.id =
+                    static_cast<int>(out.leaf_nodes.size());
+
+                e.parent_trie_id = cur_id;
+                e.prediction = leaf.prediction;
+                e.loss = leaf.loss;
+                e.subproblem_size = cur_size;
+
+                out.trie_nodes[
+                    static_cast<std::size_t>(cur_id)
+                ].leaf_ids.push_back(e.id);
+
+                out.leaf_nodes.push_back(std::move(e));
+            }
+
+            // split / AND alternatives
+            for (const SplitNode& split : cur->splits) {
+                if (!split.left || !split.right) {
+                    continue;
+                }
+
+                if (
+                    split.feature < 0 ||
+                    split.feature >= static_cast<int>(X_bits.size())
+                ) {
+                    throw std::runtime_error(
+                        "export_andor_graph found an invalid internal feature."
+                    );
+                }
+
+                if (out.split_nodes.size() >= max_split_nodes) {
+                    throw std::runtime_error(
+                        "export_andor_graph exceeded max_split_nodes."
+                    );
+                }
+
+                Packed left_mask(
+                    static_cast<std::size_t>(n_words)
+                );
+
+                Packed right_mask(
+                    static_cast<std::size_t>(n_words)
+                );
+
+                and_words(
+                    item.mask.w.data(),
+                    X_bits[
+                        static_cast<std::size_t>(split.feature)
+                    ].w.data(),
+                    left_mask.w.data(),
+                    n_words,
+                    tail_mask
+                );
+
+                andnot_words(
+                    item.mask.w.data(),
+                    X_bits[
+                        static_cast<std::size_t>(split.feature)
+                    ].w.data(),
+                    right_mask.w.data(),
+                    n_words,
+                    tail_mask
+                );
+
+                // Ttese may grow out.trie_nodes and reallocate it.
+                const int left_id =
+                    get_trie_id(split.left);
+
+                const int right_id =
+                    get_trie_id(split.right);
+
+                ExportSplitNode e;
+
+                e.id =
+                    static_cast<int>(out.split_nodes.size());
+
+                e.parent_trie_id = cur_id;
+
+                // keep the actual internal threshold-feature index.
+                e.feature = split.feature;
+
+                e.left_trie_id = left_id;
+                e.right_trie_id = right_id;
+
+                if (
+                    split.left->min_objective !=
+                        std::numeric_limits<int>::max()
+                    &&
+                    split.right->min_objective !=
+                        std::numeric_limits<int>::max()
+                ) {
+                    e.min_objective =
+                        split.left->min_objective +
+                        split.right->min_objective;
+                }
+
+                // re-index after get_trie_id() calls instead of using
+                // a reference that may have been invalidated.
+                out.trie_nodes[
+                    static_cast<std::size_t>(cur_id)
+                ].split_ids.push_back(e.id);
+
+                out.split_nodes.push_back(std::move(e));
+
+                if (
+                    processed.find(split.left.get()) ==
+                    processed.end()
+                ) {
+                    stack.push_back(
+                        StackItem{
+                            split.left,
+                            std::move(left_mask)
+                        }
+                    );
+                }
+
+                if (
+                    processed.find(split.right.get()) ==
+                    processed.end()
+                ) {
+                    stack.push_back(
+                        StackItem{
+                            split.right,
+                            std::move(right_mask)
+                        }
+                    );
+                }
+            }
+        }
+
+        return out;
+    }
+
+    
 
 
     // return the internal feature index at which each continuous group begins
