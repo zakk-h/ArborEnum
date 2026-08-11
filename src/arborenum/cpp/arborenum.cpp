@@ -1917,6 +1917,11 @@ public:
         int deferrals;
     };
 
+    struct ExactReplacementMistakesWithObj {
+        int obj = 0;
+        std::vector<double> mistakes; // [m_original, m_0, ..., m_{p-1}], exact, no montecarlo error
+    };
+
     ExportANDORGraph export_andor_graph(
         std::size_t max_trie_nodes = 10000000,
         std::size_t max_split_nodes = 50000000,
@@ -15099,6 +15104,429 @@ private:
         return to_sorted_mistake_buckets_(acc);
     }
 
+
+    struct ExactReplacementState_ {
+        // original/evaluation rows whose non-replaced feature values are
+        // consistent with the current path.
+        Packed target_rows;
+
+        // rows whose value of THIS replaced variable is still consistent
+        // with the current path.
+        Packed replacement_values;
+    };
+
+    struct ExactReplacementCounts_ {
+        int64_t original_mistakes = 0;
+        // exact sum over all (target row, replacement-value row) pairs.
+        // divide by n_eval at the end to get expected mistakes.
+        std::vector<int64_t> replacement_weighted_mistakes;
+    };
+
+    struct ObjExactReplacementBucket_ {
+        int obj = 0;
+        std::vector<ExactReplacementCounts_> counts;
+    };
+
+    static inline std::vector<ObjExactReplacementBucket_>
+    to_sorted_exact_replacement_buckets_(
+        std::unordered_map<
+            int,
+            std::vector<ExactReplacementCounts_>
+        >& acc
+    ) {
+        std::vector<ObjExactReplacementBucket_> out;
+        out.reserve(acc.size());
+
+        for (auto& kv : acc) {
+            ObjExactReplacementBucket_ b;
+            b.obj = kv.first;
+            b.counts = std::move(kv.second);
+            out.push_back(std::move(b));
+        }
+
+        std::sort(
+            out.begin(),
+            out.end(),
+            [](const ObjExactReplacementBucket_& a,
+            const ObjExactReplacementBucket_& b) {
+                return a.obj < b.obj;
+            }
+        );
+
+        return out;
+    }
+
+    inline int exact_wrong_count_for_leaf_(
+        const Packed& target_rows,
+        int prediction,
+        const EvalCtx& ctx,
+        const std::vector<Packed>& Y_eval_bits,
+        const Packed* BBwrong_eval
+    ) const {
+        if (ctx.n_words <= 0) return 0;
+
+        if (prediction == DEFER_PREDICTION) {
+            if (!BBwrong_eval) {
+                throw std::runtime_error(
+                    "Deferred leaf encountered, but eval bb_pred was not provided."
+                );
+            }
+
+            return popcount_and_eval_(
+                target_rows,
+                *BBwrong_eval,
+                ctx.n_words
+            );
+        }
+
+        if (prediction < 0 || prediction >= num_classes) {
+            throw std::runtime_error(
+                "Leaf prediction is outside valid class range."
+            );
+        }
+
+        const int n_here =
+            count_eval_mask_(target_rows, ctx.n_words);
+
+        const int correct =
+            popcount_and_eval_(
+                target_rows,
+                Y_eval_bits[(size_t)prediction],
+                ctx.n_words
+            );
+
+        return n_here - correct;
+    }
+
+    std::vector<ObjExactReplacementBucket_>
+    collect_exact_replacement_mistakes_by_obj_(
+        const TreeTrieNode* node,
+        int budget,
+
+        // ordinary, unmodified evaluation rows.
+        const Packed& original_mask,
+
+        // one state per original variable.
+        const std::vector<ExactReplacementState_>& states,
+
+        // internal binary-column index -> original variable index.
+        const std::vector<int>& internal_to_variable,
+
+        const EvalCtx& ctx,
+        const std::vector<Packed>& Y_eval_bits,
+        const Packed* BBwrong_eval
+    ) const {
+        if (!node || budget < 0) return {};
+
+        constexpr int INF = std::numeric_limits<int>::max();
+
+        if (node->min_objective == INF ||
+            node->min_objective > budget) {
+            return {};
+        }
+
+        const int number_of_variables =
+            static_cast<int>(states.size());
+
+        std::unordered_map<
+            int,
+            std::vector<ExactReplacementCounts_>
+        > acc;
+
+        const int max_objs =
+            budget - node->min_objective + 1;
+
+        acc.reserve((size_t)std::max(1, max_objs));
+
+        // leaf alternatives
+        for (const auto& leaf : node->leaves) {
+            if (leaf.loss > budget) continue;
+
+            ExactReplacementCounts_ here;
+            here.replacement_weighted_mistakes.assign(
+                (size_t)number_of_variables,
+                0
+            );
+
+            here.original_mistakes =
+                exact_wrong_count_for_leaf_(
+                    original_mask,
+                    leaf.prediction,
+                    ctx,
+                    Y_eval_bits,
+                    BBwrong_eval
+                );
+
+            for (int variable = 0;
+                variable < number_of_variables;
+                ++variable) {
+
+                const auto& state =
+                    states[(size_t)variable];
+
+                const int wrong_target_rows =
+                    exact_wrong_count_for_leaf_(
+                        state.target_rows,
+                        leaf.prediction,
+                        ctx,
+                        Y_eval_bits,
+                        BBwrong_eval
+                    );
+
+                const int number_of_replacement_values =
+                    count_eval_mask_(
+                        state.replacement_values,
+                        ctx.n_words
+                    );
+
+                here.replacement_weighted_mistakes[
+                    (size_t)variable
+                ] =
+                    (int64_t)wrong_target_rows *
+                    (int64_t)number_of_replacement_values;
+            }
+
+            acc[leaf.loss].push_back(std::move(here));
+        }
+
+        // split alternatives.
+        for (const auto& split : node->splits) {
+            const TreeTrieNode* L = split.left.get();
+            const TreeTrieNode* R = split.right.get();
+
+            if (!L || !R) continue;
+
+            const int minL = L->min_objective;
+            const int minR = R->min_objective;
+
+            if (minL == INF || minR == INF) continue;
+
+            int bL = budget - minR;
+            int bR = budget - minL;
+
+            if (bL < 0 || bR < 0) continue;
+
+            bL = std::min(bL, L->budget);
+            bR = std::min(bR, R->budget);
+
+            if (bL < minL || bR < minR) continue;
+
+            if (
+                split.feature < 0 ||
+                split.feature >= (int)internal_to_variable.size()
+            ) {
+                throw std::runtime_error(
+                    "Exact replacement evaluation saw an invalid split feature."
+                );
+            }
+
+            const int split_variable =
+                internal_to_variable[(size_t)split.feature];
+
+            if (
+                split_variable < 0 ||
+                split_variable >= number_of_variables
+            ) {
+                throw std::runtime_error(
+                    "Split feature is not mapped to an original variable."
+                );
+            }
+
+            const Packed& Xf =
+                ctx.X_bits_eval[(size_t)split.feature];
+
+            // normal/original evaluation.
+            Packed original_left((size_t)ctx.n_words);
+            Packed original_right((size_t)ctx.n_words);
+
+            and_bits_eval(
+                original_mask,
+                Xf,
+                original_left,
+                ctx.n_words,
+                ctx.tail_mask
+            );
+
+            andnot_bits_eval(
+                original_mask,
+                Xf,
+                original_right,
+                ctx.n_words,
+                ctx.tail_mask
+            );
+
+            std::vector<ExactReplacementState_> left_states;
+            std::vector<ExactReplacementState_> right_states;
+
+            left_states.resize((size_t)number_of_variables);
+            right_states.resize((size_t)number_of_variables);
+
+            for (int variable = 0;
+                variable < number_of_variables;
+                ++variable) {
+
+                const auto& cur = states[(size_t)variable];
+
+                auto& ls = left_states[(size_t)variable];
+                auto& rs = right_states[(size_t)variable];
+
+                ls.target_rows =
+                    Packed((size_t)ctx.n_words);
+                rs.target_rows =
+                    Packed((size_t)ctx.n_words);
+                ls.replacement_values =
+                    Packed((size_t)ctx.n_words);
+                rs.replacement_values =
+                    Packed((size_t)ctx.n_words);
+
+                if (variable == split_variable) {
+                    // this is the variable being replaced.
+                    // the target rows do NOT split on their original value.
+                    // Instead, the set of possible replacement values splits.
+                    ls.target_rows.w = cur.target_rows.w;
+                    rs.target_rows.w = cur.target_rows.w;
+
+                    and_bits_eval(
+                        cur.replacement_values,
+                        Xf,
+                        ls.replacement_values,
+                        ctx.n_words,
+                        ctx.tail_mask
+                    );
+
+                    andnot_bits_eval(
+                        cur.replacement_values,
+                        Xf,
+                        rs.replacement_values,
+                        ctx.n_words,
+                        ctx.tail_mask
+                    );
+                } else {
+                    // some other variable is being replaced.
+                    // this split is therefore evaluated normally on the
+                    // target row. the possible values of the replaced
+                    // variable are unchanged.
+                    and_bits_eval(
+                        cur.target_rows,
+                        Xf,
+                        ls.target_rows,
+                        ctx.n_words,
+                        ctx.tail_mask
+                    );
+
+                    andnot_bits_eval(
+                        cur.target_rows,
+                        Xf,
+                        rs.target_rows,
+                        ctx.n_words,
+                        ctx.tail_mask
+                    );
+
+                    ls.replacement_values.w =
+                        cur.replacement_values.w;
+                    rs.replacement_values.w =
+                        cur.replacement_values.w;
+                }
+            }
+
+            auto Lb =
+                collect_exact_replacement_mistakes_by_obj_(
+                    L,
+                    bL,
+                    original_left,
+                    left_states,
+                    internal_to_variable,
+                    ctx,
+                    Y_eval_bits,
+                    BBwrong_eval
+                );
+
+            auto Rb =
+                collect_exact_replacement_mistakes_by_obj_(
+                    R,
+                    bR,
+                    original_right,
+                    right_states,
+                    internal_to_variable,
+                    ctx,
+                    Y_eval_bits,
+                    BBwrong_eval
+                );
+
+            if (Lb.empty() || Rb.empty()) continue;
+
+            std::vector<int> R_objs;
+            R_objs.reserve(Rb.size());
+
+            for (const auto& rb : Rb) {
+                R_objs.push_back(rb.obj);
+            }
+
+            for (const auto& lb : Lb) {
+                if (lb.obj > bL) continue;
+
+                const int rem = budget - lb.obj;
+
+                auto it_end =
+                    std::upper_bound(
+                        R_objs.begin(),
+                        R_objs.end(),
+                        rem
+                    );
+
+                const size_t r_hi =
+                    (size_t)std::distance(
+                        R_objs.begin(),
+                        it_end
+                    );
+
+                for (size_t ri = 0; ri < r_hi; ++ri) {
+                    const auto& rb = Rb[ri];
+
+                    const int total_obj =
+                        lb.obj + rb.obj;
+
+                    if (total_obj > budget) continue;
+
+                    auto& dest = acc[total_obj];
+
+                    for (const auto& lc : lb.counts) {
+                        for (const auto& rc : rb.counts) {
+                            ExactReplacementCounts_ combined;
+
+                            combined.original_mistakes =
+                                lc.original_mistakes +
+                                rc.original_mistakes;
+
+                            combined.replacement_weighted_mistakes.resize(
+                                (size_t)number_of_variables
+                            );
+
+                            for (int variable = 0;
+                                variable < number_of_variables;
+                                ++variable) {
+
+                                combined.replacement_weighted_mistakes[
+                                    (size_t)variable
+                                ] =
+                                    lc.replacement_weighted_mistakes[
+                                        (size_t)variable
+                                    ] +
+                                    rc.replacement_weighted_mistakes[
+                                        (size_t)variable
+                                    ];
+                            }
+
+                            dest.push_back(std::move(combined));
+                        }
+                    }
+                }
+            }
+        }
+
+        return to_sorted_exact_replacement_buckets_(acc);
+    }
+
 public:
 
     uint8_t reachable_prediction_mask_for_training_sample(int sample_idx) const {
@@ -15442,4 +15870,249 @@ public:
 
         return out;
     }
+
+    std::vector<ExactReplacementMistakesWithObj>
+    get_all_exact_replacement_misclassifications_packed_trie(
+        const std::vector<std::vector<uint8_t>>& X_row_major,
+        const std::vector<int>& y_eval,
+        int budget_override = -1,
+
+        // Optional original-variable grouping.
+        // Example continuous variable:
+        //   variable_columns[j] = {threshold_col_0, threshold_col_1, ...}
+        const std::vector<std::vector<int>>& variable_columns_in = {},
+
+        const std::vector<int>& bb_pred_eval = {}
+    ) const {
+        if (!result) {
+            throw std::runtime_error(
+                "No Rashomon trie has been constructed. Call fit() first."
+            );
+        }
+
+        EvalCtx ctx =
+            build_eval_ctx_(
+                X_row_major,
+                this->n_features
+            );
+
+        if ((int)y_eval.size() != ctx.n_eval) {
+            throw std::runtime_error(
+                "Eval y has different number of rows than Eval X."
+            );
+        }
+
+        if (ctx.n_eval <= 0) {
+            return {};
+        }
+
+        const int budget =
+            (budget_override >= 0)
+                ? budget_override
+                : result->budget;
+
+        // --------------------------------------------------------
+        // Resolve original-variable -> internal-column grouping.
+        // No graph scan is done.
+        // --------------------------------------------------------
+        std::vector<std::vector<int>> variable_columns;
+
+        if (!variable_columns_in.empty()) {
+            variable_columns = variable_columns_in;
+        } else {
+            const int first_cont =
+                first_continuous_feature_();
+
+            // Ordinary binary variables.
+            for (int f = 0; f < first_cont; ++f) {
+                variable_columns.push_back({f});
+            }
+
+            // Each continuous threshold block is one variable.
+            for (int g = 0;
+                g < (int)continuous_starts.size();
+                ++g) {
+
+                const int start =
+                    continuous_starts[(size_t)g];
+
+                const int end =
+                    continuous_group_end_(g);
+
+                std::vector<int> cols;
+                cols.reserve((size_t)(end - start));
+
+                for (int f = start; f < end; ++f) {
+                    cols.push_back(f);
+                }
+
+                variable_columns.push_back(std::move(cols));
+            }
+        }
+
+        const int number_of_variables =
+            (int)variable_columns.size();
+
+        std::vector<int> internal_to_variable(
+            (size_t)this->n_features,
+            -1
+        );
+
+        for (int variable = 0;
+            variable < number_of_variables;
+            ++variable) {
+
+            const auto& cols =
+                variable_columns[(size_t)variable];
+
+            if (cols.empty()) {
+                throw std::runtime_error(
+                    "variable_columns contains an empty variable."
+                );
+            }
+
+            for (int f : cols) {
+                if (f < 0 || f >= this->n_features) {
+                    throw std::runtime_error(
+                        "variable_columns contains an out-of-range internal column."
+                    );
+                }
+
+                if (internal_to_variable[(size_t)f] != -1) {
+                    throw std::runtime_error(
+                        "An internal column appears in more than one variable."
+                    );
+                }
+
+                internal_to_variable[(size_t)f] =
+                    variable;
+            }
+        }
+
+        for (int f = 0; f < this->n_features; ++f) {
+            if (internal_to_variable[(size_t)f] < 0) {
+                throw std::runtime_error(
+                    "Every internal feature column must belong to exactly one variable."
+                );
+            }
+        }
+
+        Packed root_mask =
+            eval_root_mask_(
+                ctx.n_words,
+                ctx.tail_mask
+            );
+
+        std::vector<Packed> Y_eval_bits =
+            build_eval_y_bits_(
+                y_eval,
+                num_classes,
+                ctx.n_words,
+                ctx.tail_mask
+            );
+
+        Packed BBwrong_eval_storage((size_t)ctx.n_words);
+        const Packed* BBwrong_eval_ptr = nullptr;
+
+        if (use_deferral) {
+            if (bb_pred_eval.empty()) {
+                throw std::runtime_error(
+                    "Deferral was enabled during fit, so bb_pred_eval is required."
+                );
+            }
+
+            BBwrong_eval_storage =
+                build_eval_bb_wrong_bits_(
+                    y_eval,
+                    bb_pred_eval,
+                    num_classes,
+                    ctx.n_words,
+                    ctx.tail_mask
+                );
+
+            BBwrong_eval_ptr =
+                &BBwrong_eval_storage;
+        }
+
+        // Initially every target row is possible and every observed
+        // replacement value is possible for every variable.
+        std::vector<ExactReplacementState_> root_states(
+            (size_t)number_of_variables
+        );
+
+        for (int variable = 0;
+            variable < number_of_variables;
+            ++variable) {
+
+            root_states[(size_t)variable].target_rows =
+                Packed((size_t)ctx.n_words);
+
+            root_states[(size_t)variable].replacement_values =
+                Packed((size_t)ctx.n_words);
+
+            root_states[(size_t)variable].target_rows.w =
+                root_mask.w;
+
+            root_states[(size_t)variable].replacement_values.w =
+                root_mask.w;
+        }
+
+        auto buckets =
+            collect_exact_replacement_mistakes_by_obj_(
+                result.get(),
+                budget,
+                root_mask,
+                root_states,
+                internal_to_variable,
+                ctx,
+                Y_eval_bits,
+                BBwrong_eval_ptr
+            );
+
+        std::vector<ExactReplacementMistakesWithObj> out;
+
+        size_t total = 0;
+        for (const auto& b : buckets) {
+            total += b.counts.size();
+        }
+
+        out.reserve(total);
+
+        const double inv_n =
+            1.0 / (double)ctx.n_eval;
+
+        for (auto& b : buckets) {
+            for (auto& counts : b.counts) {
+                ExactReplacementMistakesWithObj row;
+                row.obj = b.obj;
+
+                row.mistakes.resize(
+                    (size_t)number_of_variables + 1,
+                    0.0
+                );
+
+                row.mistakes[0] =
+                    (double)counts.original_mistakes;
+
+                for (int variable = 0;
+                    variable < number_of_variables;
+                    ++variable) {
+
+                    row.mistakes[
+                        (size_t)variable + 1
+                    ] =
+                        (double)counts
+                            .replacement_weighted_mistakes[
+                                (size_t)variable
+                            ] *
+                        inv_n;
+                }
+
+                out.push_back(std::move(row));
+            }
+        }
+
+        return out;
+    }
+
 };

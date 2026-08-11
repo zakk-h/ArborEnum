@@ -2887,6 +2887,8 @@ class ArborEnum:
         lookahead_k=1,
         seed=0,
         memory_efficient=False,
+        key_mode="hash",
+        trie_cache_enabled=True,
         proxy_refinement="auto",
         refinement_width=1,
         max_refinement_rounds=-1,
@@ -2904,6 +2906,7 @@ class ArborEnum:
         eta_defer=0.0,
         bb_pred=None,
         return_joint_samples=False,
+        lossless=False,
     ):
 
         if hasattr(X, "columns"):
@@ -3098,6 +3101,8 @@ class ArborEnum:
             int(lookahead_k),
             int(seed),
             bool(memory_efficient),
+            parse_key_mode(key_mode),
+            bool(trie_cache_enabled),
             bool(early_stopping),
             int(refinement_width),
             int(max_refinement_rounds),
@@ -3120,6 +3125,7 @@ class ArborEnum:
             float(eta_defer),
             bb_pred_vec,
             bool(return_joint_samples),
+            bool(lossless),
         )
 
         if (
@@ -3149,11 +3155,14 @@ class ArborEnum:
         lookahead_k=1,
         seed=0,
         memory_efficient=False,
+        key_mode="hash",
+        trie_cache_enabled=True,
         binning_map=None,
         use_deferral=False,
         eta_defer=0.0,
         bb_pred=None,
         return_joint_samples=False,
+        lossless=False,
     ):
         X = np.asarray(X, dtype=np.uint8)
         y = np.asarray(y, dtype=int)
@@ -3212,11 +3221,14 @@ class ArborEnum:
             int(lookahead_k),
             int(seed),
             bool(memory_efficient),
+            parse_key_mode(key_mode),
+            bool(trie_cache_enabled),
             binning_map,
             bool(use_deferral),
             float(eta_defer),
             bb_pred_vec,
             bool(return_joint_samples),
+            bool(lossless),
         )
 
         if (
@@ -3251,6 +3263,8 @@ class ArborEnum:
         lookahead_k=1,
         seed=0,
         memory_efficient=False,
+        key_mode="hash",
+        trie_cache_enabled=True,
         use_anytime_fit=False,
         refinement_width=1,
         max_refinement_rounds=-1,
@@ -3273,6 +3287,7 @@ class ArborEnum:
         eta_defer=0.0,
         bb_pred=None,
         return_joint_samples=False,
+        lossless=False,
     ):
         X_num = np.asarray(X_num, dtype=np.float64)
         y = np.asarray(y, dtype=int)
@@ -3451,6 +3466,8 @@ class ArborEnum:
             int(lookahead_k),
             int(seed),
             bool(memory_efficient),
+            parse_key_mode(key_mode),
+            bool(trie_cache_enabled),
             bool(use_anytime_fit),
             int(refinement_width),
             int(max_refinement_rounds),
@@ -3475,6 +3492,7 @@ class ArborEnum:
             float(eta_defer),
             bb_pred_vec,
             bool(return_joint_samples),
+            bool(lossless),
         )
 
         if (

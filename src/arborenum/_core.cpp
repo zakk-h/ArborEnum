@@ -1722,6 +1722,8 @@ PYBIND11_MODULE(_core, m) {
             int lookahead_k,
             std::uint64_t seed,
             bool memory_efficient,
+            std::string key_mode,
+            bool trie_cache_enabled,
             py::object binning_map_obj,
             bool use_deferral,
             double eta_defer,
@@ -1729,7 +1731,8 @@ PYBIND11_MODULE(_core, m) {
                 int,
                 py::array::c_style | py::array::forcecast
             > bb_pred,
-            bool return_joint_samples
+            bool return_joint_samples,
+            bool lossless
         ) {
             py::buffer_info xinfo = X.request();
             py::buffer_info yinfo = y.request();
@@ -1845,6 +1848,8 @@ PYBIND11_MODULE(_core, m) {
                     lookahead_k,
                     seed,
                     memory_efficient,
+                    parse_key_mode(key_mode),
+                    trie_cache_enabled,
                     groups,
                     {},      // continuous_starts
                     false,   // use_anytime_fit
@@ -1871,7 +1876,8 @@ PYBIND11_MODULE(_core, m) {
                     use_deferral,
                     eta_defer,
                     bb_pred_vec,
-                    return_joint_samples
+                    return_joint_samples,
+                    lossless
                 );
 
             py::dict out;
@@ -1896,11 +1902,14 @@ PYBIND11_MODULE(_core, m) {
         py::arg("lookahead_k") = 1,
         py::arg("seed") = 0,
         py::arg("memory_efficient") = false,
+        py::arg("key_mode") = "hash",
+        py::arg("trie_cache_enabled") = true,
         py::arg("binning_map") = py::none(),
         py::arg("use_deferral") = false,
         py::arg("eta_defer") = 0.0,
         py::arg("bb_pred") = py::array_t<int>(0),
-        py::arg("return_joint_samples") = false
+        py::arg("return_joint_samples") = false,
+        py::arg("lossless") = false
     );
 
     m.def(
@@ -1941,6 +1950,8 @@ PYBIND11_MODULE(_core, m) {
             int lookahead_k,
             std::uint64_t seed,
             bool memory_efficient,
+            std::string key_mode,
+            bool trie_cache_enabled,
             bool use_anytime_fit,
             int refinement_width,
             int max_refinement_rounds,
@@ -1966,7 +1977,8 @@ PYBIND11_MODULE(_core, m) {
                 py::array::c_style |
                 py::array::forcecast
             > bb_pred,
-            bool return_joint_samples
+            bool return_joint_samples,
+            bool lossless
         ) {
             py::buffer_info num_info =
                 X_num.request();
@@ -2533,6 +2545,8 @@ PYBIND11_MODULE(_core, m) {
                     lookahead_k,
                     seed,
                     memory_efficient,
+                    parse_key_mode(key_mode),
+                    trie_cache_enabled,
                     groups,
                     continuous_starts,
                     use_anytime_fit,
@@ -2559,7 +2573,8 @@ PYBIND11_MODULE(_core, m) {
                     use_deferral,
                     eta_defer,
                     bb_pred_vec,
-                    return_joint_samples
+                    return_joint_samples,
+                    lossless
                 );
 
             py::dict out;
@@ -2607,6 +2622,8 @@ PYBIND11_MODULE(_core, m) {
         py::arg("lookahead_k") = 1,
         py::arg("seed") = 0,
         py::arg("memory_efficient") = false,
+        py::arg("key_mode") = "hash",
+        py::arg("trie_cache_enabled") = true,
         py::arg("use_anytime_fit") = false,
         py::arg("refinement_width") = 1,
         py::arg("max_refinement_rounds") = -1,
@@ -2628,7 +2645,8 @@ PYBIND11_MODULE(_core, m) {
         py::arg("use_deferral") = false,
         py::arg("eta_defer") = 0.0,
         py::arg("bb_pred") = py::array_t<int>(0),
-        py::arg("return_joint_samples") = false
+        py::arg("return_joint_samples") = false,
+        py::arg("lossless") = false
     );
 
     

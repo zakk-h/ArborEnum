@@ -8,6 +8,8 @@
 #include <random>
 #include <stdexcept>
 #include <vector>
+#include <chrono>
+#include <iomanip>
 
 using std::cout;
 
@@ -194,6 +196,8 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
     int lookahead_k,
     uint64_t seed,
     bool memory_efficient,
+    ArborEnum::KeyMode key_mode = ArborEnum::KeyMode::HASH64,
+    bool trie_cache_enabled = true,
     const std::vector<std::vector<int>>& binning_map_vars = {},
     const std::vector<int>& continuous_starts = {},
     bool use_anytime_fit = false,
@@ -220,7 +224,8 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
     bool use_deferral = false,
     double eta_defer = 0.0,
     const std::vector<int>& bb_pred = {},
-    bool return_joint_samples = false
+    bool return_joint_samples = false,
+    bool lossless = false
 ) {
     // retained for API compatibility. both modes now use the scalar packed-trie
     // extractors, which are substantially more memory efficient than storing
@@ -351,7 +356,8 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
 
     const int number_of_variables = (int)variable_columns.size();
 
-    std::mt19937_64 rng(seed);
+    std::mt19937_64 bootstrap_rng(seed);
+    std::mt19937_64 scramble_rng(seed ^ 0x9E3779B97F4A7C15ULL);
 
     RIDResult output;
     output.mean_sub_mr.assign((std::size_t)number_of_variables, 0.0);
@@ -365,8 +371,11 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
     );
 
     for (int bootstrap = 0; bootstrap < n_bootstraps; ++bootstrap) {
+
+        const auto bootstrap_start = std::chrono::steady_clock::now();
+
         std::vector<int> bootstrap_idx;
-        bootstrap_indices(n_full, rng, bootstrap_idx);
+        bootstrap_indices(n_full, bootstrap_rng, bootstrap_idx);
 
         std::vector<std::vector<uint8_t>> X_bootstrap;
         std::vector<int> y_bootstrap;
@@ -394,6 +403,8 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
         rowmajor_to_colmajor_bool(X_bootstrap, X_col_major);
 
         ArborEnum model;
+        model.set_key_mode(key_mode);
+        model.set_trie_cache_enabled(trie_cache_enabled);
         model.set_greedy_split_mode(greedy_split_mode);
         model.set_greedy_continuous_mode(greedy_continuous_mode);
 
@@ -411,6 +422,7 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
             );
         }
 
+        const auto training_start = std::chrono::steady_clock::now();
         if (use_anytime_fit) {
             model.fit_anytime(
                 X_col_major,
@@ -474,6 +486,20 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
             continue;
         }
 
+        const auto training_end = std::chrono::steady_clock::now();
+
+        const double training_seconds =
+            std::chrono::duration<double>(
+                training_end - training_start
+            ).count();
+
+        cout << std::fixed << std::setprecision(3)
+            << "RID bootstrap " << (bootstrap + 1)
+            << ": Rashomon training = "
+            << training_seconds << " s\n";
+
+        const auto post_training_start = std::chrono::steady_clock::now();
+
         // the first epsilon off of min objective, refinement just boosts approximation quality
         const int budget_override = std::min(
             model.result->budget,
@@ -483,6 +509,163 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
             ))
         );
 
+        // lossless permutation importance: compute the exact expected replacement mistakes for
+        // every variable and every tree in one packed graph traversal.
+        if (lossless) {
+            if (use_deferral) {
+                throw std::runtime_error(
+                    "lossless RID currently supports use_deferral=false only."
+                );
+            }
+
+            const auto exact_start =
+                std::chrono::steady_clock::now();
+
+            auto exact =
+                model.get_all_exact_replacement_misclassifications_packed_trie(
+                    X_bootstrap,
+                    y_bootstrap,
+                    budget_override,
+                    variable_columns
+                );
+
+            const uint64_t number_of_trees =
+                static_cast<uint64_t>(exact.size());
+
+            if (number_of_trees == 0) {
+                continue;
+            }
+
+            cout << "Finished RID bootstrap: "
+                 << (bootstrap + 1)
+                 << " / "
+                 << n_bootstraps
+                 << " with "
+                 << number_of_trees
+                 << " trees\n";
+
+            const double tree_weight =
+                1.0 /
+                ((double)n_bootstraps * (double)number_of_trees);
+
+            std::size_t joint_sample_offset = 0;
+
+            if (return_joint_samples) {
+                joint_sample_offset =
+                    output.feature_importance_weight_samples.size();
+
+                output.feature_importance_weight_samples.resize(
+                    joint_sample_offset + (std::size_t)number_of_trees,
+                    std::vector<double>(
+                        (std::size_t)number_of_variables + 1,
+                        0.0
+                    )
+                );
+
+                for (uint64_t tree = 0;
+                     tree < number_of_trees;
+                     ++tree) {
+                    output.feature_importance_weight_samples[
+                        joint_sample_offset + (std::size_t)tree
+                    ][(std::size_t)number_of_variables] = tree_weight;
+                }
+            }
+
+            for (uint64_t tree = 0;
+                 tree < number_of_trees;
+                 ++tree) {
+
+                const auto& row = exact[(std::size_t)tree];
+
+                if (
+                    row.mistakes.size() !=
+                    (std::size_t)number_of_variables + 1
+                ) {
+                    throw std::runtime_error(
+                        "Lossless RID returned the wrong number of "
+                        "mistake columns."
+                    );
+                }
+
+                const double original_mistakes =
+                    row.mistakes[0];
+
+                for (int variable = 0;
+                     variable < number_of_variables;
+                     ++variable) {
+
+                    const double importance =
+                        (
+                            row.mistakes[
+                                (std::size_t)variable + 1
+                            ]
+                            - original_mistakes
+                        )
+                        / (double)n;
+
+                    output.mean_sub_mr[
+                        (std::size_t)variable
+                    ] +=
+                        tree_weight * importance;
+
+                    mass_by_importance[
+                        (std::size_t)variable
+                    ][importance] +=
+                        tree_weight;
+
+                    if (return_joint_samples) {
+                        output.feature_importance_weight_samples[
+                            joint_sample_offset +
+                            (std::size_t)tree
+                        ][
+                            (std::size_t)variable
+                        ] = importance;
+                    }
+                }
+            }
+
+            const auto exact_end =
+                std::chrono::steady_clock::now();
+
+            const double exact_seconds =
+                std::chrono::duration<double>(
+                    exact_end - exact_start
+                ).count();
+
+            const auto bootstrap_end =
+                std::chrono::steady_clock::now();
+
+            const double post_training_seconds =
+                std::chrono::duration<double>(
+                    bootstrap_end - post_training_start
+                ).count();
+
+            const double bootstrap_seconds =
+                std::chrono::duration<double>(
+                    bootstrap_end - bootstrap_start
+                ).count();
+
+            cout << std::fixed << std::setprecision(3)
+                 << "RID bootstrap " << (bootstrap + 1)
+                 << ": LOSSLESS feature evaluation = "
+                 << exact_seconds << " s\n"
+                 << "RID bootstrap " << (bootstrap + 1)
+                 << ": post-training RID = "
+                 << post_training_seconds << " s\n"
+                 << "RID bootstrap " << (bootstrap + 1)
+                 << ": total = "
+                 << bootstrap_seconds << " s\n"
+                 << "RID bootstrap " << (bootstrap + 1)
+                 << ": training fraction = "
+                 << (100.0 * training_seconds / bootstrap_seconds)
+                 << "%, post-training fraction = "
+                 << (100.0 * post_training_seconds / bootstrap_seconds)
+                 << "%\n";
+
+            continue;
+        }
+
+        // legacy Monte Carlo RID path.
         std::vector<int> original_misclassifications;
 
         if (use_deferral) {
@@ -579,130 +762,157 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
             }
         }
 
-        // reuse these buffers across every variable and scramble.
-        std::vector<std::vector<uint8_t>> saved_columns;
-        std::vector<int> permutation;
 
-        for (int variable = 0;
-             variable < number_of_variables;
-             ++variable) {
-            const std::vector<int>& columns =
-                variable_columns[(std::size_t)variable];
+            // reuse these buffers across every variable and scramble.
+            std::vector<std::vector<uint8_t>> saved_columns;
+            std::vector<int> permutation;
 
-            // O(number_of_trees) memory, independent of n_scramble_evals.
-            std::vector<int64_t> summed_objective_differences(
-                (std::size_t)number_of_trees,
-                0
-            );
+            for (int variable = 0;
+                variable < number_of_variables;
+                ++variable) {
+                const std::vector<int>& columns =
+                    variable_columns[(std::size_t)variable];
 
-            for (int scramble = 0;
-                 scramble < n_scramble_evals;
-                 ++scramble) {
-                make_permutation(n, rng, permutation);
-
-                scramble_block_inplace(
-                    X_bootstrap,
-                    columns,
-                    permutation,
-                    saved_columns
+                // O(number_of_trees) memory, independent of n_scramble_evals.
+                std::vector<int64_t> summed_objective_differences(
+                    (std::size_t)number_of_trees,
+                    0
                 );
 
-                std::vector<int> scrambled_misclassifications;
+                for (int scramble = 0;
+                    scramble < n_scramble_evals;
+                    ++scramble) {
+                    make_permutation(n, scramble_rng, permutation);
 
-                if (use_deferral) {
-                    scrambled_misclassifications =
-                        model.get_all_misclassifications_packed_trie(
-                            X_bootstrap,
-                            y_bootstrap,
-                            budget_override,
-                            bb_pred_bootstrap
-                        );
-                } else {
-                    scrambled_misclassifications =
-                        model.get_all_misclassifications_packed_trie(
-                            X_bootstrap,
-                            y_bootstrap,
-                            budget_override
-                        );
-                }
+                    scramble_block_inplace(
+                        X_bootstrap,
+                        columns,
+                        permutation,
+                        saved_columns
+                    );
 
-                std::vector<int> scrambled_deferrals;
+                    std::vector<int> scrambled_misclassifications;
 
-                if (use_deferral) {
-                    scrambled_deferrals =
-                        model.get_all_deferrals_packed_trie(
-                            X_bootstrap,
-                            budget_override
-                        );
+                    if (use_deferral) {
+                        scrambled_misclassifications =
+                            model.get_all_misclassifications_packed_trie(
+                                X_bootstrap,
+                                y_bootstrap,
+                                budget_override,
+                                bb_pred_bootstrap
+                            );
+                    } else {
+                        scrambled_misclassifications =
+                            model.get_all_misclassifications_packed_trie(
+                                X_bootstrap,
+                                y_bootstrap,
+                                budget_override
+                            );
+                    }
 
-                    if (scrambled_deferrals.size() !=
-                        scrambled_misclassifications.size()) {
+                    std::vector<int> scrambled_deferrals;
+
+                    if (use_deferral) {
+                        scrambled_deferrals =
+                            model.get_all_deferrals_packed_trie(
+                                X_bootstrap,
+                                budget_override
+                            );
+
+                        if (scrambled_deferrals.size() !=
+                            scrambled_misclassifications.size()) {
+                            throw std::runtime_error(
+                                "RID deferral extraction returned different "
+                                "numbers of scrambled misclassification and "
+                                "deferral entries."
+                            );
+                        }
+                    }
+
+                    if ((uint64_t)scrambled_misclassifications.size() !=
+                        number_of_trees) {
                         throw std::runtime_error(
-                            "RID deferral extraction returned different "
-                            "numbers of scrambled misclassification and "
-                            "deferral entries."
+                            "RID scalar extraction returned a different tree "
+                            "count after scrambling. The original and scrambled "
+                            "collectors must use identical traversal order."
                         );
                     }
-                }
 
-                if ((uint64_t)scrambled_misclassifications.size() !=
-                    number_of_trees) {
-                    throw std::runtime_error(
-                        "RID scalar extraction returned a different tree "
-                        "count after scrambling. The original and scrambled "
-                        "collectors must use identical traversal order."
+                    for (uint64_t tree = 0;
+                        tree < number_of_trees;
+                        ++tree) {
+                        const int deferrals = use_deferral
+                            ? scrambled_deferrals[(std::size_t)tree]
+                            : 0;
+
+                        const int scrambled_eval_objective =
+                            rid_eval_objective_from_mis_def(
+                                scrambled_misclassifications[(std::size_t)tree],
+                                deferrals,
+                                use_deferral,
+                                eta_defer
+                            );
+
+                        summed_objective_differences[(std::size_t)tree] +=
+                            (int64_t)scrambled_eval_objective
+                            - (int64_t)original_eval_objectives
+                                [(std::size_t)tree];
+                    }
+
+                    restore_block_inplace(
+                        X_bootstrap,
+                        columns,
+                        saved_columns
                     );
                 }
 
                 for (uint64_t tree = 0;
-                     tree < number_of_trees;
-                     ++tree) {
-                    const int deferrals = use_deferral
-                        ? scrambled_deferrals[(std::size_t)tree]
-                        : 0;
+                    tree < number_of_trees;
+                    ++tree) {
+                    const double importance =
+                        (double)summed_objective_differences[(std::size_t)tree]
+                        /
+                        ((double)n * (double)n_scramble_evals);
 
-                    const int scrambled_eval_objective =
-                        rid_eval_objective_from_mis_def(
-                            scrambled_misclassifications[(std::size_t)tree],
-                            deferrals,
-                            use_deferral,
-                            eta_defer
-                        );
+                    output.mean_sub_mr[(std::size_t)variable] +=
+                        tree_weight * importance;
 
-                    summed_objective_differences[(std::size_t)tree] +=
-                        (int64_t)scrambled_eval_objective
-                        - (int64_t)original_eval_objectives
-                            [(std::size_t)tree];
-                }
+                    mass_by_importance[(std::size_t)variable][importance] +=
+                        tree_weight;
 
-                restore_block_inplace(
-                    X_bootstrap,
-                    columns,
-                    saved_columns
-                );
-            }
-
-            for (uint64_t tree = 0;
-                 tree < number_of_trees;
-                 ++tree) {
-                const double importance =
-                    (double)summed_objective_differences[(std::size_t)tree]
-                    /
-                    ((double)n * (double)n_scramble_evals);
-
-                output.mean_sub_mr[(std::size_t)variable] +=
-                    tree_weight * importance;
-
-                mass_by_importance[(std::size_t)variable][importance] +=
-                    tree_weight;
-
-                if (return_joint_samples) {
-                    output.feature_importance_weight_samples[
-                        joint_sample_offset + (std::size_t)tree
-                    ][(std::size_t)variable] = importance;
+                    if (return_joint_samples) {
+                        output.feature_importance_weight_samples[
+                            joint_sample_offset + (std::size_t)tree
+                        ][(std::size_t)variable] = importance;
+                    }
                 }
             }
-        }
+
+        const auto bootstrap_end = std::chrono::steady_clock::now();
+
+        const double post_training_seconds =
+            std::chrono::duration<double>(
+                bootstrap_end - post_training_start
+            ).count();
+
+        const double bootstrap_seconds =
+            std::chrono::duration<double>(
+                bootstrap_end - bootstrap_start
+            ).count();
+
+        cout << std::fixed << std::setprecision(3)
+            << "RID bootstrap " << (bootstrap + 1)
+            << ": post-training RID = "
+            << post_training_seconds << " s\n"
+            << "RID bootstrap " << (bootstrap + 1)
+            << ": total = "
+            << bootstrap_seconds << " s\n"
+            << "RID bootstrap " << (bootstrap + 1)
+            << ": training fraction = "
+            << (100.0 * training_seconds / bootstrap_seconds)
+            << "%, post-training fraction = "
+            << (100.0 * post_training_seconds / bootstrap_seconds)
+            << "%\n";
     }
 
     for (int variable = 0;
