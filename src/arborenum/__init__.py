@@ -2906,7 +2906,7 @@ class ArborEnum:
         eta_defer=0.0,
         bb_pred=None,
         return_joint_samples=False,
-        lossless=False,
+        lossless=True,
     ):
 
         if hasattr(X, "columns"):
@@ -3162,7 +3162,7 @@ class ArborEnum:
         eta_defer=0.0,
         bb_pred=None,
         return_joint_samples=False,
-        lossless=False,
+        lossless=True,
     ):
         X = np.asarray(X, dtype=np.uint8)
         y = np.asarray(y, dtype=int)
@@ -3287,7 +3287,7 @@ class ArborEnum:
         eta_defer=0.0,
         bb_pred=None,
         return_joint_samples=False,
-        lossless=False,
+        lossless=True,
     ):
         X_num = np.asarray(X_num, dtype=np.float64)
         y = np.asarray(y, dtype=int)
