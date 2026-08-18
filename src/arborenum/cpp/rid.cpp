@@ -107,6 +107,33 @@ static inline void make_permutation(
     std::shuffle(permutation.begin(), permutation.end(), rng);
 }
 
+static inline void make_groupwise_permutation(
+    int n,
+    const std::vector<std::vector<int>>& groups,
+    std::mt19937_64& rng,
+    std::vector<int>& permutation,
+    std::vector<int>& scratch
+) {
+    permutation.resize((std::size_t)n);
+
+    for (int i = 0; i < n; ++i) {
+        permutation[(std::size_t)i] = i;
+    }
+
+    for (const auto& group : groups) {
+        scratch.assign(group.begin(), group.end());
+        std::shuffle(scratch.begin(), scratch.end(), rng);
+
+        for (std::size_t t = 0; t < group.size(); ++t) {
+            const int target_row = group[t];
+            const int replacement_row = scratch[t];
+
+            permutation[(std::size_t)target_row] =
+                replacement_row;
+        }
+    }
+}
+
 // scramble one original variable represented by one or more binary columns.
 // every column in the block receives the same row permutation, preserving the
 // internal consistency of a threshold-binarized continuous variable.
@@ -225,7 +252,9 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
     double eta_defer = 0.0,
     const std::vector<int>& bb_pred = {},
     bool return_joint_samples = false,
-    bool lossless = false
+    bool lossless = false,
+    const std::vector<std::vector<std::vector<int>>>&
+        matched_groups_by_variable = {}
 ) {
     // retained for API compatibility. both modes now use the scalar packed-trie
     // extractors, which are substantially more memory efficient than storing
@@ -354,8 +383,100 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
         }
     }
 
-    const int number_of_variables = (int)variable_columns.size();
+    const int number_of_variables =
+        (int)variable_columns.size();
 
+    const bool use_matched_groups =
+        !matched_groups_by_variable.empty();
+
+    std::vector<std::vector<int>>
+        original_group_id_by_variable;
+
+    if (use_matched_groups) {
+        if (
+            (int)matched_groups_by_variable.size() !=
+            number_of_variables
+        ) {
+            throw std::runtime_error(
+                "matched_groups_by_variable must contain exactly "
+                "one matched-group partition per RID variable."
+            );
+        }
+
+        original_group_id_by_variable.assign(
+            (std::size_t)number_of_variables,
+            std::vector<int>(
+                (std::size_t)n_full,
+                -1
+            )
+        );
+
+        for (int variable = 0;
+            variable < number_of_variables;
+            ++variable) {
+
+            const auto& groups =
+                matched_groups_by_variable[
+                    (std::size_t)variable
+                ];
+
+            if (groups.empty()) {
+                throw std::runtime_error(
+                    "Each RID variable must have a nonempty "
+                    "matched-group partition."
+                );
+            }
+
+            auto& group_ids =
+                original_group_id_by_variable[
+                    (std::size_t)variable
+                ];
+
+            for (std::size_t group_index = 0;
+                group_index < groups.size();
+                ++group_index) {
+
+                const auto& group = groups[group_index];
+
+                if (group.empty()) {
+                    throw std::runtime_error(
+                        "matched_groups_by_variable contains "
+                        "an empty group."
+                    );
+                }
+
+                for (int row : group) {
+                    if (row < 0 || row >= n_full) {
+                        throw std::runtime_error(
+                            "matched_groups_by_variable contains "
+                            "an out-of-range row index."
+                        );
+                    }
+
+                    if (group_ids[(std::size_t)row] != -1) {
+                        throw std::runtime_error(
+                            "A variable's matched groups are not "
+                            "disjoint."
+                        );
+                    }
+
+                    group_ids[(std::size_t)row] =
+                        static_cast<int>(group_index);
+                }
+            }
+
+            for (int row = 0; row < n_full; ++row) {
+                if (group_ids[(std::size_t)row] == -1) {
+                    throw std::runtime_error(
+                        "Each variable's matched groups must "
+                        "partition every row."
+                    );
+                }
+            }
+        }
+    }
+
+        
     std::mt19937_64 bootstrap_rng(seed);
     std::mt19937_64 scramble_rng(seed ^ 0x9E3779B97F4A7C15ULL);
 
@@ -399,6 +520,75 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
 
         const int n = (int)X_bootstrap.size();
 
+        // bootstrap row i came from original row bootstrap_idx[i],
+        // so it inherits that original row's matched group.
+        // groups absent from this bootstrap are simply removed.
+
+        std::vector<std::vector<std::vector<int>>>
+        matched_groups_bootstrap_by_variable;
+
+        if (use_matched_groups) {
+            matched_groups_bootstrap_by_variable.resize(
+                (std::size_t)number_of_variables
+            );
+
+            for (int variable = 0;
+                variable < number_of_variables;
+                ++variable) {
+
+                const auto& original_groups =
+                    matched_groups_by_variable[
+                        (std::size_t)variable
+                    ];
+
+                auto& bootstrap_groups =
+                    matched_groups_bootstrap_by_variable[
+                        (std::size_t)variable
+                    ];
+
+                bootstrap_groups.assign(
+                    original_groups.size(),
+                    {}
+                );
+
+                const auto& group_ids =
+                    original_group_id_by_variable[
+                        (std::size_t)variable
+                    ];
+
+                for (int bootstrap_row = 0;
+                    bootstrap_row < n;
+                    ++bootstrap_row) {
+
+                    const int original_row =
+                        bootstrap_idx[
+                            (std::size_t)bootstrap_row
+                        ];
+
+                    const int group =
+                        group_ids[
+                            (std::size_t)original_row
+                        ];
+
+                    bootstrap_groups[
+                        (std::size_t)group
+                    ].push_back(bootstrap_row);
+                }
+
+                bootstrap_groups.erase(
+                    std::remove_if(
+                        bootstrap_groups.begin(),
+                        bootstrap_groups.end(),
+                        [](const std::vector<int>& group) {
+                            return group.empty();
+                        }
+                    ),
+                    bootstrap_groups.end()
+                );
+            }
+        }
+                
+        
         std::vector<std::vector<bool>> X_col_major;
         rowmajor_to_colmajor_bool(X_bootstrap, X_col_major);
 
@@ -526,7 +716,9 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
                     X_bootstrap,
                     y_bootstrap,
                     budget_override,
-                    variable_columns
+                    variable_columns,
+                    {},
+                    matched_groups_bootstrap_by_variable
                 );
 
             const uint64_t number_of_trees =
@@ -766,6 +958,7 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
             // reuse these buffers across every variable and scramble.
             std::vector<std::vector<uint8_t>> saved_columns;
             std::vector<int> permutation;
+            std::vector<int> group_permutation_scratch;
 
             for (int variable = 0;
                 variable < number_of_variables;
@@ -782,8 +975,24 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
                 for (int scramble = 0;
                     scramble < n_scramble_evals;
                     ++scramble) {
-                    make_permutation(n, scramble_rng, permutation);
-
+                    if (use_matched_groups) {
+                        make_groupwise_permutation(
+                            n,
+                            matched_groups_bootstrap_by_variable[
+                                (std::size_t)variable
+                            ],
+                            scramble_rng,
+                            permutation,
+                            group_permutation_scratch
+                        );
+                    } else {
+                        make_permutation(
+                            n,
+                            scramble_rng,
+                            permutation
+                        );
+                    }
+                    
                     scramble_block_inplace(
                         X_bootstrap,
                         columns,

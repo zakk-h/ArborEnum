@@ -574,6 +574,81 @@ def _prepare_bb_pred(
 
     return bb_pred_vec
 
+def _prepare_matched_groups_by_variable(
+    matched_groups_by_variable,
+    n_rows,
+    n_variables,
+):
+    if matched_groups_by_variable is None:
+        return []
+
+    partitions = list(matched_groups_by_variable)
+
+    # empty outer list means ordinary permutation importance.
+    if len(partitions) == 0:
+        return []
+
+    if len(partitions) != int(n_variables):
+        raise ValueError(
+            "matched_groups_by_variable must contain exactly one "
+            f"partition per variable: expected {n_variables}, "
+            f"got {len(partitions)}."
+        )
+
+    out = []
+
+    for variable_index, variable_groups in enumerate(partitions):
+        variable_groups = list(variable_groups)
+
+        if len(variable_groups) == 0:
+            raise ValueError(
+                f"matched_groups_by_variable[{variable_index}] "
+                "contains no groups."
+            )
+
+        seen = np.zeros(int(n_rows), dtype=bool)
+        groups = []
+
+        for group_index, group in enumerate(variable_groups):
+            rows = [int(row) for row in group]
+
+            if len(rows) == 0:
+                raise ValueError(
+                    "matched_groups_by_variable"
+                    f"[{variable_index}][{group_index}] is empty."
+                )
+
+            for row in rows:
+                if row < 0 or row >= n_rows:
+                    raise ValueError(
+                        "matched_groups_by_variable contains row "
+                        f"{row}, but valid row indices are "
+                        f"[0, {n_rows - 1}]."
+                    )
+
+                if seen[row]:
+                    raise ValueError(
+                        f"Row {row} appears in more than one matched "
+                        f"group for variable {variable_index}."
+                    )
+
+                seen[row] = True
+
+            groups.append(rows)
+
+        if not np.all(seen):
+            missing = np.flatnonzero(~seen)
+
+            raise ValueError(
+                f"Matched groups for variable {variable_index} must "
+                "partition all rows. Missing rows: "
+                f"{missing.tolist()}"
+            )
+
+        out.append(groups)
+
+    return out
+
 class ArborEnum:
     def __init__(self):
         self._model = _ArborEnumCore()
@@ -671,6 +746,15 @@ class ArborEnum:
 
         n = X_original.shape[0]
 
+        self.root_n_ = int(n)
+        self.lambda_reg_ = float(lambda_reg)
+        self.gamma_ = int(round(float(lambda_reg) * int(n)))
+        self.depth_budget_ = int(depth_budget)
+        self.rashomon_mult_ = float(rashomon_mult)
+        self.multiplicative_slack_ = float(multiplicative_slack)
+        self.lookahead_k_ = int(lookahead_k)
+        self.eta_defer_ = float(eta_defer)
+
         if X_initial is None:
             if early_stopping and X_num.shape[1] > 0:
                 if proxy_settings["mode"] == "binarized":
@@ -751,13 +835,6 @@ class ArborEnum:
                 use_deferral=use_deferral,
                 eta_defer=eta_defer,
             )
-
-        self.lambda_reg_ = float(lambda_reg)
-        self.depth_budget_ = int(depth_budget)
-        self.rashomon_mult_ = float(rashomon_mult)
-        self.multiplicative_slack_ = float(multiplicative_slack)
-        self.lookahead_k_ = int(lookahead_k)
-        self.eta_defer_ = float(eta_defer)
 
         return self.fit_prepared(
             lambda_reg=lambda_reg,
@@ -923,6 +1000,202 @@ class ArborEnum:
             bool(use_deferral),
             float(eta_defer),
             bb_pred_vec,
+        )
+
+        return self
+
+
+    def fit_binarized_repeated_subsamples(
+        self,
+        X,
+        y,
+        *,
+        lambda_reg=0.01,
+        depth_budget=5,
+        rashomon_mult=0.01,
+        multiplicative_slack=0.0,
+        key_mode="hash",
+        lookahead_k=1,
+        proxy_style=0,
+        use_budget_refinement=True,
+        guarantee_rule_list_recovery=False,
+        majority_leaf_only=False,
+        cache_early_exits=False,
+        heuristic_for_greedy=1,
+        greedy_continuous_mode="binary",
+        proxy_caching=True,
+        allowed_proxy_features=None,
+        restrict_proxy_in_lickety=False,
+        restrict_proxy_in_depthd_exact=False,
+        restrict_proxy_in_greedy=False,
+        continuous_starts=None,
+        trie_cache_enabled=True,
+        stronger_rollout=False,
+        use_deferral=False,
+        eta_defer=0.0,
+        bb_pred=None,
+        subsample_fraction=0.8,
+        num_subsamples=50,
+        seed=0,
+        reuse_caches_between_subsamples=False,
+    ):
+        X = np.asarray(X, dtype=np.uint8)
+        y = np.asarray(y, dtype=int)
+
+        if X.ndim != 2:
+            raise ValueError(
+                f"X must be 2D, got shape {X.shape}"
+            )
+
+        if y.ndim != 1:
+            raise ValueError(
+                f"y must be 1D, got shape {y.shape}"
+            )
+
+        if y.shape[0] != X.shape[0]:
+            raise ValueError(
+                "y length must match X rows: "
+                f"got {y.shape[0]} vs {X.shape[0]}"
+            )
+
+        subsample_fraction = float(subsample_fraction)
+
+        if (
+            not np.isfinite(subsample_fraction)
+            or subsample_fraction <= 0.0
+            or subsample_fraction > 1.0
+        ):
+            raise ValueError(
+                "subsample_fraction must lie in (0, 1]."
+            )
+
+        num_subsamples = int(num_subsamples)
+
+        if num_subsamples <= 0:
+            raise ValueError(
+                "num_subsamples must be positive."
+            )
+
+        seed = int(seed)
+
+        if seed < 0 or seed > (2**64 - 1):
+            raise ValueError(
+                "seed must lie in [0, 2**64 - 1]."
+            )
+
+        eta_defer = float(eta_defer)
+
+        if not np.isfinite(eta_defer) or eta_defer < 0.0:
+            raise ValueError(
+                "eta_defer must be finite and nonnegative."
+            )
+
+        bb_pred_vec = _prepare_bb_pred(
+            bb_pred,
+            X.shape[0],
+            use_deferral=bool(use_deferral),
+        )
+
+        n_features = X.shape[1]
+
+        if continuous_starts is None:
+            continuous_starts_vec = []
+        else:
+            continuous_starts_vec = sorted(
+                set(int(v) for v in continuous_starts)
+            )
+
+            bad = [
+                v
+                for v in continuous_starts_vec
+                if v < 0 or v >= n_features
+            ]
+
+            if bad:
+                raise ValueError(
+                    "continuous_starts contains invalid feature "
+                    f"indices {bad}; valid range is "
+                    f"[0, {n_features - 1}]"
+                )
+
+        if allowed_proxy_features is None:
+            allowed_proxy_features_vec = []
+        else:
+            allowed_proxy_features_vec = sorted(
+                set(int(v) for v in allowed_proxy_features)
+            )
+
+            bad = [
+                v
+                for v in allowed_proxy_features_vec
+                if v < 0 or v >= n_features
+            ]
+
+            if bad:
+                raise ValueError(
+                    "allowed_proxy_features contains invalid feature "
+                    f"indices {bad}; valid range is "
+                    f"[0, {n_features - 1}]"
+                )
+
+        proxy_style_int = parse_proxy_style(proxy_style)
+
+        greedy_heur_int = parse_heuristic_for_greedy(
+            heuristic_for_greedy
+        )
+
+        greedy_cont_mode = parse_greedy_continuous_mode(
+            greedy_continuous_mode
+        )
+
+        key_mode_parsed = parse_key_mode(key_mode)
+
+        if (
+            reuse_caches_between_subsamples
+            and not trie_cache_enabled
+        ):
+            raise ValueError(
+                "trie_cache_enabled must be True when "
+                "reuse_caches_between_subsamples=True if you want "
+                "the full cache-reuse experiment."
+            )
+
+        cumulative_times = self._model.fit_repeated_subsamples(
+            X,
+            y,
+            float(lambda_reg),
+            int(depth_budget),
+            float(rashomon_mult),
+            float(multiplicative_slack),
+            key_mode_parsed,
+            bool(trie_cache_enabled),
+            int(lookahead_k),
+            bool(use_budget_refinement),
+            bool(guarantee_rule_list_recovery),
+            int(proxy_style_int),
+            bool(majority_leaf_only),
+            bool(cache_early_exits),
+            int(greedy_heur_int),
+            greedy_cont_mode,
+            bool(proxy_caching),
+            allowed_proxy_features_vec,
+            bool(restrict_proxy_in_lickety),
+            bool(restrict_proxy_in_depthd_exact),
+            bool(restrict_proxy_in_greedy),
+            continuous_starts_vec,
+            float(subsample_fraction),
+            int(num_subsamples),
+            int(seed),
+            bool(reuse_caches_between_subsamples),
+            bool(stronger_rollout),
+            bool(use_deferral),
+            float(eta_defer),
+            bb_pred_vec,
+        )
+
+        self.subsample_cumulative_times_ = np.asarray(
+            cumulative_times,
+            dtype=float,
         )
 
         return self
@@ -1467,6 +1740,116 @@ class ArborEnum:
             bool(stronger_rollout),
             bool(use_deferral),
             float(eta_defer),
+        )
+
+        return self
+
+    def fit_prepared_repeated_subsamples(
+        self,
+        *,
+        lambda_reg=0.01,
+        depth_budget=5,
+        rashomon_mult=0.01,
+        multiplicative_slack=0.0,
+        key_mode="hash",
+        lookahead_k=1,
+        proxy_style=0,
+        use_budget_refinement=True,
+        guarantee_rule_list_recovery=False,
+        majority_leaf_only=False,
+        cache_early_exits=False,
+        heuristic_for_greedy=1,
+        greedy_continuous_mode="binary",
+        proxy_caching=True,
+        restrict_proxy_in_lickety=False,
+        restrict_proxy_in_depthd_exact=False,
+        restrict_proxy_in_greedy=False,
+        trie_cache_enabled=True,
+        stronger_rollout=False,
+        use_deferral=False,
+        eta_defer=0.0,
+        subsample_fraction=0.8,
+        num_subsamples=50,
+        seed=0,
+        reuse_caches_between_subsamples=False,
+    ):
+        subsample_fraction = float(subsample_fraction)
+
+        if (
+            not np.isfinite(subsample_fraction)
+            or subsample_fraction <= 0.0
+            or subsample_fraction > 1.0
+        ):
+            raise ValueError(
+                "subsample_fraction must lie in (0, 1]."
+            )
+
+        num_subsamples = int(num_subsamples)
+
+        if num_subsamples <= 0:
+            raise ValueError(
+                "num_subsamples must be positive."
+            )
+
+        seed = int(seed)
+
+        if seed < 0 or seed > 2**64 - 1:
+            raise ValueError(
+                "seed must lie in [0, 2**64 - 1]."
+            )
+
+        eta_defer = float(eta_defer)
+
+        if not np.isfinite(eta_defer) or eta_defer < 0.0:
+            raise ValueError(
+                "eta_defer must be finite and nonnegative."
+            )
+
+        proxy_style_int = parse_proxy_style(proxy_style)
+
+        greedy_heur_int = parse_heuristic_for_greedy(
+            heuristic_for_greedy
+        )
+
+        greedy_cont_mode = parse_greedy_continuous_mode(
+            greedy_continuous_mode
+        )
+
+        key_mode_parsed = parse_key_mode(key_mode)
+
+        cumulative_times = (
+            self._model.fit_prepared_repeated_subsamples(
+                float(lambda_reg),
+                int(depth_budget),
+                float(rashomon_mult),
+                float(multiplicative_slack),
+                key_mode_parsed,
+                bool(trie_cache_enabled),
+                int(lookahead_k),
+                bool(use_budget_refinement),
+                bool(guarantee_rule_list_recovery),
+                int(proxy_style_int),
+                bool(majority_leaf_only),
+                bool(cache_early_exits),
+                int(greedy_heur_int),
+                greedy_cont_mode,
+                bool(proxy_caching),
+                bool(restrict_proxy_in_lickety),
+                bool(restrict_proxy_in_depthd_exact),
+                bool(restrict_proxy_in_greedy),
+                float(subsample_fraction),
+                int(num_subsamples),
+                int(seed),
+                bool(reuse_caches_between_subsamples),
+                bool(stronger_rollout),
+                bool(use_deferral),
+                float(eta_defer),
+            )
+        )
+
+        self.subsample_cumulative_times_ = np.asarray(
+            cumulative_times,
+            dtype=float,
         )
 
         return self
@@ -2307,6 +2690,20 @@ class ArborEnum:
                 None,
             )
 
+        if root_n is None:
+            root_n = getattr(
+                self,
+                "root_n_",
+                None,
+            )
+
+        if gamma is None:
+            gamma = getattr(
+                self,
+                "gamma_",
+                None,
+            )
+
         meta = {
             **feature_meta,
 
@@ -2351,13 +2748,13 @@ class ArborEnum:
                 "subproblem_size"
             )
 
-            if root_n is None:
+            if meta.get("root_n") is None:
                 meta["root_n"] = root.get(
                     "subproblem_size"
                 )
 
         if (
-            gamma is None
+            meta.get("gamma") is None
             and lambda_reg is not None
             and meta.get("root_n") is not None
         ):
@@ -2907,6 +3304,7 @@ class ArborEnum:
         bb_pred=None,
         return_joint_samples=False,
         lossless=True,
+        matched_groups_by_variable=None,
     ):
 
         if hasattr(X, "columns"):
@@ -2976,6 +3374,24 @@ class ArborEnum:
             raise ValueError(
                 "eta_defer must be finite and nonnegative."
             )
+
+        matched_groups_by_original_variable = (
+            _prepare_matched_groups_by_variable(
+                matched_groups_by_variable,
+                X_original.shape[0],
+                X_original.shape[1],
+            )
+        )
+
+        if matched_groups_by_original_variable:
+            matched_groups_by_variable_vec = [
+                matched_groups_by_original_variable[j]
+                for j in self.rid_feature_indices_
+            ]
+        else:
+            matched_groups_by_variable_vec = []
+
+        
 
         n_classes = int(np.max(y)) + 1
 
@@ -3126,6 +3542,7 @@ class ArborEnum:
             bb_pred_vec,
             bool(return_joint_samples),
             bool(lossless),
+            matched_groups_by_variable_vec
         )
 
         if (
@@ -3163,6 +3580,7 @@ class ArborEnum:
         bb_pred=None,
         return_joint_samples=False,
         lossless=True,
+        matched_groups_by_variable=None,
     ):
         X = np.asarray(X, dtype=np.uint8)
         y = np.asarray(y, dtype=int)
@@ -3201,6 +3619,18 @@ class ArborEnum:
                 "eta_defer must be finite and nonnegative."
             )
 
+        if binning_map is None:
+            n_rid_variables = X.shape[1]
+        else:
+            n_rid_variables = len(binning_map)
+
+        matched_groups_by_variable_vec = (
+            _prepare_matched_groups_by_variable(
+                matched_groups_by_variable,
+                X.shape[0],
+                n_rid_variables,
+            )
+        )
         n_classes = int(np.max(y)) + 1
 
         bb_pred_vec = _prepare_bb_pred(
@@ -3229,6 +3659,7 @@ class ArborEnum:
             bb_pred_vec,
             bool(return_joint_samples),
             bool(lossless),
+            matched_groups_by_variable_vec
         )
 
         if (
@@ -3288,6 +3719,7 @@ class ArborEnum:
         bb_pred=None,
         return_joint_samples=False,
         lossless=True,
+        matched_groups_by_variable=None,
     ):
         X_num = np.asarray(X_num, dtype=np.float64)
         y = np.asarray(y, dtype=int)
@@ -3450,6 +3882,16 @@ class ArborEnum:
                     "positive or None."
                 )
 
+        n_rid_variables = X_bin.shape[1] + X_num.shape[1]
+
+        matched_groups_by_variable_vec = (
+            _prepare_matched_groups_by_variable(
+                matched_groups_by_variable,
+                n,
+                n_rid_variables,
+            )
+        )
+
         self._rid_out = _rid_subtractive_continuous_core(
             X_num,
             X_bin,
@@ -3493,6 +3935,7 @@ class ArborEnum:
             bb_pred_vec,
             bool(return_joint_samples),
             bool(lossless),
+            matched_groups_by_variable_vec
         )
 
         if (

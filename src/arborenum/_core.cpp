@@ -486,6 +486,239 @@ PYBIND11_MODULE(_core, m) {
         )
 
         .def(
+            "fit_repeated_subsamples",
+            [](ArborEnum &self,
+                py::array_t<
+                    uint8_t,
+                    py::array::c_style | py::array::forcecast
+                > X,
+                py::array_t<
+                    int,
+                    py::array::c_style | py::array::forcecast
+                > y,
+                double lambda_reg,
+                int depth_budget,
+                double rashomon_mult,
+                double multiplicative_slack,
+                std::string key_mode_str,
+                bool trie_cache_enabled,
+                int lookahead_k,
+                bool use_multipass,
+                bool rule_list_mode,
+                int oracle_style,
+                bool majority_leaf_only,
+                bool cache_cheap_subproblems,
+                int greedy_split_mode,
+                std::string greedy_continuous_mode,
+                bool proxy_caching,
+                std::vector<int> allowed_proxy_features,
+                bool restrict_proxy_in_lickety,
+                bool restrict_proxy_in_depthd_exact,
+                bool restrict_proxy_in_greedy,
+                std::vector<int> continuous_starts,
+                double subsample_fraction,
+                int num_subsamples,
+                std::uint64_t seed,
+                bool reuse_caches_between_subsamples,
+                bool stronger_rollout,
+                bool use_deferral,
+                double eta_defer,
+                py::array_t<
+                    int,
+                    py::array::c_style | py::array::forcecast
+                > bb_pred
+            ) {
+                py::buffer_info xinfo = X.request();
+                py::buffer_info yinfo = y.request();
+
+                if (xinfo.ndim != 2) {
+                    throw std::runtime_error(
+                        "X must be 2D (n_samples x n_features)."
+                    );
+                }
+
+                if (yinfo.ndim != 1) {
+                    throw std::runtime_error(
+                        "y must be 1D."
+                    );
+                }
+
+                const int n_samples =
+                    static_cast<int>(xinfo.shape[0]);
+
+                const int n_features =
+                    static_cast<int>(xinfo.shape[1]);
+
+                if (
+                    static_cast<int>(yinfo.shape[0]) !=
+                    n_samples
+                ) {
+                    throw std::runtime_error(
+                        "y length must match X rows."
+                    );
+                }
+
+                auto *x_ptr =
+                    static_cast<uint8_t*>(xinfo.ptr);
+
+                auto *y_ptr =
+                    static_cast<int*>(yinfo.ptr);
+
+                std::vector<std::vector<bool>>
+                    X_col_major(
+                        static_cast<std::size_t>(n_features),
+                        std::vector<bool>(
+                            static_cast<std::size_t>(n_samples)
+                        )
+                    );
+
+                for (int f = 0; f < n_features; ++f) {
+                    for (int i = 0; i < n_samples; ++i) {
+                        const uint8_t v =
+                            x_ptr[
+                                static_cast<std::size_t>(i) *
+                                static_cast<std::size_t>(n_features) +
+                                static_cast<std::size_t>(f)
+                            ];
+
+                        X_col_major[
+                            static_cast<std::size_t>(f)
+                        ][
+                            static_cast<std::size_t>(i)
+                        ] = (v != 0);
+                    }
+                }
+
+                std::vector<int> y_vec(
+                    y_ptr,
+                    y_ptr + n_samples
+                );
+
+                auto bb_pred_vec =
+                    numpy_int_1d_to_vector(
+                        bb_pred,
+                        "bb_pred"
+                    );
+
+                self.set_key_mode(
+                    parse_key_mode(key_mode_str)
+                );
+
+                self.set_trie_cache_enabled(
+                    trie_cache_enabled
+                );
+
+                self.set_multiplicative_slack(
+                    multiplicative_slack
+                );
+
+                self.set_use_multipass(
+                    use_multipass
+                );
+
+                self.set_rule_list_mode(
+                    rule_list_mode
+                );
+
+                self.set_cache_cheap_subproblems(
+                    cache_cheap_subproblems
+                );
+
+                self.set_greedy_split_mode(
+                    greedy_split_mode
+                );
+
+                self.set_greedy_continuous_mode(
+                    parse_greedy_continuous_mode(
+                        greedy_continuous_mode
+                    )
+                );
+
+                self.set_majority_leaf_only(
+                    majority_leaf_only
+                );
+
+                self.set_proxy_caching_enabled(
+                    proxy_caching
+                );
+
+                self.set_stronger_rollout(
+                    stronger_rollout
+                );
+
+                return self.fit_repeated_subsamples(
+                    X_col_major,
+                    y_vec,
+                    lambda_reg,
+                    static_cast<int8_t>(depth_budget),
+                    rashomon_mult,
+                    static_cast<int8_t>(lookahead_k),
+                    use_multipass,
+                    rule_list_mode,
+                    oracle_style,
+                    majority_leaf_only,
+                    cache_cheap_subproblems,
+                    proxy_caching,
+                    allowed_proxy_features,
+                    restrict_proxy_in_lickety,
+                    restrict_proxy_in_depthd_exact,
+                    restrict_proxy_in_greedy,
+                    continuous_starts,
+                    subsample_fraction,
+                    num_subsamples,
+                    seed,
+                    reuse_caches_between_subsamples,
+                    stronger_rollout,
+                    use_deferral,
+                    eta_defer,
+                    bb_pred_vec
+                );
+            },
+
+            py::arg("X"),
+            py::arg("y"),
+            py::arg("lambda_reg") = 0.01,
+            py::arg("depth_budget") = 5,
+            py::arg("rashomon_mult") = 0.01,
+            py::arg("multiplicative_slack") = 0.0,
+            py::arg("key_mode") = "hash",
+
+            py::arg("trie_cache_enabled") = true,
+
+            py::arg("lookahead_k") = 1,
+            py::arg("use_multipass") = true,
+            py::arg("rule_list_mode") = false,
+            py::arg("oracle_style") = 0,
+            py::arg("majority_leaf_only") = false,
+            py::arg("cache_cheap_subproblems") = false,
+            py::arg("greedy_split_mode") = 1,
+            py::arg("greedy_continuous_mode") = "binary",
+            py::arg("proxy_caching") = true,
+
+            py::arg("allowed_proxy_features") =
+                std::vector<int>{},
+
+            py::arg("restrict_proxy_in_lickety") = false,
+            py::arg("restrict_proxy_in_depthd_exact") = false,
+            py::arg("restrict_proxy_in_greedy") = false,
+
+            py::arg("continuous_starts") =
+                std::vector<int>{},
+
+            py::arg("subsample_fraction") = 0.8,
+            py::arg("num_subsamples") = 50,
+            py::arg("seed") = 0,
+
+            py::arg("reuse_caches_between_subsamples") = false,
+
+            py::arg("stronger_rollout") = false,
+            py::arg("use_deferral") = false,
+            py::arg("eta_defer") = 0.0,
+            py::arg("bb_pred") = py::array_t<int>(0)
+        )
+
+
+        .def(
             "fit_then_extend",
             [](ArborEnum &self,
                py::array_t<
@@ -934,6 +1167,132 @@ PYBIND11_MODULE(_core, m) {
             py::arg("X_proxy_active"),
             py::arg("max_number_thresholds_per_feature") = -1,
             py::arg("bb_pred") = py::array_t<int>(0)
+        )
+
+        .def(
+            "fit_prepared_repeated_subsamples",
+            [](ArborEnum &self,
+               double lambda_reg,
+               int depth_budget,
+               double rashomon_mult,
+               double multiplicative_slack,
+               std::string key_mode_str,
+               bool trie_cache_enabled,
+               int lookahead_k,
+               bool use_multipass,
+               bool rule_list_mode,
+               int oracle_style,
+               bool majority_leaf_only,
+               bool cache_cheap_subproblems,
+               int greedy_split_mode,
+               std::string greedy_continuous_mode,
+               bool proxy_caching,
+               bool restrict_proxy_in_lickety,
+               bool restrict_proxy_in_depthd_exact,
+               bool restrict_proxy_in_greedy,
+               double subsample_fraction,
+               int num_subsamples,
+               std::uint64_t seed,
+               bool reuse_caches_between_subsamples,
+               bool stronger_rollout,
+               bool use_deferral,
+               double eta_defer
+            ) {
+                self.set_key_mode(
+                    parse_key_mode(key_mode_str)
+                );
+
+                self.set_trie_cache_enabled(
+                    trie_cache_enabled
+                );
+
+                self.set_multiplicative_slack(
+                    multiplicative_slack
+                );
+
+                self.set_use_multipass(
+                    use_multipass
+                );
+
+                self.set_rule_list_mode(
+                    rule_list_mode
+                );
+
+                self.set_cache_cheap_subproblems(
+                    cache_cheap_subproblems
+                );
+
+                self.set_greedy_split_mode(
+                    greedy_split_mode
+                );
+
+                self.set_greedy_continuous_mode(
+                    parse_greedy_continuous_mode(
+                        greedy_continuous_mode
+                    )
+                );
+
+                self.set_majority_leaf_only(
+                    majority_leaf_only
+                );
+
+                self.set_proxy_caching_enabled(
+                    proxy_caching
+                );
+
+                self.set_stronger_rollout(
+                    stronger_rollout
+                );
+
+                return self.fit_prepared_repeated_subsamples(
+                    lambda_reg,
+                    static_cast<int8_t>(depth_budget),
+                    rashomon_mult,
+                    static_cast<int8_t>(lookahead_k),
+                    use_multipass,
+                    rule_list_mode,
+                    oracle_style,
+                    majority_leaf_only,
+                    cache_cheap_subproblems,
+                    proxy_caching,
+                    restrict_proxy_in_lickety,
+                    restrict_proxy_in_depthd_exact,
+                    restrict_proxy_in_greedy,
+                    subsample_fraction,
+                    num_subsamples,
+                    seed,
+                    reuse_caches_between_subsamples,
+                    stronger_rollout,
+                    use_deferral,
+                    eta_defer
+                );
+            },
+
+            py::arg("lambda_reg") = 0.01,
+            py::arg("depth_budget") = 5,
+            py::arg("rashomon_mult") = 0.01,
+            py::arg("multiplicative_slack") = 0.0,
+            py::arg("key_mode") = "hash",
+            py::arg("trie_cache_enabled") = true,
+            py::arg("lookahead_k") = 1,
+            py::arg("use_multipass") = true,
+            py::arg("rule_list_mode") = false,
+            py::arg("oracle_style") = 0,
+            py::arg("majority_leaf_only") = false,
+            py::arg("cache_cheap_subproblems") = false,
+            py::arg("greedy_split_mode") = 1,
+            py::arg("greedy_continuous_mode") = "binary",
+            py::arg("proxy_caching") = true,
+            py::arg("restrict_proxy_in_lickety") = false,
+            py::arg("restrict_proxy_in_depthd_exact") = false,
+            py::arg("restrict_proxy_in_greedy") = false,
+            py::arg("subsample_fraction") = 0.8,
+            py::arg("num_subsamples") = 50,
+            py::arg("seed") = 0,
+            py::arg("reuse_caches_between_subsamples") = false,
+            py::arg("stronger_rollout") = false,
+            py::arg("use_deferral") = false,
+            py::arg("eta_defer") = 0.0
         )
 
         .def(
@@ -1732,7 +2091,8 @@ PYBIND11_MODULE(_core, m) {
                 py::array::c_style | py::array::forcecast
             > bb_pred,
             bool return_joint_samples,
-            bool lossless
+            bool lossless,
+            std::vector<std::vector<std::vector<int>>> matched_groups_by_variable
         ) {
             py::buffer_info xinfo = X.request();
             py::buffer_info yinfo = y.request();
@@ -1877,7 +2237,8 @@ PYBIND11_MODULE(_core, m) {
                     eta_defer,
                     bb_pred_vec,
                     return_joint_samples,
-                    lossless
+                    lossless,
+                    matched_groups_by_variable
                 );
 
             py::dict out;
@@ -1909,7 +2270,10 @@ PYBIND11_MODULE(_core, m) {
         py::arg("eta_defer") = 0.0,
         py::arg("bb_pred") = py::array_t<int>(0),
         py::arg("return_joint_samples") = false,
-        py::arg("lossless") = false
+        py::arg("lossless") = false,
+        py::arg("matched_groups_by_variable") =
+            std::vector<std::vector<std::vector<int>>>{}
+        
     );
 
     m.def(
@@ -1978,7 +2342,8 @@ PYBIND11_MODULE(_core, m) {
                 py::array::forcecast
             > bb_pred,
             bool return_joint_samples,
-            bool lossless
+            bool lossless,
+            std::vector<std::vector<std::vector<int>>> matched_groups_by_variable
         ) {
             py::buffer_info num_info =
                 X_num.request();
@@ -2574,7 +2939,8 @@ PYBIND11_MODULE(_core, m) {
                     eta_defer,
                     bb_pred_vec,
                     return_joint_samples,
-                    lossless
+                    lossless,
+                    matched_groups_by_variable
                 );
 
             py::dict out;
@@ -2646,7 +3012,9 @@ PYBIND11_MODULE(_core, m) {
         py::arg("eta_defer") = 0.0,
         py::arg("bb_pred") = py::array_t<int>(0),
         py::arg("return_joint_samples") = false,
-        py::arg("lossless") = false
+        py::arg("lossless") = false,
+        py::arg("matched_groups_by_variable") =
+            std::vector<std::vector<std::vector<int>>>{}
     );
 
     

@@ -16,6 +16,7 @@
 #include <span>
 #include <chrono>
 #include <tuple>
+#include <random>
 
 #include <fstream>
 
@@ -2780,6 +2781,601 @@ public:
         }
 
         has_prepared_data = true;
+    }
+
+    std::vector<double> fit_repeated_subsamples(
+        const std::vector<std::vector<bool>>& X_col_major,
+        const std::vector<int>& y,
+        double lambda,
+        int8_t depth_budget,
+        double rashomon_mult,
+        int8_t lookahead_k,
+        bool use_multipass_flag,
+        bool rule_list_mode_flag,
+        int proxy_style_in,
+        bool majority_leaf_only_flag,
+        bool cache_cheap_subproblems_flag,
+        bool proxy_caching_flag,
+        const std::vector<int>& allowed_proxy_features_in,
+        bool restrict_proxy_in_lickety_in,
+        bool restrict_proxy_in_depthd_exact_in,
+        bool restrict_proxy_in_greedy_in,
+        const std::vector<int>& continuous_starts_in,
+        double subsample_fraction,
+        int num_subsamples,
+        uint64_t seed,
+        bool reuse_caches_between_subsamples,
+        bool stronger_rollout_flag = false,
+        bool use_deferral_flag = false,
+        double eta_defer_in = 0.0,
+        const std::vector<int>& bb_pred = {}
+    ) {
+        // start both benchmark cases from a completely clean object
+        clear_fit_state_();
+
+        if (X_col_major.empty()) {
+            throw std::runtime_error("X_col_major is empty.");
+        }
+
+        if (X_col_major[0].empty()) {
+            throw std::runtime_error("X_col_major has zero samples.");
+        }
+
+        if (
+            !std::isfinite(subsample_fraction) ||
+            subsample_fraction <= 0.0 ||
+            subsample_fraction > 1.0
+        ) {
+            throw std::runtime_error(
+                "subsample_fraction must lie in (0, 1]."
+            );
+        }
+
+        if (num_subsamples <= 0) {
+            throw std::runtime_error(
+                "num_subsamples must be positive."
+            );
+        }
+
+        n_features = (int)X_col_major.size();
+        n_samples = (int)X_col_major[0].size();
+
+        if ((int)y.size() != n_samples) {
+            throw std::runtime_error(
+                "y length does not match number of samples."
+            );
+        }
+
+        for (int f = 1; f < n_features; ++f) {
+            if (
+                (int)X_col_major[(size_t)f].size() !=
+                n_samples
+            ) {
+                throw std::runtime_error(
+                    "X_col_major columns have different "
+                    "numbers of samples."
+                );
+            }
+        }
+
+        continuous_starts = continuous_starts_in;
+        y_train = y;
+
+        if (
+            greedy_continuous_mode ==
+            GreedyContinuousMode::NUMERICAL
+        ) {
+            if (
+                numerical_X_cols_for_greedy.size() !=
+                    continuous_starts.size() ||
+                numerical_global_sorted_idx.size() !=
+                    continuous_starts.size() ||
+                numerical_unique_values_for_greedy.size() !=
+                    continuous_starts.size()
+            ) {
+                throw std::runtime_error(
+                    "Numerical greedy arrays must align "
+                    "one-to-one with continuous_starts."
+                );
+            }
+        }
+
+        // full original-data bitvector dimensions.
+
+        n_words = (n_samples + 63) / 64;
+
+        tail_mask =
+            (n_samples % 64)
+                ? ((1ULL << (n_samples % 64)) - 1ULL)
+                : ~0ULL;
+
+        const int subsample_size =
+            std::max(
+                1,
+                std::min(
+                    n_samples,
+                    (int)std::llround(
+                        subsample_fraction *
+                        (double)n_samples
+                    )
+                )
+            );
+
+        // gamma is scaled by local subproblem size
+        gamma = (int)std::llround(
+            lambda * (double)subsample_size
+        );
+
+        trained_depth_budget = depth_budget;
+        lookahead_init = lookahead_k;
+        use_multipass = use_multipass_flag;
+        rule_list_mode = rule_list_mode_flag;
+        majority_leaf_only = majority_leaf_only_flag;
+        cache_cheap_subproblems =
+            cache_cheap_subproblems_flag;
+        proxy_style = proxy_style_in;
+        proxy_caching_enabled = proxy_caching_flag;
+        stronger_rollout = stronger_rollout_flag;
+
+        restrict_proxy_in_lickety =
+            restrict_proxy_in_lickety_in;
+
+        restrict_proxy_in_depthd_exact =
+            restrict_proxy_in_depthd_exact_in;
+
+        restrict_proxy_in_greedy =
+            restrict_proxy_in_greedy_in;
+
+        allowed_proxy_features.clear();
+        allowed_proxy_features.reserve(
+            allowed_proxy_features_in.size()
+        );
+
+        for (int f : allowed_proxy_features_in) {
+            if (f < 0 || f >= n_features) {
+                throw std::runtime_error(
+                    "allowed_proxy_features contains "
+                    "out-of-range feature index."
+                );
+            }
+
+            allowed_proxy_features.push_back(f);
+        }
+
+        std::sort(
+            allowed_proxy_features.begin(),
+            allowed_proxy_features.end()
+        );
+
+        allowed_proxy_features.erase(
+            std::unique(
+                allowed_proxy_features.begin(),
+                allowed_proxy_features.end()
+            ),
+            allowed_proxy_features.end()
+        );
+
+        use_deferral = use_deferral_flag;
+        eta_defer = eta_defer_in;
+
+        if (use_deferral) {
+            if ((int)bb_pred.size() != n_samples) {
+                throw std::runtime_error(
+                    "fit_repeated_subsamples: "
+                    "use_deferral=true requires bb_pred "
+                    "with the same length as y."
+                );
+            }
+
+            if (
+                !std::isfinite(eta_defer) ||
+                eta_defer < 0.0
+            ) {
+                throw std::runtime_error(
+                    "fit_repeated_subsamples: eta_defer "
+                    "must be finite and nonnegative."
+                );
+            }
+        }
+
+        X_bits.assign(
+            (size_t)n_features,
+            Packed((size_t)n_words)
+        );
+
+        for (int f = 0; f < n_features; ++f) {
+            auto& col = X_bits[(size_t)f].w;
+
+            for (int i = 0; i < n_samples; ++i) {
+                if (
+                    X_col_major[(size_t)f][(size_t)i]
+                ) {
+                    col[(size_t)(i >> 6)] |=
+                        (1ULL << (i & 63));
+                }
+            }
+
+            col[(size_t)(n_words - 1)] &=
+                tail_mask;
+        }
+
+        int y_max = 0;
+
+        for (int i = 0; i < n_samples; ++i) {
+            y_max = std::max(
+                y_max,
+                y[(size_t)i]
+            );
+        }
+
+        num_classes = y_max + 1;
+
+        Y_bits.assign(
+            (size_t)num_classes,
+            Packed((size_t)n_words)
+        );
+
+        for (int i = 0; i < n_samples; ++i) {
+            const int yi = y[(size_t)i];
+
+            if (yi < 0 || yi >= num_classes) {
+                throw std::runtime_error(
+                    "y contains an invalid class label."
+                );
+            }
+
+            Y_bits[(size_t)yi]
+                .w[(size_t)(i >> 6)] |=
+                (1ULL << (i & 63));
+        }
+
+        for (int c = 0; c < num_classes; ++c) {
+            Y_bits[(size_t)c]
+                .w[(size_t)(n_words - 1)] &=
+                tail_mask;
+        }
+
+        BBwrong = Packed((size_t)n_words);
+        BBwrong.clear();
+
+        if (use_deferral) {
+            for (int i = 0; i < n_samples; ++i) {
+                const int bi =
+                    bb_pred[(size_t)i];
+
+                if (
+                    bi < 0 ||
+                    bi >= num_classes
+                ) {
+                    throw std::runtime_error(
+                        "bb_pred values must lie in "
+                        "the same class range as y."
+                    );
+                }
+
+                if (bi != y[(size_t)i]) {
+                    BBwrong
+                        .w[(size_t)(i >> 6)] |=
+                        (1ULL << (i & 63));
+                }
+            }
+
+            BBwrong
+                .w[(size_t)(n_words - 1)] &=
+                tail_mask;
+        }
+
+        if (proxy_style == 2) {
+            k_at_depth.assign(
+                (size_t)depth_budget + 1,
+                1
+            );
+
+            int K = lookahead_init;
+            int kk = K;
+
+            for (
+                int d = depth_budget;
+                d >= 0;
+                --d
+            ) {
+                k_at_depth[(size_t)d] =
+                    std::min(d, kk);
+
+                kk =
+                    (kk > 1)
+                        ? (kk - 1)
+                        : K;
+            }
+
+        } else {
+            k_at_depth.clear();
+        }
+
+        reserve_caches_mid_();
+
+        const PathKey& root_pk =
+            empty_pk();
+
+        const ContinuousPath& root_cpath =
+            empty_continuous_path();
+
+        std::vector<int> B_active_all =
+            all_feature_indices_();
+
+        std::vector<int> row_order(
+            (size_t)n_samples
+        );
+
+        std::mt19937_64 rng(seed);
+
+        std::vector<double> cumulative_times;
+        cumulative_times.reserve(
+            (size_t)num_subsamples
+        );
+
+        double cumulative_seconds = 0.0;
+
+        for (
+            int rep = 0;
+            rep < num_subsamples;
+            ++rep
+        ) {
+            // reset to [0, 1, ..., N-1] before every shuffle.
+            for (int i = 0; i < n_samples; ++i) {
+                row_order[(size_t)i] = i;
+            }
+
+            std::shuffle(
+                row_order.begin(),
+                row_order.end(),
+                rng
+            );
+
+            // root bitvector is N bits wide but only p*N are 1.
+            Packed root((size_t)n_words);
+
+            for (
+                int j = 0;
+                j < subsample_size;
+                ++j
+            ) {
+                const int row =
+                    row_order[(size_t)j];
+
+                root.w[(size_t)(row >> 6)] |=
+                    (1ULL << (row & 63));
+            }
+
+            root.w[(size_t)(n_words - 1)] &=
+                tail_mask;
+
+            const uint64_t subsample_hash =
+                hash_mask64(
+                    root.w.data(),
+                    n_words,
+                    tail_mask
+                );
+
+            const auto run_start =
+                std::chrono::steady_clock::now();
+
+
+            result.reset();
+
+            // case 1: clear proxy caches etc
+            if (
+                !reuse_caches_between_subsamples
+            ) {
+                trie_cache.clear();
+                greedy_cache.clear();
+                
+
+                lickety_cache_k2.clear();
+                lickety_cache_kla.clear();
+
+                greedy_first_split_cache.clear();
+
+                anytime_lickety_first_split_cache.clear();
+
+                continuous_proxy_completion_cache.clear();
+
+                mask_ids = MaskIdTable();
+                lit_ids = LitIdTable();
+
+                fingerprint128_ids =
+                    Fingerprint128IdTable();
+            }
+
+            // case 2: dont clear caches
+        
+            anytime_mode_active_ = false;
+
+            single_tree_refined_override_.reset();
+
+            best_objective = 0;
+            obj_bound = 0;
+
+            if (lookahead_init <= 0) {
+                best_objective =
+                    greedy_proxy_objective_(
+                        root,
+                        depth_budget,
+                        root_pk,
+                        root_cpath
+                    );
+
+            } else if (proxy_style == 4) {
+                best_objective =
+                    split_algorithm(
+                        root,
+                        depth_budget,
+                        lookahead_init,
+                        root_pk
+                    );
+
+            } else {
+                best_objective =
+                    lickety_proxy_objective_(
+                        root,
+                        depth_budget,
+                        lookahead_init,
+                        root_pk,
+                        root_cpath
+                    );
+            }
+
+            obj_bound =
+                (int)std::llround(
+                    (double)best_objective *
+                    (1.0 + rashomon_mult) *
+                    (1.0 + multiplicative_slack)
+                );
+
+            // fit the actual Rashomon set on the subsample mask.
+
+            result =
+                construct_trie(
+                    root,
+                    depth_budget,
+                    obj_bound,
+                    root_pk,
+                    root_cpath,
+                    &B_active_all
+                );
+
+            const double run_seconds =
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() -
+                    run_start
+                ).count();
+
+            cumulative_seconds +=
+                run_seconds;
+
+            cumulative_times.push_back(
+                cumulative_seconds
+            );
+
+            const int min_obj =
+                result
+                    ? result->min_objective
+                    : std::numeric_limits<int>::max();
+
+            std::cout
+                << "Subsample "
+                << (rep + 1)
+                << "/"
+                << num_subsamples
+
+                << " | mode="
+                << (
+                    reuse_caches_between_subsamples
+                        ? "reuse-all-caches"
+                        : "clear-all-caches"
+                )
+
+                << " | rows="
+                << subsample_size
+                << "/"
+                << n_samples
+
+                << " | sample_hash="
+                << subsample_hash
+
+                << " | best="
+                << best_objective
+
+                << " | bound="
+                << obj_bound
+
+                << " | min="
+                << min_obj
+
+                << " | run_seconds="
+                << run_seconds
+
+                << " | cumulative_seconds="
+                << cumulative_seconds
+
+                << " | greedy_cache="
+                << greedy_cache.size()
+
+                << " | lickety_cache="
+                << (
+                    use_kla_cache()
+                        ? lickety_cache_kla.size()
+                        : lickety_cache_k2.size()
+                )
+
+                << " | cont_proxy_cache="
+                << continuous_proxy_completion_cache.size()
+
+                << " | trie_cache="
+                << trie_cache.size()
+
+                << "\n";
+        }
+
+        return cumulative_times;
+    }
+
+    std::vector<double> fit_prepared_repeated_subsamples(
+        double lambda,
+        int8_t depth_budget,
+        double rashomon_mult,
+        int8_t lookahead_k,
+        bool use_multipass_flag,
+        bool rule_list_mode_flag,
+        int proxy_style_in,
+        bool majority_leaf_only_flag,
+        bool cache_cheap_subproblems_flag,
+        bool proxy_caching_flag,
+        bool restrict_proxy_in_lickety_in,
+        bool restrict_proxy_in_depthd_exact_in,
+        bool restrict_proxy_in_greedy_in,
+        double subsample_fraction,
+        int num_subsamples,
+        uint64_t seed,
+        bool reuse_caches_between_subsamples,
+        bool stronger_rollout_flag = false,
+        bool use_deferral_flag = false,
+        double eta_defer_in = 0.0
+    ) {
+        if (!has_prepared_data) {
+            throw std::runtime_error(
+                "No prepared data. Call prepare_continuous_data(...) "
+                "before fit_prepared_repeated_subsamples(...)."
+            );
+        }
+
+        return fit_repeated_subsamples(
+            prepared_X_col_major,
+            prepared_y,
+            lambda,
+            depth_budget,
+            rashomon_mult,
+            lookahead_k,
+            use_multipass_flag,
+            rule_list_mode_flag,
+            proxy_style_in,
+            majority_leaf_only_flag,
+            cache_cheap_subproblems_flag,
+            proxy_caching_flag,
+            prepared_allowed_proxy_features,
+            restrict_proxy_in_lickety_in,
+            restrict_proxy_in_depthd_exact_in,
+            restrict_proxy_in_greedy_in,
+            prepared_continuous_starts,
+            subsample_fraction,
+            num_subsamples,
+            seed,
+            reuse_caches_between_subsamples,
+            stronger_rollout_flag,
+            use_deferral_flag,
+            eta_defer_in,
+            prepared_bb_pred
+        );
     }
 
     // use the already prepared data and fit the rashomon set (by calling fit, which will then do the equivalent of ContinuousRSet)
@@ -15117,11 +15713,10 @@ private:
 
     struct ExactReplacementCounts_ {
         int64_t original_mistakes = 0;
-        // exact sum over all (target row, replacement-value row) pairs.
-        // divide by n_eval at the end to get expected mistakes.
-        std::vector<int64_t> replacement_weighted_mistakes;
+        std::vector<double> replacement_expected_mistakes;
     };
 
+   
     struct ObjExactReplacementBucket_ {
         int obj = 0;
         std::vector<ExactReplacementCounts_> counts;
@@ -15198,6 +15793,47 @@ private:
         return n_here - correct;
     }
 
+    static inline bool exact_row_in_mask_(
+        const Packed& mask,
+        int row
+    ) {
+        return (
+            mask.w[(std::size_t)(row >> 6)] &
+            (1ULL << (row & 63))
+        ) != 0ULL;
+    }
+
+    inline bool exact_row_wrong_for_leaf_(
+        int row,
+        int prediction,
+        const std::vector<Packed>& Y_eval_bits,
+        const Packed* BBwrong_eval
+    ) const {
+        if (prediction == DEFER_PREDICTION) {
+            if (!BBwrong_eval) {
+                throw std::runtime_error(
+                    "Deferred leaf encountered, but eval bb_pred was not provided."
+                );
+            }
+
+            return exact_row_in_mask_(
+                *BBwrong_eval,
+                row
+            );
+        }
+
+        if (prediction < 0 || prediction >= num_classes) {
+            throw std::runtime_error(
+                "Leaf prediction is outside valid class range."
+            );
+        }
+
+        return !exact_row_in_mask_(
+            Y_eval_bits[(std::size_t)prediction],
+            row
+        );
+    }
+
     std::vector<ObjExactReplacementBucket_>
     collect_exact_replacement_mistakes_by_obj_(
         const TreeTrieNode* node,
@@ -15214,7 +15850,9 @@ private:
 
         const EvalCtx& ctx,
         const std::vector<Packed>& Y_eval_bits,
-        const Packed* BBwrong_eval
+        const Packed* BBwrong_eval,
+        const std::vector<std::vector<std::vector<int>>>*
+            matched_groups_by_variable_eval
     ) const {
         if (!node || budget < 0) return {};
 
@@ -15243,9 +15881,10 @@ private:
             if (leaf.loss > budget) continue;
 
             ExactReplacementCounts_ here;
-            here.replacement_weighted_mistakes.assign(
-                (size_t)number_of_variables,
-                0
+
+            here.replacement_expected_mistakes.assign(
+                (std::size_t)number_of_variables,
+                0.0
             );
 
             here.original_mistakes =
@@ -15262,30 +15901,98 @@ private:
                 ++variable) {
 
                 const auto& state =
-                    states[(size_t)variable];
+                    states[(std::size_t)variable];
 
-                const int wrong_target_rows =
-                    exact_wrong_count_for_leaf_(
-                        state.target_rows,
-                        leaf.prediction,
-                        ctx,
-                        Y_eval_bits,
-                        BBwrong_eval
-                    );
+                // ordinary uniform replacement
+                // every target row may pair with every replacement row.
+                // each replacement has probability 1/n.
+                if (matched_groups_by_variable_eval == nullptr) {
 
-                const int number_of_replacement_values =
-                    count_eval_mask_(
-                        state.replacement_values,
-                        ctx.n_words
-                    );
+                    const int wrong_target_rows =
+                        exact_wrong_count_for_leaf_(
+                            state.target_rows,
+                            leaf.prediction,
+                            ctx,
+                            Y_eval_bits,
+                            BBwrong_eval
+                        );
 
-                here.replacement_weighted_mistakes[
-                    (size_t)variable
-                ] =
-                    (int64_t)wrong_target_rows *
-                    (int64_t)number_of_replacement_values;
+                    const int number_of_replacement_values =
+                        count_eval_mask_(
+                            state.replacement_values,
+                            ctx.n_words
+                        );
+
+                    here.replacement_expected_mistakes[
+                        (std::size_t)variable
+                    ] =
+                        (
+                            (double)wrong_target_rows *
+                            (double)number_of_replacement_values
+                        )
+                        / (double)ctx.n_eval;
+
+                    continue;
+                }
+
+                // conditional matched-group replacement.
+                // a target row i in G_g can only choose k in G_g.
+                // replacement is uniform within G_g, including k == i.
+                // leaf contribution:
+                // sum_g
+                //   |I_j cap W cap G_g|
+                //   |K_j cap G_g|
+                //   / |G_g|
+                double expected_mistakes = 0.0;
+
+                for (
+                    const auto& group :
+                    (*matched_groups_by_variable_eval)[
+                        (std::size_t)variable
+                    ]
+                ) {
+                    int wrong_targets_in_group = 0;
+                    int replacements_in_group = 0;
+
+                    for (int row : group) {
+
+                        if (exact_row_in_mask_(
+                                state.replacement_values,
+                                row
+                            )) {
+                            ++replacements_in_group;
+                        }
+
+                        if (
+                            exact_row_in_mask_(
+                                state.target_rows,
+                                row
+                            ) &&
+                            exact_row_wrong_for_leaf_(
+                                row,
+                                leaf.prediction,
+                                Y_eval_bits,
+                                BBwrong_eval
+                            )
+                        ) {
+                            ++wrong_targets_in_group;
+                        }
+                    }
+
+                    expected_mistakes +=
+                        (
+                            (double)wrong_targets_in_group *
+                            (double)replacements_in_group
+                        )
+                        / (double)group.size();
+                }
+
+                here.replacement_expected_mistakes[
+                    (std::size_t)variable
+                ] = expected_mistakes;
             }
 
+            
             acc[leaf.loss].push_back(std::move(here));
         }
 
@@ -15438,7 +16145,8 @@ private:
                     internal_to_variable,
                     ctx,
                     Y_eval_bits,
-                    BBwrong_eval
+                    BBwrong_eval,
+                    matched_groups_by_variable_eval
                 );
 
             auto Rb =
@@ -15450,7 +16158,8 @@ private:
                     internal_to_variable,
                     ctx,
                     Y_eval_bits,
-                    BBwrong_eval
+                    BBwrong_eval,
+                    matched_groups_by_variable_eval
                 );
 
             if (Lb.empty() || Rb.empty()) continue;
@@ -15498,22 +16207,22 @@ private:
                                 lc.original_mistakes +
                                 rc.original_mistakes;
 
-                            combined.replacement_weighted_mistakes.resize(
-                                (size_t)number_of_variables
+                            combined.replacement_expected_mistakes.resize(
+                                (std::size_t)number_of_variables
                             );
 
                             for (int variable = 0;
                                 variable < number_of_variables;
                                 ++variable) {
 
-                                combined.replacement_weighted_mistakes[
-                                    (size_t)variable
+                                combined.replacement_expected_mistakes[
+                                    (std::size_t)variable
                                 ] =
-                                    lc.replacement_weighted_mistakes[
-                                        (size_t)variable
+                                    lc.replacement_expected_mistakes[
+                                        (std::size_t)variable
                                     ] +
-                                    rc.replacement_weighted_mistakes[
-                                        (size_t)variable
+                                    rc.replacement_expected_mistakes[
+                                        (std::size_t)variable
                                     ];
                             }
 
@@ -15877,12 +16586,15 @@ public:
         const std::vector<int>& y_eval,
         int budget_override = -1,
 
-        // Optional original-variable grouping.
-        // Example continuous variable:
-        //   variable_columns[j] = {threshold_col_0, threshold_col_1, ...}
+        // optional original-variable grouping.
+        // variable_columns[j] = {threshold_col_0, threshold_col_1, ...}
         const std::vector<std::vector<int>>& variable_columns_in = {},
 
-        const std::vector<int>& bb_pred_eval = {}
+        const std::vector<int>& bb_pred_eval = {},
+        // matched_groups_by_variable_eval[j] is the row partition
+        // used when replacing original variable j.
+        const std::vector<std::vector<std::vector<int>>>&
+            matched_groups_by_variable_eval = {}
     ) const {
         if (!result) {
             throw std::runtime_error(
@@ -15952,6 +16664,78 @@ public:
 
         const int number_of_variables =
             (int)variable_columns.size();
+
+        const bool use_matched_groups =
+            !matched_groups_by_variable_eval.empty();
+
+        if (use_matched_groups) {
+            if (
+                (int)matched_groups_by_variable_eval.size() !=
+                number_of_variables
+            ) {
+                throw std::runtime_error(
+                    "matched_groups_by_variable_eval must contain exactly "
+                    "one row partition per original variable."
+                );
+            }
+
+            for (int variable = 0;
+                variable < number_of_variables;
+                ++variable) {
+
+                const auto& groups =
+                    matched_groups_by_variable_eval[
+                        (std::size_t)variable
+                    ];
+
+                if (groups.empty()) {
+                    throw std::runtime_error(
+                        "Every variable must have a nonempty "
+                        "matched-group partition."
+                    );
+                }
+
+                std::vector<uint8_t> seen(
+                    (std::size_t)ctx.n_eval,
+                    0
+                );
+
+                for (const auto& group : groups) {
+                    if (group.empty()) {
+                        throw std::runtime_error(
+                            "A variable's matched-group partition "
+                            "contains an empty group."
+                        );
+                    }
+
+                    for (int row : group) {
+                        if (row < 0 || row >= ctx.n_eval) {
+                            throw std::runtime_error(
+                                "matched_groups_by_variable_eval contains "
+                                "an out-of-range row index."
+                            );
+                        }
+
+                        if (seen[(std::size_t)row]) {
+                            throw std::runtime_error(
+                                "A variable's matched groups are not disjoint."
+                            );
+                        }
+
+                        seen[(std::size_t)row] = 1;
+                    }
+                }
+
+                for (int row = 0; row < ctx.n_eval; ++row) {
+                    if (!seen[(std::size_t)row]) {
+                        throw std::runtime_error(
+                            "Each variable's matched groups must "
+                            "partition the evaluation dataset."
+                        );
+                    }
+                }
+            }
+        }
 
         std::vector<int> internal_to_variable(
             (size_t)this->n_features,
@@ -16057,6 +16841,12 @@ public:
                 root_mask.w;
         }
 
+        const std::vector<std::vector<std::vector<int>>>*
+            matched_groups_by_variable_eval_ptr =
+                use_matched_groups
+                    ? &matched_groups_by_variable_eval
+                    : nullptr;
+
         auto buckets =
             collect_exact_replacement_mistakes_by_obj_(
                 result.get(),
@@ -16066,7 +16856,8 @@ public:
                 internal_to_variable,
                 ctx,
                 Y_eval_bits,
-                BBwrong_eval_ptr
+                BBwrong_eval_ptr,
+                matched_groups_by_variable_eval_ptr
             );
 
         std::vector<ExactReplacementMistakesWithObj> out;
@@ -16078,16 +16869,13 @@ public:
 
         out.reserve(total);
 
-        const double inv_n =
-            1.0 / (double)ctx.n_eval;
-
         for (auto& b : buckets) {
             for (auto& counts : b.counts) {
                 ExactReplacementMistakesWithObj row;
                 row.obj = b.obj;
 
                 row.mistakes.resize(
-                    (size_t)number_of_variables + 1,
+                    (std::size_t)number_of_variables + 1,
                     0.0
                 );
 
@@ -16099,13 +16887,11 @@ public:
                     ++variable) {
 
                     row.mistakes[
-                        (size_t)variable + 1
+                        (std::size_t)variable + 1
                     ] =
-                        (double)counts
-                            .replacement_weighted_mistakes[
-                                (size_t)variable
-                            ] *
-                        inv_n;
+                        counts.replacement_expected_mistakes[
+                            (std::size_t)variable
+                        ];
                 }
 
                 out.push_back(std::move(row));
