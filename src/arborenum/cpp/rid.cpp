@@ -520,41 +520,78 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
 
         const int n = (int)X_bootstrap.size();
 
-        // bootstrap row i came from original row bootstrap_idx[i],
-        // so it inherits that original row's matched group.
-        // groups absent from this bootstrap are simply removed.
+        // matched_group_of_bootstrap_row_by_variable[j][i] = matched-group ID of bootstrap row i for variable j
+        // matched_group_size_bootstrap_by_variable[j][g] = number of bootstrap rows in group g for variable j
+
+        std::vector<std::vector<int>>
+            matched_group_of_bootstrap_row_by_variable;
+
+        std::vector<std::vector<int>>
+            matched_group_size_bootstrap_by_variable;
 
         std::vector<std::vector<std::vector<int>>>
-        matched_groups_bootstrap_by_variable;
+            matched_groups_bootstrap_by_variable;
 
         if (use_matched_groups) {
-            matched_groups_bootstrap_by_variable.resize(
+            matched_group_of_bootstrap_row_by_variable.resize(
                 (std::size_t)number_of_variables
             );
+
+            matched_group_size_bootstrap_by_variable.resize(
+                (std::size_t)number_of_variables
+            );
+
+            // explicit row lists are only needed by the monte carlo error path.
+            if (!lossless) {
+                matched_groups_bootstrap_by_variable.resize(
+                    (std::size_t)number_of_variables
+                );
+            }
 
             for (int variable = 0;
                 variable < number_of_variables;
                 ++variable) {
 
-                const auto& original_groups =
-                    matched_groups_by_variable[
-                        (std::size_t)variable
-                    ];
+                const int number_of_groups =
+                    static_cast<int>(
+                        matched_groups_by_variable[
+                            (std::size_t)variable
+                        ].size()
+                    );
 
-                auto& bootstrap_groups =
-                    matched_groups_bootstrap_by_variable[
-                        (std::size_t)variable
-                    ];
-
-                bootstrap_groups.assign(
-                    original_groups.size(),
-                    {}
-                );
-
-                const auto& group_ids =
+                const auto& original_group_ids =
                     original_group_id_by_variable[
                         (std::size_t)variable
                     ];
+
+                auto& bootstrap_group_of_row =
+                    matched_group_of_bootstrap_row_by_variable[
+                        (std::size_t)variable
+                    ];
+
+                auto& bootstrap_group_sizes =
+                    matched_group_size_bootstrap_by_variable[
+                        (std::size_t)variable
+                    ];
+
+                bootstrap_group_of_row.assign(
+                    (std::size_t)n,
+                    -1
+                );
+
+                bootstrap_group_sizes.assign(
+                    (std::size_t)number_of_groups,
+                    0
+                );
+
+                if (!lossless) {
+                    matched_groups_bootstrap_by_variable[
+                        (std::size_t)variable
+                    ].assign(
+                        (std::size_t)number_of_groups,
+                        {}
+                    );
+                }
 
                 for (int bootstrap_row = 0;
                     bootstrap_row < n;
@@ -566,27 +603,29 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
                         ];
 
                     const int group =
-                        group_ids[
+                        original_group_ids[
                             (std::size_t)original_row
                         ];
 
-                    bootstrap_groups[
-                        (std::size_t)group
-                    ].push_back(bootstrap_row);
-                }
+                    bootstrap_group_of_row[
+                        (std::size_t)bootstrap_row
+                    ] = group;
 
-                bootstrap_groups.erase(
-                    std::remove_if(
-                        bootstrap_groups.begin(),
-                        bootstrap_groups.end(),
-                        [](const std::vector<int>& group) {
-                            return group.empty();
-                        }
-                    ),
-                    bootstrap_groups.end()
-                );
+                    ++bootstrap_group_sizes[
+                        (std::size_t)group
+                    ];
+
+                    if (!lossless) {
+                        matched_groups_bootstrap_by_variable[
+                            (std::size_t)variable
+                        ][
+                            (std::size_t)group
+                        ].push_back(bootstrap_row);
+                    }
+                }
             }
         }
+
                 
         
         std::vector<std::vector<bool>> X_col_major;
@@ -718,7 +757,8 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
                     budget_override,
                     variable_columns,
                     {},
-                    matched_groups_bootstrap_by_variable
+                    matched_group_of_bootstrap_row_by_variable,
+                    matched_group_size_bootstrap_by_variable
                 );
 
             const uint64_t number_of_trees =

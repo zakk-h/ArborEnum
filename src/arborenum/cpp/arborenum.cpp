@@ -15702,13 +15702,13 @@ private:
 
 
     struct ExactReplacementState_ {
-        // original/evaluation rows whose non-replaced feature values are
-        // consistent with the current path.
+        // These masks are only materialized after the replacement variable
+        // has appeared on the current tree path. Until then, perturbing the
+        // variable cannot change routing, so its leaf contribution is just
+        // the ordinary/original leaf mistakes.
         Packed target_rows;
-
-        // rows whose value of THIS replaced variable is still consistent
-        // with the current path.
         Packed replacement_values;
+        bool replacement_feature_used = false;
     };
 
     struct ExactReplacementCounts_ {
@@ -15716,10 +15716,62 @@ private:
         std::vector<double> replacement_expected_mistakes;
     };
 
-   
     struct ObjExactReplacementBucket_ {
         int obj = 0;
         std::vector<ExactReplacementCounts_> counts;
+    };
+
+    // Reused by every recursive call. Stamps let us avoid clearing O(G)
+    // counters for every variable/leaf; we only reset groups actually touched
+    // by the current target/donor masks.
+    struct ExactMatchedScratch_ {
+        std::vector<int> wrong_counts;
+        std::vector<int> replacement_counts;
+        std::vector<uint32_t> stamps;
+        std::vector<int> touched_groups;
+        uint32_t current_stamp = 0;
+
+        inline void begin(int number_of_groups) {
+            if (number_of_groups < 0) {
+                throw std::runtime_error(
+                    "Negative number of matched groups."
+                );
+            }
+
+            const std::size_t need =
+                static_cast<std::size_t>(number_of_groups);
+
+            if (wrong_counts.size() < need) {
+                wrong_counts.resize(need, 0);
+                replacement_counts.resize(need, 0);
+                stamps.resize(need, 0);
+            }
+
+            ++current_stamp;
+
+            // Extremely unlikely, but keep the stamp logic correct after
+            // uint32_t wraparound.
+            if (current_stamp == 0) {
+                std::fill(stamps.begin(), stamps.end(), 0);
+                current_stamp = 1;
+            }
+
+            touched_groups.clear();
+        }
+
+        inline void touch(int group) {
+            const std::size_t g =
+                static_cast<std::size_t>(group);
+
+            if (stamps[g] == current_stamp) {
+                return;
+            }
+
+            stamps[g] = current_stamp;
+            wrong_counts[g] = 0;
+            replacement_counts[g] = 0;
+            touched_groups.push_back(group);
+        }
     };
 
     static inline std::vector<ObjExactReplacementBucket_>
@@ -15743,7 +15795,7 @@ private:
             out.begin(),
             out.end(),
             [](const ObjExactReplacementBucket_& a,
-            const ObjExactReplacementBucket_& b) {
+               const ObjExactReplacementBucket_& b) {
                 return a.obj < b.obj;
             }
         );
@@ -15793,45 +15845,14 @@ private:
         return n_here - correct;
     }
 
-    static inline bool exact_row_in_mask_(
-        const Packed& mask,
-        int row
-    ) {
-        return (
-            mask.w[(std::size_t)(row >> 6)] &
-            (1ULL << (row & 63))
-        ) != 0ULL;
-    }
-
-    inline bool exact_row_wrong_for_leaf_(
-        int row,
-        int prediction,
-        const std::vector<Packed>& Y_eval_bits,
-        const Packed* BBwrong_eval
-    ) const {
-        if (prediction == DEFER_PREDICTION) {
-            if (!BBwrong_eval) {
-                throw std::runtime_error(
-                    "Deferred leaf encountered, but eval bb_pred was not provided."
-                );
-            }
-
-            return exact_row_in_mask_(
-                *BBwrong_eval,
-                row
-            );
-        }
-
-        if (prediction < 0 || prediction >= num_classes) {
-            throw std::runtime_error(
-                "Leaf prediction is outside valid class range."
-            );
-        }
-
-        return !exact_row_in_mask_(
-            Y_eval_bits[(std::size_t)prediction],
-            row
-        );
+    static inline int exact_ctz64_(uint64_t bits) {
+    #if defined(_MSC_VER)
+        unsigned long bit_index = 0;
+        _BitScanForward64(&bit_index, bits);
+        return static_cast<int>(bit_index);
+    #else
+        return __builtin_ctzll(bits);
+    #endif
     }
 
     std::vector<ObjExactReplacementBucket_>
@@ -15839,8 +15860,12 @@ private:
         const TreeTrieNode* node,
         int budget,
 
-        // ordinary, unmodified evaluation rows.
+        // ordinary, unmodified evaluation rows at this graph node.
         const Packed& original_mask,
+
+        // full evaluation-row mask. This is the donor universe before the
+        // replacement variable appears on the path.
+        const Packed& replacement_root_mask,
 
         // one state per original variable.
         const std::vector<ExactReplacementState_>& states,
@@ -15851,8 +15876,24 @@ private:
         const EvalCtx& ctx,
         const std::vector<Packed>& Y_eval_bits,
         const Packed* BBwrong_eval,
-        const std::vector<std::vector<std::vector<int>>>*
-            matched_groups_by_variable_eval
+
+        // matched_group_of_row_by_variable_eval[j][i]
+        // gives the matched-group ID of evaluation row i
+        // for replacement variable j.
+        const std::vector<std::vector<int>>*
+            matched_group_of_row_by_variable_eval,
+
+        // Precomputed 1 / |G_g|. Zero for groups absent from this bootstrap.
+        const std::vector<std::vector<double>>*
+            matched_group_inv_size_by_variable_eval,
+
+        // 1 iff exactly one matched group is nonempty for this variable in
+        // this bootstrap, in which case the conditional kernel is identical
+        // to ordinary uniform replacement.
+        const std::vector<uint8_t>*
+            matched_group_effectively_uniform_by_variable_eval,
+
+        ExactMatchedScratch_* matched_scratch
     ) const {
         if (!node || budget < 0) return {};
 
@@ -15882,11 +15923,6 @@ private:
 
             ExactReplacementCounts_ here;
 
-            here.replacement_expected_mistakes.assign(
-                (std::size_t)number_of_variables,
-                0.0
-            );
-
             here.original_mistakes =
                 exact_wrong_count_for_leaf_(
                     original_mask,
@@ -15896,18 +15932,61 @@ private:
                     BBwrong_eval
                 );
 
+            // Most variables have not appeared on a shallow root-to-leaf
+            // path. Initialize them directly to the exact no-effect value.
+            here.replacement_expected_mistakes.assign(
+                (std::size_t)number_of_variables,
+                static_cast<double>(here.original_mistakes)
+            );
+
+            // Validate once per leaf, outside the variable loop.
+            if (
+                leaf.prediction != DEFER_PREDICTION &&
+                (leaf.prediction < 0 ||
+                 leaf.prediction >= num_classes)
+            ) {
+                throw std::runtime_error(
+                    "Leaf prediction is outside valid class range."
+                );
+            }
+
+            if (
+                leaf.prediction == DEFER_PREDICTION &&
+                !BBwrong_eval
+            ) {
+                throw std::runtime_error(
+                    "Deferred leaf encountered, but eval bb_pred was not provided."
+                );
+            }
+
             for (int variable = 0;
-                variable < number_of_variables;
-                ++variable) {
+                 variable < number_of_variables;
+                 ++variable) {
 
                 const auto& state =
                     states[(std::size_t)variable];
 
-                // ordinary uniform replacement
-                // every target row may pair with every replacement row.
-                // each replacement has probability 1/n.
-                if (matched_groups_by_variable_eval == nullptr) {
+                // If the replacement variable has not appeared anywhere on
+                // this root-to-leaf path, perturbing it cannot change routing.
+                // Its expected perturbed mistakes are exactly the ordinary
+                // mistakes at this leaf.
+                if (!state.replacement_feature_used) {
+                    continue;
+                }
 
+                const bool matched_effectively_uniform =
+                    matched_group_effectively_uniform_by_variable_eval !=
+                        nullptr &&
+                    (*matched_group_effectively_uniform_by_variable_eval)[
+                        (std::size_t)variable
+                    ] != 0;
+
+                // Ordinary uniform replacement, or a conditional partition
+                // with exactly one nonempty group.
+                if (
+                    matched_group_of_row_by_variable_eval == nullptr ||
+                    matched_effectively_uniform
+                ) {
                     const int wrong_target_rows =
                         exact_wrong_count_for_leaf_(
                             state.target_rows,
@@ -15935,56 +16014,121 @@ private:
                     continue;
                 }
 
-                // conditional matched-group replacement.
-                // a target row i in G_g can only choose k in G_g.
-                // replacement is uniform within G_g, including k == i.
-                // leaf contribution:
-                // sum_g
-                //   |I_j cap W cap G_g|
-                //   |K_j cap G_g|
-                //   / |G_g|
+                const auto& group_of_row =
+                    (*matched_group_of_row_by_variable_eval)[
+                        (std::size_t)variable
+                    ];
+
+                const auto& inverse_group_sizes =
+                    (*matched_group_inv_size_by_variable_eval)[
+                        (std::size_t)variable
+                    ];
+
+                const int number_of_groups =
+                    static_cast<int>(
+                        inverse_group_sizes.size()
+                    );
+
+                if (!matched_scratch) {
+                    throw std::runtime_error(
+                        "Matched-group scratch space was not provided."
+                    );
+                }
+
+                matched_scratch->begin(number_of_groups);
+
+                // Count donor rows by group by iterating only the set bits of
+                // the current replacement-value mask.
+                for (int wi = 0; wi < ctx.n_words; ++wi) {
+                    uint64_t replacement_bits =
+                        state.replacement_values.w[
+                            (std::size_t)wi
+                        ];
+
+                    while (replacement_bits) {
+                        const int bit =
+                            exact_ctz64_(replacement_bits);
+
+                        const int row =
+                            (wi << 6) + bit;
+
+                        replacement_bits &=
+                            replacement_bits - 1;
+
+                        const int group =
+                            group_of_row[
+                                (std::size_t)row
+                            ];
+
+                        matched_scratch->touch(group);
+
+                        ++matched_scratch->replacement_counts[
+                            (std::size_t)group
+                        ];
+                    }
+
+                    // Count only target rows that are wrong for this leaf.
+                    uint64_t wrong_bits =
+                        state.target_rows.w[
+                            (std::size_t)wi
+                        ];
+
+                    if (leaf.prediction == DEFER_PREDICTION) {
+                        wrong_bits &=
+                            BBwrong_eval->w[
+                                (std::size_t)wi
+                            ];
+                    } else {
+                        wrong_bits &=
+                            ~Y_eval_bits[
+                                (std::size_t)leaf.prediction
+                            ].w[
+                                (std::size_t)wi
+                            ];
+                    }
+
+                    while (wrong_bits) {
+                        const int bit =
+                            exact_ctz64_(wrong_bits);
+
+                        const int row =
+                            (wi << 6) + bit;
+
+                        wrong_bits &=
+                            wrong_bits - 1;
+
+                        const int group =
+                            group_of_row[
+                                (std::size_t)row
+                            ];
+
+                        matched_scratch->touch(group);
+
+                        ++matched_scratch->wrong_counts[
+                            (std::size_t)group
+                        ];
+                    }
+                }
+
                 double expected_mistakes = 0.0;
 
-                for (
-                    const auto& group :
-                    (*matched_groups_by_variable_eval)[
-                        (std::size_t)variable
-                    ]
-                ) {
-                    int wrong_targets_in_group = 0;
-                    int replacements_in_group = 0;
-
-                    for (int row : group) {
-
-                        if (exact_row_in_mask_(
-                                state.replacement_values,
-                                row
-                            )) {
-                            ++replacements_in_group;
-                        }
-
-                        if (
-                            exact_row_in_mask_(
-                                state.target_rows,
-                                row
-                            ) &&
-                            exact_row_wrong_for_leaf_(
-                                row,
-                                leaf.prediction,
-                                Y_eval_bits,
-                                BBwrong_eval
-                            )
-                        ) {
-                            ++wrong_targets_in_group;
-                        }
-                    }
+                // Only groups touched by at least one target or donor mask
+                // need to be visited.
+                for (int group :
+                     matched_scratch->touched_groups) {
 
                     expected_mistakes +=
                         (
-                            (double)wrong_targets_in_group *
-                            (double)replacements_in_group
-                        )
-                        / (double)group.size();
+                            (double)matched_scratch->wrong_counts[
+                                (std::size_t)group
+                            ] *
+                            (double)matched_scratch->replacement_counts[
+                                (std::size_t)group
+                            ]
+                        ) *
+                        inverse_group_sizes[
+                            (std::size_t)group
+                        ];
                 }
 
                 here.replacement_expected_mistakes[
@@ -15992,7 +16136,6 @@ private:
                 ] = expected_mistakes;
             }
 
-            
             acc[leaf.loss].push_back(std::move(here));
         }
 
@@ -16062,36 +16205,91 @@ private:
                 ctx.tail_mask
             );
 
-            std::vector<ExactReplacementState_> left_states;
-            std::vector<ExactReplacementState_> right_states;
-
-            left_states.resize((size_t)number_of_variables);
-            right_states.resize((size_t)number_of_variables);
+            std::vector<ExactReplacementState_> left_states(
+                (size_t)number_of_variables
+            );
+            std::vector<ExactReplacementState_> right_states(
+                (size_t)number_of_variables
+            );
 
             for (int variable = 0;
-                variable < number_of_variables;
-                ++variable) {
+                 variable < number_of_variables;
+                 ++variable) {
 
-                const auto& cur = states[(size_t)variable];
+                const auto& cur =
+                    states[(size_t)variable];
 
-                auto& ls = left_states[(size_t)variable];
-                auto& rs = right_states[(size_t)variable];
+                auto& ls =
+                    left_states[(size_t)variable];
+
+                auto& rs =
+                    right_states[(size_t)variable];
+
+                // Lazy state: before variable j first appears on the path,
+                // target_rows is conceptually original_mask and
+                // replacement_values is conceptually replacement_root_mask.
+                // We do not materialize either mask.
+                if (!cur.replacement_feature_used) {
+                    if (variable != split_variable) {
+                        continue;
+                    }
+
+                    // First occurrence of this replacement variable.
+                    ls.replacement_feature_used = true;
+                    rs.replacement_feature_used = true;
+
+                    ls.target_rows = original_mask;
+                    rs.target_rows = original_mask;
+
+                    ls.replacement_values =
+                        Packed((size_t)ctx.n_words);
+
+                    rs.replacement_values =
+                        Packed((size_t)ctx.n_words);
+
+                    and_bits_eval(
+                        replacement_root_mask,
+                        Xf,
+                        ls.replacement_values,
+                        ctx.n_words,
+                        ctx.tail_mask
+                    );
+
+                    andnot_bits_eval(
+                        replacement_root_mask,
+                        Xf,
+                        rs.replacement_values,
+                        ctx.n_words,
+                        ctx.tail_mask
+                    );
+
+                    continue;
+                }
+
+                ls.replacement_feature_used = true;
+                rs.replacement_feature_used = true;
 
                 ls.target_rows =
                     Packed((size_t)ctx.n_words);
+
                 rs.target_rows =
                     Packed((size_t)ctx.n_words);
+
                 ls.replacement_values =
                     Packed((size_t)ctx.n_words);
+
                 rs.replacement_values =
                     Packed((size_t)ctx.n_words);
 
                 if (variable == split_variable) {
-                    // this is the variable being replaced.
-                    // the target rows do NOT split on their original value.
-                    // Instead, the set of possible replacement values splits.
-                    ls.target_rows.w = cur.target_rows.w;
-                    rs.target_rows.w = cur.target_rows.w;
+                    // This is the variable being replaced. The target rows
+                    // do NOT split on their original value. Instead, the set
+                    // of possible replacement values splits.
+                    ls.target_rows.w =
+                        cur.target_rows.w;
+
+                    rs.target_rows.w =
+                        cur.target_rows.w;
 
                     and_bits_eval(
                         cur.replacement_values,
@@ -16109,10 +16307,9 @@ private:
                         ctx.tail_mask
                     );
                 } else {
-                    // some other variable is being replaced.
-                    // this split is therefore evaluated normally on the
-                    // target row. the possible values of the replaced
-                    // variable are unchanged.
+                    // Some other variable is split normally on the target
+                    // row. The possible values of the replaced variable are
+                    // unchanged.
                     and_bits_eval(
                         cur.target_rows,
                         Xf,
@@ -16131,6 +16328,7 @@ private:
 
                     ls.replacement_values.w =
                         cur.replacement_values.w;
+
                     rs.replacement_values.w =
                         cur.replacement_values.w;
                 }
@@ -16141,12 +16339,16 @@ private:
                     L,
                     bL,
                     original_left,
+                    replacement_root_mask,
                     left_states,
                     internal_to_variable,
                     ctx,
                     Y_eval_bits,
                     BBwrong_eval,
-                    matched_groups_by_variable_eval
+                    matched_group_of_row_by_variable_eval,
+                    matched_group_inv_size_by_variable_eval,
+                    matched_group_effectively_uniform_by_variable_eval,
+                    matched_scratch
                 );
 
             auto Rb =
@@ -16154,12 +16356,16 @@ private:
                     R,
                     bR,
                     original_right,
+                    replacement_root_mask,
                     right_states,
                     internal_to_variable,
                     ctx,
                     Y_eval_bits,
                     BBwrong_eval,
-                    matched_groups_by_variable_eval
+                    matched_group_of_row_by_variable_eval,
+                    matched_group_inv_size_by_variable_eval,
+                    matched_group_effectively_uniform_by_variable_eval,
+                    matched_scratch
                 );
 
             if (Lb.empty() || Rb.empty()) continue;
@@ -16212,8 +16418,8 @@ private:
                             );
 
                             for (int variable = 0;
-                                variable < number_of_variables;
-                                ++variable) {
+                                 variable < number_of_variables;
+                                 ++variable) {
 
                                 combined.replacement_expected_mistakes[
                                     (std::size_t)variable
@@ -16591,10 +16797,19 @@ public:
         const std::vector<std::vector<int>>& variable_columns_in = {},
 
         const std::vector<int>& bb_pred_eval = {},
-        // matched_groups_by_variable_eval[j] is the row partition
-        // used when replacing original variable j.
-        const std::vector<std::vector<std::vector<int>>>&
-            matched_groups_by_variable_eval = {}
+
+        // matched_group_of_row_by_variable_eval[j][i]
+        // gives the matched-group ID of evaluation row i
+        // for replacement variable j.
+        const std::vector<std::vector<int>>&
+            matched_group_of_row_by_variable_eval = {},
+
+        // matched_group_size_by_variable_eval[j][g]
+        // gives the number of evaluation rows in group g
+        // for replacement variable j. Zero-sized groups are allowed because
+        // an original group may be absent from a bootstrap.
+        const std::vector<std::vector<int>>&
+            matched_group_size_by_variable_eval = {}
     ) const {
         if (!result) {
             throw std::runtime_error(
@@ -16642,8 +16857,8 @@ public:
 
             // Each continuous threshold block is one variable.
             for (int g = 0;
-                g < (int)continuous_starts.size();
-                ++g) {
+                 g < (int)continuous_starts.size();
+                 ++g) {
 
                 const int start =
                     continuous_starts[(size_t)g];
@@ -16665,75 +16880,160 @@ public:
         const int number_of_variables =
             (int)variable_columns.size();
 
+        const bool has_group_of_row =
+            !matched_group_of_row_by_variable_eval.empty();
+
+        const bool has_group_sizes =
+            !matched_group_size_by_variable_eval.empty();
+
+        if (has_group_of_row != has_group_sizes) {
+            throw std::runtime_error(
+                "Matched-group evaluation requires both "
+                "group-of-row and group-size arrays."
+            );
+        }
+
         const bool use_matched_groups =
-            !matched_groups_by_variable_eval.empty();
+            has_group_of_row;
+
+        // Hot-loop metadata derived once per evaluation/bootstrap.
+        std::vector<std::vector<double>>
+            matched_group_inv_size_by_variable_eval;
+
+        std::vector<uint8_t>
+            matched_group_effectively_uniform_by_variable_eval;
 
         if (use_matched_groups) {
             if (
-                (int)matched_groups_by_variable_eval.size() !=
-                number_of_variables
+                (int)matched_group_of_row_by_variable_eval.size() !=
+                    number_of_variables ||
+                (int)matched_group_size_by_variable_eval.size() !=
+                    number_of_variables
             ) {
                 throw std::runtime_error(
-                    "matched_groups_by_variable_eval must contain exactly "
-                    "one row partition per original variable."
+                    "Matched-group arrays must contain exactly one "
+                    "entry per original variable."
                 );
             }
 
-            for (int variable = 0;
-                variable < number_of_variables;
-                ++variable) {
+            matched_group_inv_size_by_variable_eval.resize(
+                (std::size_t)number_of_variables
+            );
 
-                const auto& groups =
-                    matched_groups_by_variable_eval[
+            matched_group_effectively_uniform_by_variable_eval.assign(
+                (std::size_t)number_of_variables,
+                0
+            );
+
+            for (int variable = 0;
+                 variable < number_of_variables;
+                 ++variable) {
+
+                const auto& group_of_row =
+                    matched_group_of_row_by_variable_eval[
                         (std::size_t)variable
                     ];
 
-                if (groups.empty()) {
+                const auto& group_sizes =
+                    matched_group_size_by_variable_eval[
+                        (std::size_t)variable
+                    ];
+
+                if ((int)group_of_row.size() != ctx.n_eval) {
                     throw std::runtime_error(
-                        "Every variable must have a nonempty "
-                        "matched-group partition."
+                        "Matched-group row map has the wrong "
+                        "number of evaluation rows."
                     );
                 }
 
-                std::vector<uint8_t> seen(
-                    (std::size_t)ctx.n_eval,
+                if (group_sizes.empty()) {
+                    throw std::runtime_error(
+                        "Matched-group size array is empty."
+                    );
+                }
+
+                std::vector<int> observed_group_sizes(
+                    group_sizes.size(),
                     0
                 );
 
-                for (const auto& group : groups) {
-                    if (group.empty()) {
+                for (int row = 0;
+                     row < ctx.n_eval;
+                     ++row) {
+
+                    const int group =
+                        group_of_row[(std::size_t)row];
+
+                    if (
+                        group < 0 ||
+                        group >= (int)group_sizes.size()
+                    ) {
                         throw std::runtime_error(
-                            "A variable's matched-group partition "
-                            "contains an empty group."
+                            "Matched-group row map contains an "
+                            "out-of-range group ID."
                         );
                     }
 
-                    for (int row : group) {
-                        if (row < 0 || row >= ctx.n_eval) {
-                            throw std::runtime_error(
-                                "matched_groups_by_variable_eval contains "
-                                "an out-of-range row index."
-                            );
-                        }
-
-                        if (seen[(std::size_t)row]) {
-                            throw std::runtime_error(
-                                "A variable's matched groups are not disjoint."
-                            );
-                        }
-
-                        seen[(std::size_t)row] = 1;
-                    }
+                    ++observed_group_sizes[
+                        (std::size_t)group
+                    ];
                 }
 
-                for (int row = 0; row < ctx.n_eval; ++row) {
-                    if (!seen[(std::size_t)row]) {
+                auto& inverse_group_sizes =
+                    matched_group_inv_size_by_variable_eval[
+                        (std::size_t)variable
+                    ];
+
+                inverse_group_sizes.assign(
+                    group_sizes.size(),
+                    0.0
+                );
+
+                int number_of_nonempty_groups = 0;
+
+                for (std::size_t group = 0;
+                     group < group_sizes.size();
+                     ++group) {
+
+                    if (group_sizes[group] < 0) {
                         throw std::runtime_error(
-                            "Each variable's matched groups must "
-                            "partition the evaluation dataset."
+                            "Matched-group size cannot be negative."
                         );
                     }
+
+                    if (
+                        observed_group_sizes[group] !=
+                        group_sizes[group]
+                    ) {
+                        throw std::runtime_error(
+                            "Matched-group size array does not agree "
+                            "with the row-to-group map."
+                        );
+                    }
+
+                    if (group_sizes[group] > 0) {
+                        inverse_group_sizes[group] =
+                            1.0 /
+                            static_cast<double>(
+                                group_sizes[group]
+                            );
+
+                        ++number_of_nonempty_groups;
+                    }
                 }
+
+                if (number_of_nonempty_groups <= 0) {
+                    throw std::runtime_error(
+                        "Matched-group partition has no rows."
+                    );
+                }
+
+                matched_group_effectively_uniform_by_variable_eval[
+                    (std::size_t)variable
+                ] =
+                    number_of_nonempty_groups == 1
+                        ? 1
+                        : 0;
             }
         }
 
@@ -16743,8 +17043,8 @@ public:
         );
 
         for (int variable = 0;
-            variable < number_of_variables;
-            ++variable) {
+             variable < number_of_variables;
+             ++variable) {
 
             const auto& cols =
                 variable_columns[(size_t)variable];
@@ -16818,46 +17118,52 @@ public:
                 &BBwrong_eval_storage;
         }
 
-        // Initially every target row is possible and every observed
-        // replacement value is possible for every variable.
+        // Lazy root state: no replacement variable has appeared yet, so no
+        // target/donor masks need to be materialized.
         std::vector<ExactReplacementState_> root_states(
             (size_t)number_of_variables
         );
 
-        for (int variable = 0;
-            variable < number_of_variables;
-            ++variable) {
-
-            root_states[(size_t)variable].target_rows =
-                Packed((size_t)ctx.n_words);
-
-            root_states[(size_t)variable].replacement_values =
-                Packed((size_t)ctx.n_words);
-
-            root_states[(size_t)variable].target_rows.w =
-                root_mask.w;
-
-            root_states[(size_t)variable].replacement_values.w =
-                root_mask.w;
-        }
-
-        const std::vector<std::vector<std::vector<int>>>*
-            matched_groups_by_variable_eval_ptr =
+        const std::vector<std::vector<int>>*
+            matched_group_of_row_by_variable_eval_ptr =
                 use_matched_groups
-                    ? &matched_groups_by_variable_eval
+                    ? &matched_group_of_row_by_variable_eval
                     : nullptr;
+
+        const std::vector<std::vector<double>>*
+            matched_group_inv_size_by_variable_eval_ptr =
+                use_matched_groups
+                    ? &matched_group_inv_size_by_variable_eval
+                    : nullptr;
+
+        const std::vector<uint8_t>*
+            matched_group_effectively_uniform_by_variable_eval_ptr =
+                use_matched_groups
+                    ? &matched_group_effectively_uniform_by_variable_eval
+                    : nullptr;
+
+        ExactMatchedScratch_ matched_scratch;
+
+        ExactMatchedScratch_* matched_scratch_ptr =
+            use_matched_groups
+                ? &matched_scratch
+                : nullptr;
 
         auto buckets =
             collect_exact_replacement_mistakes_by_obj_(
                 result.get(),
                 budget,
                 root_mask,
+                root_mask,
                 root_states,
                 internal_to_variable,
                 ctx,
                 Y_eval_bits,
                 BBwrong_eval_ptr,
-                matched_groups_by_variable_eval_ptr
+                matched_group_of_row_by_variable_eval_ptr,
+                matched_group_inv_size_by_variable_eval_ptr,
+                matched_group_effectively_uniform_by_variable_eval_ptr,
+                matched_scratch_ptr
             );
 
         std::vector<ExactReplacementMistakesWithObj> out;
@@ -16883,8 +17189,8 @@ public:
                     (double)counts.original_mistakes;
 
                 for (int variable = 0;
-                    variable < number_of_variables;
-                    ++variable) {
+                     variable < number_of_variables;
+                     ++variable) {
 
                     row.mistakes[
                         (std::size_t)variable + 1
@@ -16900,5 +17206,6 @@ public:
 
         return out;
     }
+
 
 };
