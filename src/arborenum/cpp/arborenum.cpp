@@ -15702,7 +15702,7 @@ private:
 
 
     struct ExactReplacementState_ {
-        // These masks are only materialized after the replacement variable
+        // these masks are only materialized after the replacement variable
         // has appeared on the current tree path. Until then, perturbing the
         // variable cannot change routing, so its leaf contribution is just
         // the ordinary/original leaf mistakes.
@@ -15721,7 +15721,7 @@ private:
         std::vector<ExactReplacementCounts_> counts;
     };
 
-    // Reused by every recursive call. Stamps let us avoid clearing O(G)
+    // reused by every recursive call. stamps let us avoid clearing O(G)
     // counters for every variable/leaf; we only reset groups actually touched
     // by the current target/donor masks.
     struct ExactMatchedScratch_ {
@@ -15749,8 +15749,6 @@ private:
 
             ++current_stamp;
 
-            // Extremely unlikely, but keep the stamp logic correct after
-            // uint32_t wraparound.
             if (current_stamp == 0) {
                 std::fill(stamps.begin(), stamps.end(), 0);
                 current_stamp = 1;
@@ -15966,7 +15964,7 @@ private:
                 const auto& state =
                     states[(std::size_t)variable];
 
-                // If the replacement variable has not appeared anywhere on
+                // if the replacement variable has not appeared anywhere on
                 // this root-to-leaf path, perturbing it cannot change routing.
                 // Its expected perturbed mistakes are exactly the ordinary
                 // mistakes at this leaf.
@@ -15981,7 +15979,7 @@ private:
                         (std::size_t)variable
                     ] != 0;
 
-                // Ordinary uniform replacement, or a conditional partition
+                // ordinary uniform replacement, or a conditional partition
                 // with exactly one nonempty group.
                 if (
                     matched_group_of_row_by_variable_eval == nullptr ||
@@ -16037,7 +16035,7 @@ private:
 
                 matched_scratch->begin(number_of_groups);
 
-                // Count donor rows by group by iterating only the set bits of
+                // count donor rows by group by iterating only the set bits of
                 // the current replacement-value mask.
                 for (int wi = 0; wi < ctx.n_words; ++wi) {
                     uint64_t replacement_bits =
@@ -16067,7 +16065,7 @@ private:
                         ];
                     }
 
-                    // Count only target rows that are wrong for this leaf.
+                    // count only target rows that are wrong for this leaf.
                     uint64_t wrong_bits =
                         state.target_rows.w[
                             (std::size_t)wi
@@ -16112,8 +16110,7 @@ private:
 
                 double expected_mistakes = 0.0;
 
-                // Only groups touched by at least one target or donor mask
-                // need to be visited.
+                // only groups touched by at least one target or donor mask need to be visited.
                 for (int group :
                      matched_scratch->touched_groups) {
 
@@ -16838,10 +16835,8 @@ public:
                 ? budget_override
                 : result->budget;
 
-        // --------------------------------------------------------
-        // Resolve original-variable -> internal-column grouping.
-        // No graph scan is done.
-        // --------------------------------------------------------
+        // resolve original-variable -> internal-column grouping.
+        // no graph scan is done.
         std::vector<std::vector<int>> variable_columns;
 
         if (!variable_columns_in.empty()) {
@@ -16850,12 +16845,12 @@ public:
             const int first_cont =
                 first_continuous_feature_();
 
-            // Ordinary binary variables.
+            // ordinary binary variables.
             for (int f = 0; f < first_cont; ++f) {
                 variable_columns.push_back({f});
             }
 
-            // Each continuous threshold block is one variable.
+            // each continuous threshold block is one variable.
             for (int g = 0;
                  g < (int)continuous_starts.size();
                  ++g) {
@@ -16896,7 +16891,6 @@ public:
         const bool use_matched_groups =
             has_group_of_row;
 
-        // Hot-loop metadata derived once per evaluation/bootstrap.
         std::vector<std::vector<double>>
             matched_group_inv_size_by_variable_eval;
 
@@ -17118,7 +17112,7 @@ public:
                 &BBwrong_eval_storage;
         }
 
-        // Lazy root state: no replacement variable has appeared yet, so no
+        // lazy root state: no replacement variable has appeared yet, so no
         // target/donor masks need to be materialized.
         std::vector<ExactReplacementState_> root_states(
             (size_t)number_of_variables
