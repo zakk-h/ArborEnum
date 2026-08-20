@@ -32,6 +32,8 @@ pip install arborenum
 
 See the [example notebook](https://github.com/zakk-h/ArborEnum/blob/main/examples/example.ipynb) for a complete walkthrough.
 
+For more detail about the algorithms themselves, see our [paper](https://arxiv.org/abs/2608.04310).
+
 ## Basic usage
 
 ```python

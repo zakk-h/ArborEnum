@@ -10,8 +10,59 @@
 #include <vector>
 #include <chrono>
 #include <iomanip>
+#include <atomic>
+#include <thread>
 
 using std::cout;
+
+struct PeakMemorySampler {
+    std::atomic<bool> stop_requested{false};
+    std::thread worker;
+    double peak_mb = 0.0;
+    bool running = false;
+
+    void start() {
+        stop_requested.store(false, std::memory_order_relaxed);
+        peak_mb = ArborEnum::current_memory_mb();
+        running = true;
+
+        worker = std::thread([this]() {
+            while (!stop_requested.load(std::memory_order_relaxed)) {
+                peak_mb = std::max(
+                    peak_mb,
+                    ArborEnum::current_memory_mb()
+                );
+
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(20)
+                );
+            }
+
+            peak_mb = std::max(
+                peak_mb,
+                ArborEnum::current_memory_mb()
+            );
+        });
+    }
+
+    double finish() {
+        if (running) {
+            stop_requested.store(true, std::memory_order_relaxed);
+
+            if (worker.joinable()) {
+                worker.join();
+            }
+
+            running = false;
+        }
+
+        return peak_mb;
+    }
+
+    ~PeakMemorySampler() {
+        finish();
+    }
+};
 
 struct RIDResult {
     std::vector<double> mean_sub_mr;
@@ -651,7 +702,11 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
             );
         }
 
+        PeakMemorySampler training_memory;
+        training_memory.start();
+
         const auto training_start = std::chrono::steady_clock::now();
+
         if (use_anytime_fit) {
             model.fit_anytime(
                 X_col_major,
@@ -691,31 +746,34 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
                 static_cast<int8_t>(depth_budget),
                 rashomon_mult,
                 static_cast<int8_t>(lookahead_k),
-                -1,                            // root_budget
+                -1,
                 use_multipass,
                 rule_list_mode,
                 proxy_style,
                 majority_leaf_only,
                 cache_cheap_subproblems,
                 proxy_caching,
-                proxy_threshold_features,     // allowed_proxy_features
+                proxy_threshold_features,
                 !continuous_proxy_in_lickety,
                 !continuous_proxy_in_depthd_exact,
                 !continuous_proxy_in_greedy,
-                true,                          // rashomon_mode
+                true,
                 continuous_starts,
-                false,                         // stronger_rollout_flag
+                false,
                 use_deferral,
                 eta_defer,
                 bb_pred_bootstrap
             );
         }
 
+        const auto training_end = std::chrono::steady_clock::now();
+
+        const double training_peak_mb =
+            training_memory.finish();
+
         if (!model.result) {
             continue;
         }
-
-        const auto training_end = std::chrono::steady_clock::now();
 
         const double training_seconds =
             std::chrono::duration<double>(
@@ -725,11 +783,11 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
         cout << std::fixed << std::setprecision(3)
             << "RID bootstrap " << (bootstrap + 1)
             << ": Rashomon training = "
-            << training_seconds << " s\n";
+            << training_seconds << " s\n"
+            << "RID bootstrap " << (bootstrap + 1)
+            << ": Rashomon training peak memory = "
+            << training_peak_mb << " MB\n";
 
-        const auto post_training_start = std::chrono::steady_clock::now();
-
-        // the first epsilon off of min objective, refinement just boosts approximation quality
         const int budget_override = std::min(
             model.result->budget,
             static_cast<int>(std::llround(
@@ -737,6 +795,21 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
                 static_cast<double>(model.result->min_objective)
             ))
         );
+
+        const double pre_importance_memory_mb =
+            ArborEnum::current_memory_mb();
+
+        cout << "RID bootstrap " << (bootstrap + 1)
+            << ": memory before feature importance = "
+            << pre_importance_memory_mb << " MB\n";
+
+        PeakMemorySampler importance_memory;
+        importance_memory.start();
+
+        const auto post_training_start =
+            std::chrono::steady_clock::now();
+
+        
 
         // lossless permutation importance: compute the exact expected replacement mistakes for
         // every variable and every tree in one packed graph traversal.
@@ -864,6 +937,16 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
                     exact_end - exact_start
                 ).count();
 
+            // peak reached at any point while computing feature importance
+            const double importance_peak_mb =
+                importance_memory.finish();
+
+            const double importance_extra_peak_mb =
+                std::max(
+                    0.0,
+                    importance_peak_mb - pre_importance_memory_mb
+                );
+
             const auto bootstrap_end =
                 std::chrono::steady_clock::now();
 
@@ -878,21 +961,36 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
                 ).count();
 
             cout << std::fixed << std::setprecision(3)
-                 << "RID bootstrap " << (bootstrap + 1)
-                 << ": LOSSLESS feature evaluation = "
-                 << exact_seconds << " s\n"
-                 << "RID bootstrap " << (bootstrap + 1)
-                 << ": post-training RID = "
-                 << post_training_seconds << " s\n"
-                 << "RID bootstrap " << (bootstrap + 1)
-                 << ": total = "
-                 << bootstrap_seconds << " s\n"
-                 << "RID bootstrap " << (bootstrap + 1)
-                 << ": training fraction = "
-                 << (100.0 * training_seconds / bootstrap_seconds)
-                 << "%, post-training fraction = "
-                 << (100.0 * post_training_seconds / bootstrap_seconds)
-                 << "%\n";
+                << "RID bootstrap " << (bootstrap + 1)
+                << ": Fast Graph feature evaluation = "
+                << exact_seconds << " s\n"
+
+                << "RID bootstrap " << (bootstrap + 1)
+                << ": memory before feature importance = "
+                << pre_importance_memory_mb << " MB\n"
+
+                << "RID bootstrap " << (bootstrap + 1)
+                << ": feature importance peak memory = "
+                << importance_peak_mb << " MB\n"
+
+                << "RID bootstrap " << (bootstrap + 1)
+                << ": feature importance extra peak memory = "
+                << importance_extra_peak_mb << " MB\n"
+
+                << "RID bootstrap " << (bootstrap + 1)
+                << ": post-training RID = "
+                << post_training_seconds << " s\n"
+
+                << "RID bootstrap " << (bootstrap + 1)
+                << ": total = "
+                << bootstrap_seconds << " s\n"
+
+                << "RID bootstrap " << (bootstrap + 1)
+                << ": training fraction = "
+                << (100.0 * training_seconds / bootstrap_seconds)
+                << "%, post-training fraction = "
+                << (100.0 * post_training_seconds / bootstrap_seconds)
+                << "%\n";
 
             continue;
         }

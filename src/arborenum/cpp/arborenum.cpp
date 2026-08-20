@@ -912,6 +912,11 @@ public:
         NUMERICAL = 1
     };
 
+    static double current_memory_mb() {
+        return current_memory_mb_();
+    }
+
+
 private:
     int n_samples = 0;
     int n_features = 0;
