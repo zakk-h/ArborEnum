@@ -702,6 +702,7 @@ class ArborEnum:
         use_deferral=False,
         eta_defer=0.0,
         bb_pred=None,
+        additive=False,
     ):
         # fit directly from a mixed numerical matrix.
         # columns with at most binary_unique_threshold unique values are
@@ -834,6 +835,8 @@ class ArborEnum:
                 memory_limit_mb=memory_limit_mb,
                 use_deferral=use_deferral,
                 eta_defer=eta_defer,
+                additive=additive,
+                
             )
 
         return self.fit_prepared(
@@ -866,6 +869,7 @@ class ArborEnum:
             stronger_rollout=stronger_rollout,
             use_deferral=use_deferral,
             eta_defer=eta_defer,
+            additive=additive,
         )
 
     
@@ -1232,6 +1236,7 @@ class ArborEnum:
         use_deferral=False,
         eta_defer=0.0,
         bb_pred=None,
+        additive=False,
     ):
         X = np.asarray(X, dtype=np.uint8)
         y = np.asarray(y, dtype=int)
@@ -1368,6 +1373,7 @@ class ArborEnum:
             bool(use_deferral),
             float(eta_defer),
             bb_pred_vec,
+            bool(additive)
         )
 
         return self
@@ -1881,6 +1887,7 @@ class ArborEnum:
         memory_limit_mb=-1.0,
         use_deferral=False,
         eta_defer=0.0,
+        additive=False,
     ):
         first_rashomon_mult = float(first_rashomon_mult)
         second_rashomon_mult = float(second_rashomon_mult)
@@ -1944,6 +1951,7 @@ class ArborEnum:
             float(memory_limit_mb),
             bool(use_deferral),
             float(eta_defer),
+            bool(additive)
         )
 
         return self
@@ -3279,6 +3287,7 @@ class ArborEnum:
         lambda_reg=0.01,
         depth_budget=5,
         rashomon_mult=0.03,
+        additive=False,
         second_rashomon_mult=None,
         multiplier_step_size=0.01,
         lookahead_k=1,
@@ -3542,7 +3551,8 @@ class ArborEnum:
             bb_pred_vec,
             bool(return_joint_samples),
             bool(lossless),
-            matched_groups_by_variable_vec
+            matched_groups_by_variable_vec,
+            bool(additive)
         )
 
         if (
@@ -3581,6 +3591,7 @@ class ArborEnum:
         return_joint_samples=False,
         lossless=True,
         matched_groups_by_variable=None,
+        additive=False,
     ):
         X = np.asarray(X, dtype=np.uint8)
         y = np.asarray(y, dtype=int)
@@ -3659,7 +3670,8 @@ class ArborEnum:
             bb_pred_vec,
             bool(return_joint_samples),
             bool(lossless),
-            matched_groups_by_variable_vec
+            matched_groups_by_variable_vec,
+            bool(additive)
         )
 
         if (
@@ -3720,6 +3732,7 @@ class ArborEnum:
         return_joint_samples=False,
         lossless=True,
         matched_groups_by_variable=None,
+        additive=False,
     ):
         X_num = np.asarray(X_num, dtype=np.float64)
         y = np.asarray(y, dtype=int)
@@ -3935,7 +3948,8 @@ class ArborEnum:
             bb_pred_vec,
             bool(return_joint_samples),
             bool(lossless),
-            matched_groups_by_variable_vec
+            matched_groups_by_variable_vec,
+            bool(additive)
         )
 
         if (

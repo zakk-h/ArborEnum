@@ -305,7 +305,8 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
     bool return_joint_samples = false,
     bool lossless = false,
     const std::vector<std::vector<std::vector<int>>>&
-        matched_groups_by_variable = {}
+        matched_groups_by_variable = {},
+    bool additive = false
 ) {
     // retained for API compatibility. both modes now use the scalar packed-trie
     // extractors, which are substantially more memory efficient than storing
@@ -687,6 +688,7 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
         model.set_trie_cache_enabled(trie_cache_enabled);
         model.set_greedy_split_mode(greedy_split_mode);
         model.set_greedy_continuous_mode(greedy_continuous_mode);
+        model.set_additive(additive);
 
         const bool any_proxy_is_restricted =
             !continuous_proxy_in_lickety ||
@@ -788,13 +790,23 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
             << ": Rashomon training peak memory = "
             << training_peak_mb << " MB\n";
 
+        const int requested_budget =
+            additive
+                ? static_cast<int>(std::llround(
+                    static_cast<double>(model.result->min_objective)
+                    + rashomon_mult * static_cast<double>(n)
+                ))
+                : static_cast<int>(std::llround(
+                    (1.0 + rashomon_mult) *
+                    static_cast<double>(model.result->min_objective)
+                ));
+
         const int budget_override = std::min(
             model.result->budget,
-            static_cast<int>(std::llround(
-                (1.0 + rashomon_mult) *
-                static_cast<double>(model.result->min_objective)
-            ))
+            requested_budget
         );
+
+     
 
         const double pre_importance_memory_mb =
             ArborEnum::current_memory_mb();

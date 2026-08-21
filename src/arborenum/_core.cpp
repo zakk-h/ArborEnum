@@ -1757,6 +1757,12 @@ PYBIND11_MODULE(_core, m) {
         )
 
         .def(
+            "set_additive",
+            &ArborEnum::set_additive,
+            py::arg("additive") = false
+        )
+
+        .def(
             "get_all_predictions",
             [](const ArborEnum &self,
                py::array_t<
@@ -2092,7 +2098,8 @@ PYBIND11_MODULE(_core, m) {
             > bb_pred,
             bool return_joint_samples,
             bool lossless,
-            std::vector<std::vector<std::vector<int>>> matched_groups_by_variable
+            std::vector<std::vector<std::vector<int>>> matched_groups_by_variable,
+            bool additive
         ) {
             py::buffer_info xinfo = X.request();
             py::buffer_info yinfo = y.request();
@@ -2238,7 +2245,8 @@ PYBIND11_MODULE(_core, m) {
                     bb_pred_vec,
                     return_joint_samples,
                     lossless,
-                    matched_groups_by_variable
+                    matched_groups_by_variable,
+                    additive
                 );
 
             py::dict out;
@@ -2272,7 +2280,8 @@ PYBIND11_MODULE(_core, m) {
         py::arg("return_joint_samples") = false,
         py::arg("lossless") = false,
         py::arg("matched_groups_by_variable") =
-            std::vector<std::vector<std::vector<int>>>{}
+            std::vector<std::vector<std::vector<int>>>{},
+        py::arg("additive") = false
         
     );
 
@@ -2343,7 +2352,8 @@ PYBIND11_MODULE(_core, m) {
             > bb_pred,
             bool return_joint_samples,
             bool lossless,
-            std::vector<std::vector<std::vector<int>>> matched_groups_by_variable
+            std::vector<std::vector<std::vector<int>>> matched_groups_by_variable,
+            bool additive
         ) {
             py::buffer_info num_info =
                 X_num.request();
@@ -2940,7 +2950,8 @@ PYBIND11_MODULE(_core, m) {
                     bb_pred_vec,
                     return_joint_samples,
                     lossless,
-                    matched_groups_by_variable
+                    matched_groups_by_variable,
+                    additive
                 );
 
             py::dict out;
@@ -3014,7 +3025,8 @@ PYBIND11_MODULE(_core, m) {
         py::arg("return_joint_samples") = false,
         py::arg("lossless") = false,
         py::arg("matched_groups_by_variable") =
-            std::vector<std::vector<std::vector<int>>>{}
+            std::vector<std::vector<std::vector<int>>>{},
+        py::arg("additive") = false
     );
 
     

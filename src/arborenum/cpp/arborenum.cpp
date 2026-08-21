@@ -929,6 +929,7 @@ private:
     int obj_bound = 0;
 
     double multiplicative_slack = 0.0;
+    bool additive = false;
 
     vector<Packed> X_bits; // vector of Packed, each Packed is a feature column. packed is a sequence of 64-bit words where each bit corresponds to the row value for the column
     // Packed Ypos; // each bit of a word is the label for the row
@@ -1418,8 +1419,6 @@ private:
     #endif
     }
 
-    
-
     void begin_resource_tracking_(
         double runtime_limit_seconds,
         double memory_limit_mb
@@ -1535,6 +1534,25 @@ private:
 
     inline int count_class(const Packed& mask, int c) const {
         return popcount_and(mask, Y_bits[(size_t)c]);
+    }
+
+    int rashomon_budget_(
+        int reference_objective,
+        double rashomon_mult,
+        int reference_n,
+        bool apply_multiplicative_slack
+    ) const {
+        double bound = additive
+            ? static_cast<double>(reference_objective)
+                + rashomon_mult * static_cast<double>(reference_n)
+            : static_cast<double>(reference_objective)
+                * (1.0 + rashomon_mult);
+
+        if (apply_multiplicative_slack) {
+            bound *= (1.0 + multiplicative_slack);
+        }
+
+        return static_cast<int>(std::llround(bound));
     }
 
     // standard formulas in greedy decision tree optimization
@@ -1857,6 +1875,7 @@ public:
     void set_use_128bit_fingerprint(bool on) { key_mode = on ? KeyMode::HASH128 : KeyMode::HASH64; }
     void set_trie_cache_enabled(bool on) { trie_cache_enabled = on; }
     void set_multiplicative_slack(double s) { multiplicative_slack = s; }
+    void set_additive(bool on) { additive = on; }
     void set_use_multipass(bool on) { use_multipass = on; }
     void set_rule_list_mode(bool on) { rule_list_mode = on; }
     void set_majority_leaf_only(bool on) { majority_leaf_only = on; }
@@ -3230,12 +3249,12 @@ public:
                     );
             }
 
-            obj_bound =
-                (int)std::llround(
-                    (double)best_objective *
-                    (1.0 + rashomon_mult) *
-                    (1.0 + multiplicative_slack)
-                );
+           obj_bound = rashomon_budget_(
+                best_objective,
+                rashomon_mult,
+                subsample_size,
+                true
+            );
 
             // fit the actual Rashomon set on the subsample mask.
 
@@ -3666,7 +3685,13 @@ public:
             cout << "Best objective: " << best_objective
                 << " (" << (double)best_objective / (double)n_samples << ")\n";
 
-            obj_bound = (int)llround(best_objective * (1.0 + rashomon_mult) * (1.0 + multiplicative_slack));
+            obj_bound = rashomon_budget_(
+                best_objective,
+                rashomon_mult,
+                n_samples,
+                true
+            );
+
 
             cout << "Objective bound: " << obj_bound << "\n";
         }
@@ -3937,12 +3962,11 @@ public:
         // mode 3: second multiplier is larger.
         // do expected behavior of extending to it
         const int explicit_second_budget =
-            static_cast<int>(
-                std::llround(
-                    static_cast<double>(best_objective) *
-                    (1.0 + second_rashomon_mult) *
-                    (1.0 + multiplicative_slack)
-                )
+            rashomon_budget_(
+                best_objective,
+                second_rashomon_mult,
+                n_samples,
+                true
             );
 
         if (explicit_second_budget < first_budget) {
@@ -3972,12 +3996,11 @@ public:
                 current_multiplier + multiplier_step_size
             );
 
-            int next_budget = static_cast<int>(
-                std::llround(
-                    static_cast<double>(best_objective) *
-                    (1.0 + current_multiplier) *
-                    (1.0 + multiplicative_slack)
-                )
+            int next_budget = rashomon_budget_(
+                best_objective,
+                current_multiplier,
+                n_samples,
+                true
             );
 
             // ensure every unfinished iteration makes integer-budget progress.
@@ -4883,9 +4906,13 @@ public:
             );
         }
 
-        const int eps_abs = (int)llround(
-            (1.0 + rashomon_mult) * (double)P_root
+        const int eps_abs = rashomon_budget_(
+            P_root,
+            rashomon_mult,
+            n_samples,
+            false
         );
+
 
         // don't allow early stopping in the initial solve
         const bool limits_were_active = resource_limits_active_;
@@ -4979,11 +5006,11 @@ public:
             second_rashomon_mult > rashomon_mult &&
             !resource_limit_reached_()
         ) {
-            const int final_budget = static_cast<int>(
-                std::llround(
-                    (1.0 + second_rashomon_mult) *
-                    static_cast<double>(P_root)
-                )
+            const int final_budget = rashomon_budget_(
+                P_root,
+                second_rashomon_mult,
+                n_samples,
+                false
             );
 
             double current_multiplier = rashomon_mult;
@@ -4997,11 +5024,11 @@ public:
                     current_multiplier + multiplier_step_size
                 );
 
-                int next_budget = static_cast<int>(
-                    std::llround(
-                        (1.0 + current_multiplier) *
-                        static_cast<double>(P_root)
-                    )
+                int next_budget = rashomon_budget_(
+                    P_root,
+                    current_multiplier,
+                    n_samples,
+                    false
                 );
 
                 // rounding can otherwise make a multiplier step produce
