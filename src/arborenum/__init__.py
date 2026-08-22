@@ -3314,6 +3314,8 @@ class ArborEnum:
         return_joint_samples=False,
         lossless=True,
         matched_groups_by_variable=None,
+        importance_interval_mode=0,
+        subsample=-1,
     ):
 
         if hasattr(X, "columns"):
@@ -3369,10 +3371,37 @@ class ArborEnum:
         n_boot = int(n_boot)
         n_scramble_evals = int(n_scramble_evals)
 
+        importance_interval_mode = int(importance_interval_mode)
+        subsample = int(subsample)
+
+        if importance_interval_mode not in (0, 1, 2):
+            raise ValueError(
+                "importance_interval_mode must be 0, 1, or 2."
+            )
+
+        if importance_interval_mode != 0 and not lossless:
+            raise ValueError(
+                "importance_interval_mode requires lossless=True."
+            )
+
+        if importance_interval_mode != 0 and return_joint_samples:
+            raise ValueError(
+                "return_joint_samples is incompatible with "
+                "importance_interval_mode != 0."
+            )
+
+        if subsample != -1 and (
+            subsample <= 0 or subsample > X_original.shape[0]
+        ):
+            raise ValueError(
+                "subsample must be -1 or an integer in "
+                f"[1, {X_original.shape[0]}]."
+            )
+
         if n_boot <= 0:
             raise ValueError("n_boot must be positive.")
 
-        if n_scramble_evals <= 0:
+        if not lossless and n_scramble_evals <= 0:
             raise ValueError(
                 "n_scramble_evals must be positive."
             )
@@ -3552,7 +3581,9 @@ class ArborEnum:
             bool(return_joint_samples),
             bool(lossless),
             matched_groups_by_variable_vec,
-            bool(additive)
+            bool(additive),
+            int(importance_interval_mode),
+            int(subsample),
         )
 
         if (
@@ -3565,6 +3596,12 @@ class ArborEnum:
                 self._rid_out[
                     "feature_importance_weight_samples"
                 ],
+                dtype=float,
+            )
+
+        if "bootstrap_importance_intervals" in self._rid_out:
+            self._rid_out["bootstrap_importance_intervals"] = np.asarray(
+                self._rid_out["bootstrap_importance_intervals"],
                 dtype=float,
             )
 
@@ -3592,6 +3629,8 @@ class ArborEnum:
         lossless=True,
         matched_groups_by_variable=None,
         additive=False,
+        importance_interval_mode=0,
+        subsample=-1,
     ):
         X = np.asarray(X, dtype=np.uint8)
         y = np.asarray(y, dtype=int)
@@ -3618,7 +3657,34 @@ class ArborEnum:
         if n_boot <= 0:
             raise ValueError("n_boot must be positive.")
 
-        if n_scramble_evals <= 0:
+        importance_interval_mode = int(importance_interval_mode)
+        subsample = int(subsample)
+
+        if importance_interval_mode not in (0, 1, 2):
+            raise ValueError(
+                "importance_interval_mode must be 0, 1, or 2."
+            )
+
+        if importance_interval_mode != 0 and not lossless:
+            raise ValueError(
+                "importance_interval_mode requires lossless=True."
+            )
+
+        if importance_interval_mode != 0 and return_joint_samples:
+            raise ValueError(
+                "return_joint_samples is incompatible with "
+                "importance_interval_mode != 0."
+            )
+
+        if subsample != -1 and (
+            subsample <= 0 or subsample > X.shape[0]
+        ):
+            raise ValueError(
+                "subsample must be -1 or an integer in "
+                f"[1, {X.shape[0]}]."
+            )
+
+        if not lossless and n_scramble_evals <= 0:
             raise ValueError(
                 "n_scramble_evals must be positive."
             )
@@ -3671,7 +3737,9 @@ class ArborEnum:
             bool(return_joint_samples),
             bool(lossless),
             matched_groups_by_variable_vec,
-            bool(additive)
+            bool(additive),
+            int(importance_interval_mode),
+            int(subsample),
         )
 
         if (
@@ -3684,6 +3752,12 @@ class ArborEnum:
                 self._rid_out[
                     "feature_importance_weight_samples"
                 ],
+                dtype=float,
+            )
+        
+        if "bootstrap_importance_intervals" in self._rid_out:
+            self._rid_out["bootstrap_importance_intervals"] = np.asarray(
+                self._rid_out["bootstrap_importance_intervals"],
                 dtype=float,
             )
 
@@ -3733,6 +3807,8 @@ class ArborEnum:
         lossless=True,
         matched_groups_by_variable=None,
         additive=False,
+        importance_interval_mode=0,
+        subsample=-1,
     ):
         X_num = np.asarray(X_num, dtype=np.float64)
         y = np.asarray(y, dtype=int)
@@ -3761,7 +3837,34 @@ class ArborEnum:
         if n_boot <= 0:
             raise ValueError("n_boot must be positive.")
 
-        if n_scramble_evals <= 0:
+        importance_interval_mode = int(importance_interval_mode)
+        subsample = int(subsample)
+
+        if importance_interval_mode not in (0, 1, 2):
+            raise ValueError(
+                "importance_interval_mode must be 0, 1, or 2."
+            )
+
+        if importance_interval_mode != 0 and not lossless:
+            raise ValueError(
+                "importance_interval_mode requires lossless=True."
+            )
+
+        if importance_interval_mode != 0 and return_joint_samples:
+            raise ValueError(
+                "return_joint_samples is incompatible with "
+                "importance_interval_mode != 0."
+            )
+
+        if subsample != -1 and (
+            subsample <= 0 or subsample > n
+        ):
+            raise ValueError(
+                "subsample must be -1 or an integer in "
+                f"[1, {n}]."
+            )
+
+        if not lossless and n_scramble_evals <= 0:
             raise ValueError(
                 "n_scramble_evals must be positive."
             )
@@ -3949,8 +4052,16 @@ class ArborEnum:
             bool(return_joint_samples),
             bool(lossless),
             matched_groups_by_variable_vec,
-            bool(additive)
+            bool(additive),
+            int(importance_interval_mode),
+            int(subsample),
         )
+
+        if "bootstrap_importance_intervals" in self._rid_out:
+            self._rid_out["bootstrap_importance_intervals"] = np.asarray(
+                self._rid_out["bootstrap_importance_intervals"],
+                dtype=float,
+            )
 
         if (
             bool(return_joint_samples)

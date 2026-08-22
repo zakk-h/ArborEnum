@@ -2099,7 +2099,9 @@ PYBIND11_MODULE(_core, m) {
             bool return_joint_samples,
             bool lossless,
             std::vector<std::vector<std::vector<int>>> matched_groups_by_variable,
-            bool additive
+            bool additive,
+            int importance_interval_mode,
+            int subsample
         ) {
             py::buffer_info xinfo = X.request();
             py::buffer_info yinfo = y.request();
@@ -2246,13 +2248,20 @@ PYBIND11_MODULE(_core, m) {
                     return_joint_samples,
                     lossless,
                     matched_groups_by_variable,
-                    additive
+                    additive,
+                    importance_interval_mode,
+                    subsample
                 );
 
             py::dict out;
             out["mean_sub_mr"] = r.mean_sub_mr;
             out["cdf_x"] = r.cdf_x;
             out["cdf_p"] = r.cdf_p;
+
+            if (importance_interval_mode != 0) {
+                out["bootstrap_importance_intervals"] =
+                    r.bootstrap_importance_intervals;
+            }
 
             if (return_joint_samples) {
                 out["feature_importance_weight_samples"] =
@@ -2281,7 +2290,9 @@ PYBIND11_MODULE(_core, m) {
         py::arg("lossless") = false,
         py::arg("matched_groups_by_variable") =
             std::vector<std::vector<std::vector<int>>>{},
-        py::arg("additive") = false
+        py::arg("additive") = false,
+        py::arg("importance_interval_mode") = 0,
+        py::arg("subsample") = -1
         
     );
 
@@ -2353,7 +2364,9 @@ PYBIND11_MODULE(_core, m) {
             bool return_joint_samples,
             bool lossless,
             std::vector<std::vector<std::vector<int>>> matched_groups_by_variable,
-            bool additive
+            bool additive,
+            int importance_interval_mode,
+            int subsample
         ) {
             py::buffer_info num_info =
                 X_num.request();
@@ -2951,7 +2964,9 @@ PYBIND11_MODULE(_core, m) {
                     return_joint_samples,
                     lossless,
                     matched_groups_by_variable,
-                    additive
+                    additive,
+                    importance_interval_mode,
+                    subsample
                 );
 
             py::dict out;
@@ -2976,6 +2991,11 @@ PYBIND11_MODULE(_core, m) {
 
             out["binning_map"] =
                 groups;
+            
+            if (importance_interval_mode != 0) {
+                out["bootstrap_importance_intervals"] =
+                    r.bootstrap_importance_intervals;
+            }
 
             if (return_joint_samples) {
                 out["feature_importance_weight_samples"] =
@@ -3026,7 +3046,9 @@ PYBIND11_MODULE(_core, m) {
         py::arg("lossless") = false,
         py::arg("matched_groups_by_variable") =
             std::vector<std::vector<std::vector<int>>>{},
-        py::arg("additive") = false
+        py::arg("additive") = false,
+        py::arg("importance_interval_mode") = 0,
+        py::arg("subsample") = -1
     );
 
     

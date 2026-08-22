@@ -10,6 +10,8 @@
 #include <vector>
 #include <chrono>
 #include <iomanip>
+#include <limits>
+#include <utility>
 #include <atomic>
 #include <thread>
 
@@ -69,23 +71,52 @@ struct RIDResult {
     std::vector<std::vector<double>> cdf_x;
     std::vector<std::vector<double>> cdf_p;
 
-    // optional output. When return_joint_samples=true, there is one row per
-    // tree per bootstrap. Columns 0..V-1 are the feature importances and the
+    // interval-only output [bootstrap][variable]
+    // importance_interval_mode=1: [min_f Phi_j(f), max_f Phi_j(f)].
+    // importance_interval_mode=2: [(1/n)sum_i min_f phi_ij(f),
+    //                              (1/n)sum_i max_f phi_ij(f)].
+    std::vector<std::vector<std::pair<double, double>>>
+        bootstrap_importance_intervals;
+
+    // optional output. when return_joint_samples=true, there is one row per
+    // tree per bootstrap. columns 0..V-1 are the feature importances and the
     // final column is the tree's probability weight.
     std::vector<std::vector<double>> feature_importance_weight_samples;
 };
 
 static inline void bootstrap_indices(
     int n,
+    int subsample,
     std::mt19937_64& rng,
     std::vector<int>& idx
 ) {
-    std::uniform_int_distribution<int> unif(0, n - 1);
+    // standard bootstrap: n draws with replacement.
+    if (subsample == -1) {
+        std::uniform_int_distribution<int> unif(0, n - 1);
+        idx.resize((std::size_t)n);
+
+        for (int i = 0; i < n; ++i) {
+            idx[(std::size_t)i] = unif(rng);
+        }
+
+        return;
+    }
+
+    // subsample without replacement.
     idx.resize((std::size_t)n);
 
     for (int i = 0; i < n; ++i) {
-        idx[(std::size_t)i] = unif(rng);
+        idx[(std::size_t)i] = i;
     }
+
+    // only randomize enough positions to choose the first subsample samples.
+    for (int i = 0; i < subsample; ++i) {
+        std::uniform_int_distribution<int> unif(i, n - 1);
+        const int j = unif(rng);
+        std::swap(idx[(std::size_t)i], idx[(std::size_t)j]);
+    }
+
+    idx.resize((std::size_t)subsample);
 }
 
 static inline void make_bootstrap_dataset(
@@ -306,11 +337,13 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
     bool lossless = false,
     const std::vector<std::vector<std::vector<int>>>&
         matched_groups_by_variable = {},
-    bool additive = false
+    bool additive = false,
+    // 0 = full RID distribution (existing behavior)
+    // 1 = interval only: min/max global importance over models
+    // 2 = interval only: sum of per-sample min/max local importances
+    int importance_interval_mode = 0,
+    int subsample = -1
 ) {
-    // retained for API compatibility. both modes now use the scalar packed-trie
-    // extractors, which are substantially more memory efficient than storing
-    // prediction vectors. there is no longer a slower per-tree prediction path.
     (void)memory_efficient;
 
     const int n_full = (int)X_row_major.size();
@@ -321,6 +354,14 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
         );
     }
 
+    if (subsample != -1 &&
+        (subsample <= 0 || subsample > n_full)) {
+        throw std::runtime_error(
+            "compute_rid_subtractive_mr_bootstrap: "
+            "subsample must be -1 or an integer in [1, n]."
+        );
+    }
+
     if (n_bootstraps <= 0) {
         throw std::runtime_error(
             "compute_rid_subtractive_mr_bootstrap: "
@@ -328,10 +369,31 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
         );
     }
 
-    if (n_scramble_evals <= 0) {
+    if (!lossless && n_scramble_evals <= 0) {
         throw std::runtime_error(
             "compute_rid_subtractive_mr_bootstrap: "
-            "n_scramble_evals must be positive."
+            "n_scramble_evals must be positive in Monte Carlo mode."
+        );
+    }
+
+    if (importance_interval_mode < 0 || importance_interval_mode > 2) {
+        throw std::runtime_error(
+            "compute_rid_subtractive_mr_bootstrap: "
+            "importance_interval_mode must be 0, 1, or 2."
+        );
+    }
+
+    if (importance_interval_mode != 0 && !lossless) {
+        throw std::runtime_error(
+            "compute_rid_subtractive_mr_bootstrap: "
+            "importance interval modes are supported only with lossless=true."
+        );
+    }
+
+    if (importance_interval_mode != 0 && return_joint_samples) {
+        throw std::runtime_error(
+            "compute_rid_subtractive_mr_bootstrap: "
+            "return_joint_samples is incompatible with interval-only mode."
         );
     }
 
@@ -533,9 +595,32 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
     std::mt19937_64 scramble_rng(seed ^ 0x9E3779B97F4A7C15ULL);
 
     RIDResult output;
-    output.mean_sub_mr.assign((std::size_t)number_of_variables, 0.0);
-    output.cdf_x.assign((std::size_t)number_of_variables, {});
-    output.cdf_p.assign((std::size_t)number_of_variables, {});
+
+    if (importance_interval_mode == 0) {
+        output.mean_sub_mr.assign(
+            (std::size_t)number_of_variables,
+            0.0
+        );
+        output.cdf_x.assign(
+            (std::size_t)number_of_variables,
+            {}
+        );
+        output.cdf_p.assign(
+            (std::size_t)number_of_variables,
+            {}
+        );
+    } else {
+        const double nan =
+            std::numeric_limits<double>::quiet_NaN();
+
+        output.bootstrap_importance_intervals.assign(
+            (std::size_t)n_bootstraps,
+            std::vector<std::pair<double, double>>(
+                (std::size_t)number_of_variables,
+                {nan, nan}
+            )
+        );
+    }
 
     // each map stores probability mass directly on the normalized,
     // scramble-averaged importance values.
@@ -548,7 +633,12 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
         const auto bootstrap_start = std::chrono::steady_clock::now();
 
         std::vector<int> bootstrap_idx;
-        bootstrap_indices(n_full, bootstrap_rng, bootstrap_idx);
+        bootstrap_indices(
+            n_full,
+            subsample,
+            bootstrap_rng,
+            bootstrap_idx
+        );
 
         std::vector<std::vector<uint8_t>> X_bootstrap;
         std::vector<int> y_bootstrap;
@@ -830,6 +920,116 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
                 throw std::runtime_error(
                     "lossless RID currently supports use_deferral=false only."
                 );
+            }
+
+            if (importance_interval_mode != 0) {
+                const auto exact_start =
+                    std::chrono::steady_clock::now();
+
+                const uint64_t number_of_trees =
+                    model.result->count_leq(budget_override);
+
+                if (number_of_trees == 0) {
+                    continue;
+                }
+
+                auto intervals =
+                    model.get_exact_replacement_importance_intervals_packed_trie(
+                        X_bootstrap,
+                        y_bootstrap,
+                        budget_override,
+                        variable_columns,
+                        {},
+                        matched_group_of_bootstrap_row_by_variable,
+                        matched_group_size_bootstrap_by_variable,
+                        importance_interval_mode == 2
+                    );
+
+                if (
+                    intervals.size() !=
+                    (std::size_t)number_of_variables
+                ) {
+                    throw std::runtime_error(
+                        "Lossless RID interval extraction returned the wrong "
+                        "number of variables."
+                    );
+                }
+
+                output.bootstrap_importance_intervals[
+                    (std::size_t)bootstrap
+                ] = std::move(intervals);
+
+                cout << "Finished RID bootstrap: "
+                     << (bootstrap + 1)
+                     << " / "
+                     << n_bootstraps
+                     << " with "
+                     << number_of_trees
+                     << " trees represented (not enumerated)\n";
+
+                const auto exact_end =
+                    std::chrono::steady_clock::now();
+
+                const double exact_seconds =
+                    std::chrono::duration<double>(
+                        exact_end - exact_start
+                    ).count();
+
+                const double importance_peak_mb =
+                    importance_memory.finish();
+
+                const double importance_extra_peak_mb =
+                    std::max(
+                        0.0,
+                        importance_peak_mb - pre_importance_memory_mb
+                    );
+
+                const auto bootstrap_end =
+                    std::chrono::steady_clock::now();
+
+                const double post_training_seconds =
+                    std::chrono::duration<double>(
+                        bootstrap_end - post_training_start
+                    ).count();
+
+                const double bootstrap_seconds =
+                    std::chrono::duration<double>(
+                        bootstrap_end - bootstrap_start
+                    ).count();
+
+                cout << std::fixed << std::setprecision(3)
+                    << "RID bootstrap " << (bootstrap + 1)
+                    << ": Fast Graph interval evaluation = "
+                    << exact_seconds << " s\n"
+
+                    << "RID bootstrap " << (bootstrap + 1)
+                    << ": memory before feature importance = "
+                    << pre_importance_memory_mb << " MB\n"
+
+                    << "RID bootstrap " << (bootstrap + 1)
+                    << ": feature importance peak memory = "
+                    << importance_peak_mb << " MB\n"
+
+                    << "RID bootstrap " << (bootstrap + 1)
+                    << ": feature importance extra peak memory = "
+                    << importance_extra_peak_mb << " MB\n"
+
+                    << "RID bootstrap " << (bootstrap + 1)
+                    << ": post-training RID = "
+                    << post_training_seconds << " s\n"
+
+                    << "RID bootstrap " << (bootstrap + 1)
+                    << ": total = "
+                    << bootstrap_seconds << " s\n"
+
+                    << "RID bootstrap " << (bootstrap + 1)
+                    << ": training fraction = "
+                    << (100.0 * training_seconds / bootstrap_seconds)
+                    << "%, post-training fraction = "
+                    << (100.0 * post_training_seconds / bootstrap_seconds)
+                    << "%\n";
+
+                continue;
             }
 
             const auto exact_start =
@@ -1274,23 +1474,26 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
             << "%\n";
     }
 
-    for (int variable = 0;
-         variable < number_of_variables;
-         ++variable) {
-        const auto& mass = mass_by_importance[(std::size_t)variable];
+    if (importance_interval_mode == 0) {
+        for (int variable = 0;
+             variable < number_of_variables;
+             ++variable) {
+            const auto& mass =
+                mass_by_importance[(std::size_t)variable];
 
-        output.cdf_x[(std::size_t)variable].reserve(mass.size());
-        output.cdf_p[(std::size_t)variable].reserve(mass.size());
+            output.cdf_x[(std::size_t)variable].reserve(mass.size());
+            output.cdf_p[(std::size_t)variable].reserve(mass.size());
 
-        double cumulative_probability = 0.0;
+            double cumulative_probability = 0.0;
 
-        for (const auto& [importance, probability] : mass) {
-            cumulative_probability += probability;
+            for (const auto& [importance, probability] : mass) {
+                cumulative_probability += probability;
 
-            output.cdf_x[(std::size_t)variable].push_back(importance);
-            output.cdf_p[(std::size_t)variable].push_back(
-                cumulative_probability
-            );
+                output.cdf_x[(std::size_t)variable].push_back(importance);
+                output.cdf_p[(std::size_t)variable].push_back(
+                    cumulative_probability
+                );
+            }
         }
     }
 

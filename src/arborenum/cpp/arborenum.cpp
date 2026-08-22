@@ -16,6 +16,7 @@
 #include <span>
 #include <chrono>
 #include <tuple>
+#include <utility>
 #include <random>
 
 #include <fstream>
@@ -1946,6 +1947,8 @@ public:
         int obj = 0;
         std::vector<double> mistakes; // [m_original, m_0, ..., m_{p-1}], exact, no montecarlo error
     };
+
+    using ExactImportanceInterval = std::pair<double, double>;
 
     ExportANDORGraph export_andor_graph(
         std::size_t max_trie_nodes = 10000000,
@@ -15913,7 +15916,7 @@ private:
         const std::vector<std::vector<int>>*
             matched_group_of_row_by_variable_eval,
 
-        // Precomputed 1 / |G_g|. Zero for groups absent from this bootstrap.
+        // Precomputed 1 / |G_g|. zero for groups absent from this bootstrap.
         const std::vector<std::vector<double>>*
             matched_group_inv_size_by_variable_eval,
 
@@ -15962,14 +15965,11 @@ private:
                     BBwrong_eval
                 );
 
-            // Most variables have not appeared on a shallow root-to-leaf
-            // path. Initialize them directly to the exact no-effect value.
             here.replacement_expected_mistakes.assign(
                 (std::size_t)number_of_variables,
                 static_cast<double>(here.original_mistakes)
             );
 
-            // Validate once per leaf, outside the variable loop.
             if (
                 leaf.prediction != DEFER_PREDICTION &&
                 (leaf.prediction < 0 ||
@@ -15998,8 +15998,7 @@ private:
 
                 // if the replacement variable has not appeared anywhere on
                 // this root-to-leaf path, perturbing it cannot change routing.
-                // Its expected perturbed mistakes are exactly the ordinary
-                // mistakes at this leaf.
+                // its expected perturbed mistakes are exactly the ordinary mistakes at this leaf.
                 if (!state.replacement_feature_used) {
                     continue;
                 }
@@ -16011,8 +16010,7 @@ private:
                         (std::size_t)variable
                     ] != 0;
 
-                // ordinary uniform replacement, or a conditional partition
-                // with exactly one nonempty group.
+                // ordinary uniform replacement, or a conditional partition with exactly one nonempty group  (which is exactly permutation importance)
                 if (
                     matched_group_of_row_by_variable_eval == nullptr ||
                     matched_effectively_uniform
@@ -16067,8 +16065,7 @@ private:
 
                 matched_scratch->begin(number_of_groups);
 
-                // count donor rows by group by iterating only the set bits of
-                // the current replacement-value mask.
+                // count donor rows by group by iterating only the set bits of the current replacement-value mask
                 for (int wi = 0; wi < ctx.n_words; ++wi) {
                     uint64_t replacement_bits =
                         state.replacement_values.w[
@@ -16097,7 +16094,7 @@ private:
                         ];
                     }
 
-                    // count only target rows that are wrong for this leaf.
+                    // count only target rows that are wrong for this leaf
                     uint64_t wrong_bits =
                         state.target_rows.w[
                             (std::size_t)wi
@@ -16142,7 +16139,7 @@ private:
 
                 double expected_mistakes = 0.0;
 
-                // only groups touched by at least one target or donor mask need to be visited.
+                // only groups touched by at least one target or donor mask need to be visited
                 for (int group :
                      matched_scratch->touched_groups) {
 
@@ -16168,7 +16165,7 @@ private:
             acc[leaf.loss].push_back(std::move(here));
         }
 
-        // split alternatives.
+        // split alternatives
         for (const auto& split : node->splits) {
             const TreeTrieNode* L = split.left.get();
             const TreeTrieNode* R = split.right.get();
@@ -16214,7 +16211,7 @@ private:
             const Packed& Xf =
                 ctx.X_bits_eval[(size_t)split.feature];
 
-            // normal/original evaluation.
+            // normal/original evaluation
             Packed original_left((size_t)ctx.n_words);
             Packed original_right((size_t)ctx.n_words);
 
@@ -16254,16 +16251,13 @@ private:
                 auto& rs =
                     right_states[(size_t)variable];
 
-                // Lazy state: before variable j first appears on the path,
-                // target_rows is conceptually original_mask and
-                // replacement_values is conceptually replacement_root_mask.
-                // We do not materialize either mask.
+                // lazy state of bitvectors before variable j first appears on the path 
                 if (!cur.replacement_feature_used) {
                     if (variable != split_variable) {
                         continue;
                     }
 
-                    // First occurrence of this replacement variable.
+                    // first occurrence of this replacement variable.
                     ls.replacement_feature_used = true;
                     rs.replacement_feature_used = true;
 
@@ -16311,8 +16305,8 @@ private:
                     Packed((size_t)ctx.n_words);
 
                 if (variable == split_variable) {
-                    // This is the variable being replaced. The target rows
-                    // do NOT split on their original value. Instead, the set
+                    // this is the variable being replaced. The target rows
+                    // do not split on their original value. instead, the set
                     // of possible replacement values splits.
                     ls.target_rows.w =
                         cur.target_rows.w;
@@ -16336,9 +16330,8 @@ private:
                         ctx.tail_mask
                     );
                 } else {
-                    // Some other variable is split normally on the target
-                    // row. The possible values of the replaced variable are
-                    // unchanged.
+                    // some other variable is split normally on the target
+                    // row. the possible values of the replaced variable are unchanged.
                     and_bits_eval(
                         cur.target_rows,
                         Xf,
@@ -16469,6 +16462,3757 @@ private:
         }
 
         return to_sorted_exact_replacement_buckets_(acc);
+    }
+
+    struct ExactGlobalImportanceExtrema_ {
+        std::vector<double> lower;
+        std::vector<double> upper;
+    };
+
+    struct ObjExactGlobalImportanceExtremaBucket_ {
+        int obj = 0;
+        ExactGlobalImportanceExtrema_ extrema;
+    };
+
+    struct ExactLocalImportanceExtrema_ {
+        std::vector<double> lower;
+        std::vector<double> upper;
+    };
+
+    struct ObjExactLocalImportanceExtremaBucket_ {
+        int obj = 0;
+        ExactLocalImportanceExtrema_ extrema;
+    };
+
+    static inline void update_global_extrema_(
+        ExactGlobalImportanceExtrema_& dst,
+        const std::vector<double>& candidate_lower,
+        const std::vector<double>& candidate_upper
+    ) {
+        if (dst.lower.empty()) {
+            dst.lower = candidate_lower;
+            dst.upper = candidate_upper;
+            return;
+        }
+
+        if (
+            dst.lower.size() != candidate_lower.size() ||
+            dst.upper.size() != candidate_upper.size()
+        ) {
+            throw std::runtime_error(
+                "Global exact-importance extrema have inconsistent sizes."
+            );
+        }
+
+        for (std::size_t j = 0; j < dst.lower.size(); ++j) {
+            dst.lower[j] = std::min(dst.lower[j], candidate_lower[j]);
+            dst.upper[j] = std::max(dst.upper[j], candidate_upper[j]);
+        }
+    }
+
+    static inline void update_local_extrema_(
+        ExactLocalImportanceExtrema_& dst,
+        const std::vector<double>& candidate_lower,
+        const std::vector<double>& candidate_upper
+    ) {
+        if (dst.lower.empty()) {
+            dst.lower = candidate_lower;
+            dst.upper = candidate_upper;
+            return;
+        }
+
+        if (
+            dst.lower.size() != candidate_lower.size() ||
+            dst.upper.size() != candidate_upper.size()
+        ) {
+            throw std::runtime_error(
+                "Local exact-importance extrema have inconsistent sizes."
+            );
+        }
+
+        for (std::size_t i = 0; i < dst.lower.size(); ++i) {
+            dst.lower[i] = std::min(dst.lower[i], candidate_lower[i]);
+            dst.upper[i] = std::max(dst.upper[i], candidate_upper[i]);
+        }
+    }
+
+    static inline void update_global_extrema_from_sum_(
+        ExactGlobalImportanceExtrema_& dst,
+        const ExactGlobalImportanceExtrema_& left,
+        const ExactGlobalImportanceExtrema_& right
+    ) {
+        if (left.lower.size() != right.lower.size() ||
+            left.upper.size() != right.upper.size() ||
+            left.lower.size() != left.upper.size()) {
+            throw std::runtime_error(
+                "Global exact-importance extrema have inconsistent sizes."
+            );
+        }
+
+        const std::size_t n = left.lower.size();
+
+        if (dst.lower.empty()) {
+            dst.lower.resize(n);
+            dst.upper.resize(n);
+
+            for (std::size_t j = 0; j < n; ++j) {
+                dst.lower[j] = left.lower[j] + right.lower[j];
+                dst.upper[j] = left.upper[j] + right.upper[j];
+            }
+            return;
+        }
+
+        if (dst.lower.size() != n || dst.upper.size() != n) {
+            throw std::runtime_error(
+                "Global exact-importance extrema have inconsistent sizes."
+            );
+        }
+
+        for (std::size_t j = 0; j < n; ++j) {
+            dst.lower[j] = std::min(
+                dst.lower[j],
+                left.lower[j] + right.lower[j]
+            );
+            dst.upper[j] = std::max(
+                dst.upper[j],
+                left.upper[j] + right.upper[j]
+            );
+        }
+    }
+
+    static inline void update_local_extrema_from_sum_(
+        ExactLocalImportanceExtrema_& dst,
+        const ExactLocalImportanceExtrema_& left,
+        const ExactLocalImportanceExtrema_& right
+    ) {
+        if (left.lower.size() != right.lower.size() ||
+            left.upper.size() != right.upper.size() ||
+            left.lower.size() != left.upper.size()) {
+            throw std::runtime_error(
+                "Local exact-importance extrema have inconsistent sizes."
+            );
+        }
+
+        const std::size_t n = left.lower.size();
+
+        if (dst.lower.empty()) {
+            dst.lower.resize(n);
+            dst.upper.resize(n);
+
+            for (std::size_t i = 0; i < n; ++i) {
+                dst.lower[i] = left.lower[i] + right.lower[i];
+                dst.upper[i] = left.upper[i] + right.upper[i];
+            }
+            return;
+        }
+
+        if (dst.lower.size() != n || dst.upper.size() != n) {
+            throw std::runtime_error(
+                "Local exact-importance extrema have inconsistent sizes."
+            );
+        }
+
+        for (std::size_t i = 0; i < n; ++i) {
+            dst.lower[i] = std::min(
+                dst.lower[i],
+                left.lower[i] + right.lower[i]
+            );
+            dst.upper[i] = std::max(
+                dst.upper[i],
+                left.upper[i] + right.upper[i]
+            );
+        }
+    }
+
+    static inline std::vector<ObjExactGlobalImportanceExtremaBucket_>
+    to_sorted_global_importance_extrema_buckets_(
+        std::unordered_map<int, ExactGlobalImportanceExtrema_>& acc
+    ) {
+        std::vector<ObjExactGlobalImportanceExtremaBucket_> out;
+        out.reserve(acc.size());
+
+        for (auto& kv : acc) {
+            ObjExactGlobalImportanceExtremaBucket_ b;
+            b.obj = kv.first;
+            b.extrema = std::move(kv.second);
+            out.push_back(std::move(b));
+        }
+
+        std::sort(
+            out.begin(),
+            out.end(),
+            [](const ObjExactGlobalImportanceExtremaBucket_& a,
+               const ObjExactGlobalImportanceExtremaBucket_& b) {
+                return a.obj < b.obj;
+            }
+        );
+
+        return out;
+    }
+
+    static inline std::vector<ObjExactLocalImportanceExtremaBucket_>
+    to_sorted_local_importance_extrema_buckets_(
+        std::unordered_map<int, ExactLocalImportanceExtrema_>& acc
+    ) {
+        std::vector<ObjExactLocalImportanceExtremaBucket_> out;
+        out.reserve(acc.size());
+
+        for (auto& kv : acc) {
+            ObjExactLocalImportanceExtremaBucket_ b;
+            b.obj = kv.first;
+            b.extrema = std::move(kv.second);
+            out.push_back(std::move(b));
+        }
+
+        std::sort(
+            out.begin(),
+            out.end(),
+            [](const ObjExactLocalImportanceExtremaBucket_& a,
+               const ObjExactLocalImportanceExtremaBucket_& b) {
+                return a.obj < b.obj;
+            }
+        );
+
+        return out;
+    }
+
+    double exact_replacement_expected_mistakes_for_leaf_variable_(
+        const ExactReplacementState_& state,
+        int variable,
+        int prediction,
+        int original_mistakes,
+        const EvalCtx& ctx,
+        const std::vector<Packed>& Y_eval_bits,
+        const Packed* BBwrong_eval,
+        const std::vector<std::vector<int>>*
+            matched_group_of_row_by_variable_eval,
+        const std::vector<std::vector<double>>*
+            matched_group_inv_size_by_variable_eval,
+        const std::vector<uint8_t>*
+            matched_group_effectively_uniform_by_variable_eval,
+        ExactMatchedScratch_* matched_scratch
+    ) const {
+        if (!state.replacement_feature_used) {
+            return static_cast<double>(original_mistakes);
+        }
+
+        const bool matched_effectively_uniform =
+            matched_group_effectively_uniform_by_variable_eval != nullptr &&
+            (*matched_group_effectively_uniform_by_variable_eval)[
+                static_cast<std::size_t>(variable)
+            ] != 0;
+
+        if (
+            matched_group_of_row_by_variable_eval == nullptr ||
+            matched_effectively_uniform
+        ) {
+            const int wrong_target_rows =
+                exact_wrong_count_for_leaf_(
+                    state.target_rows,
+                    prediction,
+                    ctx,
+                    Y_eval_bits,
+                    BBwrong_eval
+                );
+
+            const int number_of_replacement_values =
+                count_eval_mask_(
+                    state.replacement_values,
+                    ctx.n_words
+                );
+
+            return
+                (
+                    static_cast<double>(wrong_target_rows) *
+                    static_cast<double>(number_of_replacement_values)
+                ) /
+                static_cast<double>(ctx.n_eval);
+        }
+
+        if (
+            matched_group_inv_size_by_variable_eval == nullptr ||
+            matched_scratch == nullptr
+        ) {
+            throw std::runtime_error(
+                "Matched-group exact replacement state is incomplete."
+            );
+        }
+
+        const auto& group_of_row =
+            (*matched_group_of_row_by_variable_eval)[
+                static_cast<std::size_t>(variable)
+            ];
+
+        const auto& inverse_group_sizes =
+            (*matched_group_inv_size_by_variable_eval)[
+                static_cast<std::size_t>(variable)
+            ];
+
+        const int number_of_groups =
+            static_cast<int>(inverse_group_sizes.size());
+
+        matched_scratch->begin(number_of_groups);
+
+        for (int wi = 0; wi < ctx.n_words; ++wi) {
+            uint64_t replacement_bits =
+                state.replacement_values.w[static_cast<std::size_t>(wi)];
+
+            while (replacement_bits) {
+                const int bit = exact_ctz64_(replacement_bits);
+                const int row = (wi << 6) + bit;
+                replacement_bits &= replacement_bits - 1;
+
+                const int group =
+                    group_of_row[static_cast<std::size_t>(row)];
+
+                matched_scratch->touch(group);
+                ++matched_scratch->replacement_counts[
+                    static_cast<std::size_t>(group)
+                ];
+            }
+
+            uint64_t wrong_bits =
+                state.target_rows.w[static_cast<std::size_t>(wi)];
+
+            if (prediction == DEFER_PREDICTION) {
+                wrong_bits &=
+                    BBwrong_eval->w[static_cast<std::size_t>(wi)];
+            } else {
+                wrong_bits &=
+                    ~Y_eval_bits[
+                        static_cast<std::size_t>(prediction)
+                    ].w[static_cast<std::size_t>(wi)];
+            }
+
+            while (wrong_bits) {
+                const int bit = exact_ctz64_(wrong_bits);
+                const int row = (wi << 6) + bit;
+                wrong_bits &= wrong_bits - 1;
+
+                const int group =
+                    group_of_row[static_cast<std::size_t>(row)];
+
+                matched_scratch->touch(group);
+                ++matched_scratch->wrong_counts[
+                    static_cast<std::size_t>(group)
+                ];
+            }
+        }
+
+        double expected_mistakes = 0.0;
+
+        for (int group : matched_scratch->touched_groups) {
+            expected_mistakes +=
+                static_cast<double>(
+                    matched_scratch->wrong_counts[
+                        static_cast<std::size_t>(group)
+                    ]
+                ) *
+                static_cast<double>(
+                    matched_scratch->replacement_counts[
+                        static_cast<std::size_t>(group)
+                    ]
+                ) *
+                inverse_group_sizes[static_cast<std::size_t>(group)];
+        }
+
+        return expected_mistakes;
+    }
+
+    std::vector<double> exact_local_importance_for_leaf_variable_(
+        const Packed& original_mask,
+        const ExactReplacementState_& state,
+        int prediction,
+        const EvalCtx& ctx,
+        const std::vector<Packed>& Y_eval_bits,
+        const Packed* BBwrong_eval,
+        const std::vector<int>* matched_group_of_row_eval,
+        const std::vector<double>* matched_group_inv_size_eval,
+        bool matched_effectively_uniform,
+        ExactMatchedScratch_* matched_scratch
+    ) const {
+        std::vector<double> local(
+            static_cast<std::size_t>(ctx.n_eval),
+            0.0
+        );
+
+        // if j never appeared on this root-to-leaf path, replacement and
+        // original routing agree exactly on this leaf, hence contribution 0.
+        if (!state.replacement_feature_used) {
+            return local;
+        }
+
+        if (
+            prediction != DEFER_PREDICTION &&
+            (prediction < 0 || prediction >= num_classes)
+        ) {
+            throw std::runtime_error(
+                "Leaf prediction is outside valid class range."
+            );
+        }
+
+        if (prediction == DEFER_PREDICTION && !BBwrong_eval) {
+            throw std::runtime_error(
+                "Deferred leaf encountered, but eval bb_pred was not provided."
+            );
+        }
+
+        // subtract the original 0/1 loss contribution of this leaf.
+        for (int wi = 0; wi < ctx.n_words; ++wi) {
+            uint64_t wrong_original =
+                original_mask.w[static_cast<std::size_t>(wi)];
+
+            if (prediction == DEFER_PREDICTION) {
+                wrong_original &=
+                    BBwrong_eval->w[static_cast<std::size_t>(wi)];
+            } else {
+                wrong_original &=
+                    ~Y_eval_bits[
+                        static_cast<std::size_t>(prediction)
+                    ].w[static_cast<std::size_t>(wi)];
+            }
+
+            while (wrong_original) {
+                const int bit = exact_ctz64_(wrong_original);
+                const int row = (wi << 6) + bit;
+                wrong_original &= wrong_original - 1;
+                local[static_cast<std::size_t>(row)] -= 1.0;
+            }
+        }
+
+        // ordinary empirical permutation importance, or matched permutation
+        // with a single nonempty group, has the same donor probability for every target row.
+        if (
+            matched_group_of_row_eval == nullptr ||
+            matched_effectively_uniform
+        ) {
+            const int number_of_replacement_values =
+                count_eval_mask_(
+                    state.replacement_values,
+                    ctx.n_words
+                );
+
+            const double donor_probability =
+                static_cast<double>(number_of_replacement_values) /
+                static_cast<double>(ctx.n_eval);
+
+            if (donor_probability == 0.0) {
+                return local;
+            }
+
+            for (int wi = 0; wi < ctx.n_words; ++wi) {
+                uint64_t wrong_target =
+                    state.target_rows.w[static_cast<std::size_t>(wi)];
+
+                if (prediction == DEFER_PREDICTION) {
+                    wrong_target &=
+                        BBwrong_eval->w[static_cast<std::size_t>(wi)];
+                } else {
+                    wrong_target &=
+                        ~Y_eval_bits[
+                            static_cast<std::size_t>(prediction)
+                        ].w[static_cast<std::size_t>(wi)];
+                }
+
+                while (wrong_target) {
+                    const int bit = exact_ctz64_(wrong_target);
+                    const int row = (wi << 6) + bit;
+                    wrong_target &= wrong_target - 1;
+                    local[static_cast<std::size_t>(row)] +=
+                        donor_probability;
+                }
+            }
+
+            return local;
+        }
+
+        if (
+            matched_group_inv_size_eval == nullptr ||
+            matched_scratch == nullptr
+        ) {
+            throw std::runtime_error(
+                "Matched-group local exact replacement state is incomplete."
+            );
+        }
+
+        const int number_of_groups =
+            static_cast<int>(matched_group_inv_size_eval->size());
+
+        matched_scratch->begin(number_of_groups);
+
+        // count donor values reaching this leaf by matched group
+        for (int wi = 0; wi < ctx.n_words; ++wi) {
+            uint64_t replacement_bits =
+                state.replacement_values.w[static_cast<std::size_t>(wi)];
+
+            while (replacement_bits) {
+                const int bit = exact_ctz64_(replacement_bits);
+                const int row = (wi << 6) + bit;
+                replacement_bits &= replacement_bits - 1;
+
+                const int group =
+                    (*matched_group_of_row_eval)[
+                        static_cast<std::size_t>(row)
+                    ];
+
+                matched_scratch->touch(group);
+                ++matched_scratch->replacement_counts[
+                    static_cast<std::size_t>(group)
+                ];
+            }
+        }
+
+        // add the perturbed expected loss contribution row by row.
+        for (int wi = 0; wi < ctx.n_words; ++wi) {
+            uint64_t wrong_target =
+                state.target_rows.w[static_cast<std::size_t>(wi)];
+
+            if (prediction == DEFER_PREDICTION) {
+                wrong_target &=
+                    BBwrong_eval->w[static_cast<std::size_t>(wi)];
+            } else {
+                wrong_target &=
+                    ~Y_eval_bits[
+                        static_cast<std::size_t>(prediction)
+                    ].w[static_cast<std::size_t>(wi)];
+            }
+
+            while (wrong_target) {
+                const int bit = exact_ctz64_(wrong_target);
+                const int row = (wi << 6) + bit;
+                wrong_target &= wrong_target - 1;
+
+                const int group =
+                    (*matched_group_of_row_eval)[
+                        static_cast<std::size_t>(row)
+                    ];
+
+                // a target group can have zero donors reaching this leaf.
+                matched_scratch->touch(group);
+
+                local[static_cast<std::size_t>(row)] +=
+                    static_cast<double>(
+                        matched_scratch->replacement_counts[
+                            static_cast<std::size_t>(group)
+                        ]
+                    ) *
+                    (*matched_group_inv_size_eval)[
+                        static_cast<std::size_t>(group)
+                    ];
+            }
+        }
+
+        return local;
+    }
+
+    std::vector<ObjExactGlobalImportanceExtremaBucket_>
+    collect_exact_global_importance_extrema_by_obj_(
+        const TreeTrieNode* node,
+        int budget,
+        const Packed& original_mask,
+        const Packed& replacement_root_mask,
+        const std::vector<ExactReplacementState_>& states,
+        const std::vector<int>& internal_to_variable,
+        const EvalCtx& ctx,
+        const std::vector<Packed>& Y_eval_bits,
+        const Packed* BBwrong_eval,
+        const std::vector<std::vector<int>>*
+            matched_group_of_row_by_variable_eval,
+        const std::vector<std::vector<double>>*
+            matched_group_inv_size_by_variable_eval,
+        const std::vector<uint8_t>*
+            matched_group_effectively_uniform_by_variable_eval,
+        ExactMatchedScratch_* matched_scratch
+    ) const {
+        if (!node || budget < 0) return {};
+
+        constexpr int INF = std::numeric_limits<int>::max();
+
+        if (
+            node->min_objective == INF ||
+            node->min_objective > budget
+        ) {
+            return {};
+        }
+
+        const int number_of_variables =
+            static_cast<int>(states.size());
+
+        std::unordered_map<int, ExactGlobalImportanceExtrema_> acc;
+        acc.reserve(
+            static_cast<std::size_t>(
+                std::max(1, budget - node->min_objective + 1)
+            )
+        );
+
+        for (const auto& leaf : node->leaves) {
+            if (leaf.loss > budget) continue;
+
+            const int original_mistakes =
+                exact_wrong_count_for_leaf_(
+                    original_mask,
+                    leaf.prediction,
+                    ctx,
+                    Y_eval_bits,
+                    BBwrong_eval
+                );
+
+            std::vector<double> here(
+                static_cast<std::size_t>(number_of_variables),
+                0.0
+            );
+
+            for (int variable = 0;
+                 variable < number_of_variables;
+                 ++variable) {
+
+                if (!states[static_cast<std::size_t>(variable)]
+                         .replacement_feature_used) {
+                    continue;
+                }
+
+                const double replacement_mistakes =
+                    exact_replacement_expected_mistakes_for_leaf_variable_(
+                        states[static_cast<std::size_t>(variable)],
+                        variable,
+                        leaf.prediction,
+                        original_mistakes,
+                        ctx,
+                        Y_eval_bits,
+                        BBwrong_eval,
+                        matched_group_of_row_by_variable_eval,
+                        matched_group_inv_size_by_variable_eval,
+                        matched_group_effectively_uniform_by_variable_eval,
+                        matched_scratch
+                    );
+
+                here[static_cast<std::size_t>(variable)] =
+                    replacement_mistakes -
+                    static_cast<double>(original_mistakes);
+            }
+
+            update_global_extrema_(
+                acc[leaf.loss],
+                here,
+                here
+            );
+        }
+
+        for (const auto& split : node->splits) {
+            const TreeTrieNode* L = split.left.get();
+            const TreeTrieNode* R = split.right.get();
+
+            if (!L || !R) continue;
+
+            const int minL = L->min_objective;
+            const int minR = R->min_objective;
+
+            if (minL == INF || minR == INF) continue;
+
+            int bL = budget - minR;
+            int bR = budget - minL;
+
+            if (bL < 0 || bR < 0) continue;
+
+            bL = std::min(bL, L->budget);
+            bR = std::min(bR, R->budget);
+
+            if (bL < minL || bR < minR) continue;
+
+            if (
+                split.feature < 0 ||
+                split.feature >=
+                    static_cast<int>(internal_to_variable.size())
+            ) {
+                throw std::runtime_error(
+                    "Exact interval evaluation saw an invalid split feature."
+                );
+            }
+
+            const int split_variable =
+                internal_to_variable[
+                    static_cast<std::size_t>(split.feature)
+                ];
+
+            if (
+                split_variable < 0 ||
+                split_variable >= number_of_variables
+            ) {
+                throw std::runtime_error(
+                    "Split feature is not mapped to an original variable."
+                );
+            }
+
+            const Packed& Xf =
+                ctx.X_bits_eval[
+                    static_cast<std::size_t>(split.feature)
+                ];
+
+            Packed original_left(static_cast<std::size_t>(ctx.n_words));
+            Packed original_right(static_cast<std::size_t>(ctx.n_words));
+
+            and_bits_eval(
+                original_mask,
+                Xf,
+                original_left,
+                ctx.n_words,
+                ctx.tail_mask
+            );
+
+            andnot_bits_eval(
+                original_mask,
+                Xf,
+                original_right,
+                ctx.n_words,
+                ctx.tail_mask
+            );
+
+            std::vector<ExactReplacementState_> left_states(
+                static_cast<std::size_t>(number_of_variables)
+            );
+
+            std::vector<ExactReplacementState_> right_states(
+                static_cast<std::size_t>(number_of_variables)
+            );
+
+            for (int variable = 0;
+                 variable < number_of_variables;
+                 ++variable) {
+
+                const auto& cur =
+                    states[static_cast<std::size_t>(variable)];
+
+                auto& ls =
+                    left_states[static_cast<std::size_t>(variable)];
+
+                auto& rs =
+                    right_states[static_cast<std::size_t>(variable)];
+
+                if (!cur.replacement_feature_used) {
+                    if (variable != split_variable) {
+                        continue;
+                    }
+
+                    ls.replacement_feature_used = true;
+                    rs.replacement_feature_used = true;
+                    ls.target_rows = original_mask;
+                    rs.target_rows = original_mask;
+                    ls.replacement_values =
+                        Packed(static_cast<std::size_t>(ctx.n_words));
+                    rs.replacement_values =
+                        Packed(static_cast<std::size_t>(ctx.n_words));
+
+                    and_bits_eval(
+                        replacement_root_mask,
+                        Xf,
+                        ls.replacement_values,
+                        ctx.n_words,
+                        ctx.tail_mask
+                    );
+
+                    andnot_bits_eval(
+                        replacement_root_mask,
+                        Xf,
+                        rs.replacement_values,
+                        ctx.n_words,
+                        ctx.tail_mask
+                    );
+
+                    continue;
+                }
+
+                ls.replacement_feature_used = true;
+                rs.replacement_feature_used = true;
+                ls.target_rows = Packed(static_cast<std::size_t>(ctx.n_words));
+                rs.target_rows = Packed(static_cast<std::size_t>(ctx.n_words));
+                ls.replacement_values = Packed(static_cast<std::size_t>(ctx.n_words));
+                rs.replacement_values = Packed(static_cast<std::size_t>(ctx.n_words));
+
+                if (variable == split_variable) {
+                    ls.target_rows.w = cur.target_rows.w;
+                    rs.target_rows.w = cur.target_rows.w;
+
+                    and_bits_eval(
+                        cur.replacement_values,
+                        Xf,
+                        ls.replacement_values,
+                        ctx.n_words,
+                        ctx.tail_mask
+                    );
+
+                    andnot_bits_eval(
+                        cur.replacement_values,
+                        Xf,
+                        rs.replacement_values,
+                        ctx.n_words,
+                        ctx.tail_mask
+                    );
+                } else {
+                    and_bits_eval(
+                        cur.target_rows,
+                        Xf,
+                        ls.target_rows,
+                        ctx.n_words,
+                        ctx.tail_mask
+                    );
+
+                    andnot_bits_eval(
+                        cur.target_rows,
+                        Xf,
+                        rs.target_rows,
+                        ctx.n_words,
+                        ctx.tail_mask
+                    );
+
+                    ls.replacement_values.w = cur.replacement_values.w;
+                    rs.replacement_values.w = cur.replacement_values.w;
+                }
+            }
+
+            auto Lb =
+                collect_exact_global_importance_extrema_by_obj_(
+                    L,
+                    bL,
+                    original_left,
+                    replacement_root_mask,
+                    left_states,
+                    internal_to_variable,
+                    ctx,
+                    Y_eval_bits,
+                    BBwrong_eval,
+                    matched_group_of_row_by_variable_eval,
+                    matched_group_inv_size_by_variable_eval,
+                    matched_group_effectively_uniform_by_variable_eval,
+                    matched_scratch
+                );
+
+            auto Rb =
+                collect_exact_global_importance_extrema_by_obj_(
+                    R,
+                    bR,
+                    original_right,
+                    replacement_root_mask,
+                    right_states,
+                    internal_to_variable,
+                    ctx,
+                    Y_eval_bits,
+                    BBwrong_eval,
+                    matched_group_of_row_by_variable_eval,
+                    matched_group_inv_size_by_variable_eval,
+                    matched_group_effectively_uniform_by_variable_eval,
+                    matched_scratch
+                );
+
+            if (Lb.empty() || Rb.empty()) continue;
+
+            std::vector<int> R_objs;
+            R_objs.reserve(Rb.size());
+            for (const auto& rb : Rb) {
+                R_objs.push_back(rb.obj);
+            }
+
+            for (const auto& lb : Lb) {
+                const int rem = budget - lb.obj;
+
+                auto it_end =
+                    std::upper_bound(
+                        R_objs.begin(),
+                        R_objs.end(),
+                        rem
+                    );
+
+                const std::size_t r_hi =
+                    static_cast<std::size_t>(
+                        std::distance(R_objs.begin(), it_end)
+                    );
+
+                for (std::size_t ri = 0; ri < r_hi; ++ri) {
+                    const auto& rb = Rb[ri];
+                    const int total_obj = lb.obj + rb.obj;
+                    if (total_obj > budget) continue;
+
+                    update_global_extrema_from_sum_(
+                        acc[total_obj],
+                        lb.extrema,
+                        rb.extrema
+                    );
+                }
+            }
+        }
+
+        return to_sorted_global_importance_extrema_buckets_(acc);
+    }
+
+    std::vector<ObjExactLocalImportanceExtremaBucket_>
+    collect_exact_local_importance_extrema_by_obj_(
+        const TreeTrieNode* node,
+        int budget,
+        const Packed& original_mask,
+        const Packed& replacement_root_mask,
+        const ExactReplacementState_& state,
+        int variable,
+        const std::vector<int>& internal_to_variable,
+        const EvalCtx& ctx,
+        const std::vector<Packed>& Y_eval_bits,
+        const Packed* BBwrong_eval,
+        const std::vector<int>* matched_group_of_row_eval,
+        const std::vector<double>* matched_group_inv_size_eval,
+        bool matched_effectively_uniform,
+        ExactMatchedScratch_* matched_scratch
+    ) const {
+        if (!node || budget < 0) return {};
+
+        constexpr int INF = std::numeric_limits<int>::max();
+
+        if (
+            node->min_objective == INF ||
+            node->min_objective > budget
+        ) {
+            return {};
+        }
+
+        std::unordered_map<int, ExactLocalImportanceExtrema_> acc;
+        acc.reserve(
+            static_cast<std::size_t>(
+                std::max(1, budget - node->min_objective + 1)
+            )
+        );
+
+        for (const auto& leaf : node->leaves) {
+            if (leaf.loss > budget) continue;
+
+            auto here =
+                exact_local_importance_for_leaf_variable_(
+                    original_mask,
+                    state,
+                    leaf.prediction,
+                    ctx,
+                    Y_eval_bits,
+                    BBwrong_eval,
+                    matched_group_of_row_eval,
+                    matched_group_inv_size_eval,
+                    matched_effectively_uniform,
+                    matched_scratch
+                );
+
+            update_local_extrema_(
+                acc[leaf.loss],
+                here,
+                here
+            );
+        }
+
+        for (const auto& split : node->splits) {
+            const TreeTrieNode* L = split.left.get();
+            const TreeTrieNode* R = split.right.get();
+
+            if (!L || !R) continue;
+
+            const int minL = L->min_objective;
+            const int minR = R->min_objective;
+
+            if (minL == INF || minR == INF) continue;
+
+            int bL = budget - minR;
+            int bR = budget - minL;
+
+            if (bL < 0 || bR < 0) continue;
+
+            bL = std::min(bL, L->budget);
+            bR = std::min(bR, R->budget);
+
+            if (bL < minL || bR < minR) continue;
+
+            if (
+                split.feature < 0 ||
+                split.feature >=
+                    static_cast<int>(internal_to_variable.size())
+            ) {
+                throw std::runtime_error(
+                    "Exact local interval evaluation saw an invalid split feature."
+                );
+            }
+
+            const int split_variable =
+                internal_to_variable[
+                    static_cast<std::size_t>(split.feature)
+                ];
+
+            if (split_variable < 0) {
+                throw std::runtime_error(
+                    "Split feature is not mapped to an original variable."
+                );
+            }
+
+            const Packed& Xf =
+                ctx.X_bits_eval[
+                    static_cast<std::size_t>(split.feature)
+                ];
+
+            Packed original_left(static_cast<std::size_t>(ctx.n_words));
+            Packed original_right(static_cast<std::size_t>(ctx.n_words));
+
+            and_bits_eval(
+                original_mask,
+                Xf,
+                original_left,
+                ctx.n_words,
+                ctx.tail_mask
+            );
+
+            andnot_bits_eval(
+                original_mask,
+                Xf,
+                original_right,
+                ctx.n_words,
+                ctx.tail_mask
+            );
+
+            ExactReplacementState_ left_state;
+            ExactReplacementState_ right_state;
+
+            if (!state.replacement_feature_used) {
+                if (split_variable == variable) {
+                    left_state.replacement_feature_used = true;
+                    right_state.replacement_feature_used = true;
+                    left_state.target_rows = original_mask;
+                    right_state.target_rows = original_mask;
+                    left_state.replacement_values =
+                        Packed(static_cast<std::size_t>(ctx.n_words));
+                    right_state.replacement_values =
+                        Packed(static_cast<std::size_t>(ctx.n_words));
+
+                    and_bits_eval(
+                        replacement_root_mask,
+                        Xf,
+                        left_state.replacement_values,
+                        ctx.n_words,
+                        ctx.tail_mask
+                    );
+
+                    andnot_bits_eval(
+                        replacement_root_mask,
+                        Xf,
+                        right_state.replacement_values,
+                        ctx.n_words,
+                        ctx.tail_mask
+                    );
+                }
+            } else {
+                left_state.replacement_feature_used = true;
+                right_state.replacement_feature_used = true;
+                left_state.target_rows =
+                    Packed(static_cast<std::size_t>(ctx.n_words));
+                right_state.target_rows =
+                    Packed(static_cast<std::size_t>(ctx.n_words));
+                left_state.replacement_values =
+                    Packed(static_cast<std::size_t>(ctx.n_words));
+                right_state.replacement_values =
+                    Packed(static_cast<std::size_t>(ctx.n_words));
+
+                if (split_variable == variable) {
+                    left_state.target_rows.w = state.target_rows.w;
+                    right_state.target_rows.w = state.target_rows.w;
+
+                    and_bits_eval(
+                        state.replacement_values,
+                        Xf,
+                        left_state.replacement_values,
+                        ctx.n_words,
+                        ctx.tail_mask
+                    );
+
+                    andnot_bits_eval(
+                        state.replacement_values,
+                        Xf,
+                        right_state.replacement_values,
+                        ctx.n_words,
+                        ctx.tail_mask
+                    );
+                } else {
+                    and_bits_eval(
+                        state.target_rows,
+                        Xf,
+                        left_state.target_rows,
+                        ctx.n_words,
+                        ctx.tail_mask
+                    );
+
+                    andnot_bits_eval(
+                        state.target_rows,
+                        Xf,
+                        right_state.target_rows,
+                        ctx.n_words,
+                        ctx.tail_mask
+                    );
+
+                    left_state.replacement_values.w =
+                        state.replacement_values.w;
+                    right_state.replacement_values.w =
+                        state.replacement_values.w;
+                }
+            }
+
+            auto Lb =
+                collect_exact_local_importance_extrema_by_obj_(
+                    L,
+                    bL,
+                    original_left,
+                    replacement_root_mask,
+                    left_state,
+                    variable,
+                    internal_to_variable,
+                    ctx,
+                    Y_eval_bits,
+                    BBwrong_eval,
+                    matched_group_of_row_eval,
+                    matched_group_inv_size_eval,
+                    matched_effectively_uniform,
+                    matched_scratch
+                );
+
+            auto Rb =
+                collect_exact_local_importance_extrema_by_obj_(
+                    R,
+                    bR,
+                    original_right,
+                    replacement_root_mask,
+                    right_state,
+                    variable,
+                    internal_to_variable,
+                    ctx,
+                    Y_eval_bits,
+                    BBwrong_eval,
+                    matched_group_of_row_eval,
+                    matched_group_inv_size_eval,
+                    matched_effectively_uniform,
+                    matched_scratch
+                );
+
+            if (Lb.empty() || Rb.empty()) continue;
+
+            std::vector<int> R_objs;
+            R_objs.reserve(Rb.size());
+            for (const auto& rb : Rb) {
+                R_objs.push_back(rb.obj);
+            }
+
+            for (const auto& lb : Lb) {
+                const int rem = budget - lb.obj;
+
+                auto it_end =
+                    std::upper_bound(
+                        R_objs.begin(),
+                        R_objs.end(),
+                        rem
+                    );
+
+                const std::size_t r_hi =
+                    static_cast<std::size_t>(
+                        std::distance(R_objs.begin(), it_end)
+                    );
+
+                for (std::size_t ri = 0; ri < r_hi; ++ri) {
+                    const auto& rb = Rb[ri];
+                    const int total_obj = lb.obj + rb.obj;
+                    if (total_obj > budget) continue;
+
+                    update_local_extrema_from_sum_(
+                        acc[total_obj],
+                        lb.extrema,
+                        rb.extrema
+                    );
+                }
+            }
+        }
+
+        return to_sorted_local_importance_extrema_buckets_(acc);
+    }
+
+    struct ExactAllLocalImportanceExtrema_ {
+        int number_of_variables = 0;
+        int n_eval = 0;
+        std::vector<double> lower; // flattened [variable * n_eval + row]
+        std::vector<double> upper;
+
+        inline bool empty() const {
+            return lower.empty();
+        }
+
+        inline std::size_t block_size() const {
+            return static_cast<std::size_t>(n_eval);
+        }
+
+        inline double* lower_ptr(int variable) {
+            return lower.data() +
+                static_cast<std::size_t>(variable) * block_size();
+        }
+
+        inline double* upper_ptr(int variable) {
+            return upper.data() +
+                static_cast<std::size_t>(variable) * block_size();
+        }
+
+        inline const double* lower_ptr(int variable) const {
+            return lower.data() +
+                static_cast<std::size_t>(variable) * block_size();
+        }
+
+        inline const double* upper_ptr(int variable) const {
+            return upper.data() +
+                static_cast<std::size_t>(variable) * block_size();
+        }
+    };
+
+    static inline void fast_update_minmax_(
+        double* dst_lower,
+        double* dst_upper,
+        const double* cand_lower,
+        const double* cand_upper,
+        std::size_t n
+    ) {
+        std::size_t i = 0;
+    #if ArborEnum_USE_AVX512
+        for (; i + 8 <= n; i += 8) {
+            const __m512d dlo = _mm512_loadu_pd(dst_lower + i);
+            const __m512d dup = _mm512_loadu_pd(dst_upper + i);
+            const __m512d clo = _mm512_loadu_pd(cand_lower + i);
+            const __m512d cup = _mm512_loadu_pd(cand_upper + i);
+            _mm512_storeu_pd(dst_lower + i, _mm512_min_pd(dlo, clo));
+            _mm512_storeu_pd(dst_upper + i, _mm512_max_pd(dup, cup));
+        }
+    #endif
+        for (; i < n; ++i) {
+            dst_lower[i] = std::min(dst_lower[i], cand_lower[i]);
+            dst_upper[i] = std::max(dst_upper[i], cand_upper[i]);
+        }
+    }
+
+    static inline void fast_update_minmax_sum_(
+        double* dst_lower,
+        double* dst_upper,
+        const double* left_lower,
+        const double* left_upper,
+        const double* right_lower,
+        const double* right_upper,
+        std::size_t n
+    ) {
+        std::size_t i = 0;
+    #if ArborEnum_USE_AVX512
+        for (; i + 8 <= n; i += 8) {
+            const __m512d dlo = _mm512_loadu_pd(dst_lower + i);
+            const __m512d dup = _mm512_loadu_pd(dst_upper + i);
+            const __m512d llo = _mm512_loadu_pd(left_lower + i);
+            const __m512d lup = _mm512_loadu_pd(left_upper + i);
+            const __m512d rlo = _mm512_loadu_pd(right_lower + i);
+            const __m512d rup = _mm512_loadu_pd(right_upper + i);
+            const __m512d clo = _mm512_add_pd(llo, rlo);
+            const __m512d cup = _mm512_add_pd(lup, rup);
+            _mm512_storeu_pd(dst_lower + i, _mm512_min_pd(dlo, clo));
+            _mm512_storeu_pd(dst_upper + i, _mm512_max_pd(dup, cup));
+        }
+    #endif
+        for (; i < n; ++i) {
+            const double lo = left_lower[i] + right_lower[i];
+            const double up = left_upper[i] + right_upper[i];
+            dst_lower[i] = std::min(dst_lower[i], lo);
+            dst_upper[i] = std::max(dst_upper[i], up);
+        }
+    }
+
+    static inline void fast_include_zero_(
+        double* dst_lower,
+        double* dst_upper,
+        std::size_t n
+    ) {
+        std::size_t i = 0;
+    #if ArborEnum_USE_AVX512
+        const __m512d z = _mm512_setzero_pd();
+        for (; i + 8 <= n; i += 8) {
+            const __m512d dlo = _mm512_loadu_pd(dst_lower + i);
+            const __m512d dup = _mm512_loadu_pd(dst_upper + i);
+            _mm512_storeu_pd(dst_lower + i, _mm512_min_pd(dlo, z));
+            _mm512_storeu_pd(dst_upper + i, _mm512_max_pd(dup, z));
+        }
+    #endif
+        for (; i < n; ++i) {
+            dst_lower[i] = std::min(dst_lower[i], 0.0);
+            dst_upper[i] = std::max(dst_upper[i], 0.0);
+        }
+    }
+
+    static inline double fast_sum_doubles_(
+        const double* x,
+        std::size_t n
+    ) {
+        std::size_t i = 0;
+        double total = 0.0;
+    #if ArborEnum_USE_AVX512
+        __m512d acc = _mm512_setzero_pd();
+        for (; i + 8 <= n; i += 8) {
+            acc = _mm512_add_pd(acc, _mm512_loadu_pd(x + i));
+        }
+        alignas(64) double tmp[8];
+        _mm512_store_pd(tmp, acc);
+        total = tmp[0] + tmp[1] + tmp[2] + tmp[3] +
+                tmp[4] + tmp[5] + tmp[6] + tmp[7];
+    #endif
+        for (; i < n; ++i) total += x[i];
+        return total;
+    }
+
+    void exact_local_importance_for_leaf_variable_into_(
+        const Packed& original_mask,
+        const ExactReplacementState_& state,
+        int prediction,
+        const EvalCtx& ctx,
+        const std::vector<Packed>& Y_eval_bits,
+        const Packed* BBwrong_eval,
+        const std::vector<int>* matched_group_of_row_eval,
+        const std::vector<double>* matched_group_inv_size_eval,
+        bool matched_effectively_uniform,
+        ExactMatchedScratch_* matched_scratch,
+        std::vector<double>& local
+    ) const {
+        local.assign(static_cast<std::size_t>(ctx.n_eval), 0.0);
+
+        if (!state.replacement_feature_used) {
+            return;
+        }
+
+        if (
+            prediction != DEFER_PREDICTION &&
+            (prediction < 0 || prediction >= num_classes)
+        ) {
+            throw std::runtime_error(
+                "Leaf prediction is outside valid class range."
+            );
+        }
+
+        if (prediction == DEFER_PREDICTION && !BBwrong_eval) {
+            throw std::runtime_error(
+                "Deferred leaf encountered, but eval bb_pred was not provided."
+            );
+        }
+
+        // Original contribution: -1 for rows misclassified by the original route.
+        for (int wi = 0; wi < ctx.n_words; ++wi) {
+            uint64_t wrong_original =
+                original_mask.w[static_cast<std::size_t>(wi)];
+
+            if (prediction == DEFER_PREDICTION) {
+                wrong_original &=
+                    BBwrong_eval->w[static_cast<std::size_t>(wi)];
+            } else {
+                wrong_original &=
+                    ~Y_eval_bits[
+                        static_cast<std::size_t>(prediction)
+                    ].w[static_cast<std::size_t>(wi)];
+            }
+
+            while (wrong_original) {
+                const int bit = exact_ctz64_(wrong_original);
+                const int row = (wi << 6) + bit;
+                wrong_original &= wrong_original - 1;
+                local[static_cast<std::size_t>(row)] -= 1.0;
+            }
+        }
+
+        if (
+            matched_group_of_row_eval == nullptr ||
+            matched_effectively_uniform
+        ) {
+            const int number_of_replacement_values =
+                count_eval_mask_(state.replacement_values, ctx.n_words);
+
+            const double donor_probability =
+                static_cast<double>(number_of_replacement_values) /
+                static_cast<double>(ctx.n_eval);
+
+            if (donor_probability == 0.0) {
+                return;
+            }
+
+            for (int wi = 0; wi < ctx.n_words; ++wi) {
+                uint64_t wrong_target =
+                    state.target_rows.w[static_cast<std::size_t>(wi)];
+
+                if (prediction == DEFER_PREDICTION) {
+                    wrong_target &=
+                        BBwrong_eval->w[static_cast<std::size_t>(wi)];
+                } else {
+                    wrong_target &=
+                        ~Y_eval_bits[
+                            static_cast<std::size_t>(prediction)
+                        ].w[static_cast<std::size_t>(wi)];
+                }
+
+                while (wrong_target) {
+                    const int bit = exact_ctz64_(wrong_target);
+                    const int row = (wi << 6) + bit;
+                    wrong_target &= wrong_target - 1;
+                    local[static_cast<std::size_t>(row)] += donor_probability;
+                }
+            }
+
+            return;
+        }
+
+        if (
+            matched_group_inv_size_eval == nullptr ||
+            matched_scratch == nullptr
+        ) {
+            throw std::runtime_error(
+                "Matched-group local exact replacement state is incomplete."
+            );
+        }
+
+        const int number_of_groups =
+            static_cast<int>(matched_group_inv_size_eval->size());
+
+        matched_scratch->begin(number_of_groups);
+
+        for (int wi = 0; wi < ctx.n_words; ++wi) {
+            uint64_t replacement_bits =
+                state.replacement_values.w[static_cast<std::size_t>(wi)];
+
+            while (replacement_bits) {
+                const int bit = exact_ctz64_(replacement_bits);
+                const int row = (wi << 6) + bit;
+                replacement_bits &= replacement_bits - 1;
+
+                const int group =
+                    (*matched_group_of_row_eval)[
+                        static_cast<std::size_t>(row)
+                    ];
+
+                matched_scratch->touch(group);
+                ++matched_scratch->replacement_counts[
+                    static_cast<std::size_t>(group)
+                ];
+            }
+        }
+
+        for (int wi = 0; wi < ctx.n_words; ++wi) {
+            uint64_t wrong_target =
+                state.target_rows.w[static_cast<std::size_t>(wi)];
+
+            if (prediction == DEFER_PREDICTION) {
+                wrong_target &=
+                    BBwrong_eval->w[static_cast<std::size_t>(wi)];
+            } else {
+                wrong_target &=
+                    ~Y_eval_bits[
+                        static_cast<std::size_t>(prediction)
+                    ].w[static_cast<std::size_t>(wi)];
+            }
+
+            while (wrong_target) {
+                const int bit = exact_ctz64_(wrong_target);
+                const int row = (wi << 6) + bit;
+                wrong_target &= wrong_target - 1;
+
+                const int group =
+                    (*matched_group_of_row_eval)[
+                        static_cast<std::size_t>(row)
+                    ];
+
+                matched_scratch->touch(group);
+                local[static_cast<std::size_t>(row)] +=
+                    static_cast<double>(
+                        matched_scratch->replacement_counts[
+                            static_cast<std::size_t>(group)
+                        ]
+                    ) *
+                    (*matched_group_inv_size_eval)[
+                        static_cast<std::size_t>(group)
+                    ];
+            }
+        }
+    }
+
+
+    struct ExactLocalImportanceNumeratorExtrema_ {
+        std::vector<int32_t> lower;
+        std::vector<int32_t> upper;
+        bool all_zero = false;
+
+        inline bool empty() const {
+            return !all_zero && lower.empty();
+        }
+    };
+
+    using ExactNodeVariableMasks_ =
+        std::unordered_map<const TreeTrieNode*, std::vector<uint64_t>>;
+
+    static inline void fast_update_minmax_i32_(
+        int32_t* dst_lower,
+        int32_t* dst_upper,
+        const int32_t* cand_lower,
+        const int32_t* cand_upper,
+        std::size_t n
+    ) {
+        std::size_t i = 0;
+    #if ArborEnum_USE_AVX512
+        for (; i + 16 <= n; i += 16) {
+            const __m512i dlo =
+                _mm512_loadu_si512((const void*)(dst_lower + i));
+            const __m512i dup =
+                _mm512_loadu_si512((const void*)(dst_upper + i));
+            const __m512i clo =
+                _mm512_loadu_si512((const void*)(cand_lower + i));
+            const __m512i cup =
+                _mm512_loadu_si512((const void*)(cand_upper + i));
+            _mm512_storeu_si512(
+                (void*)(dst_lower + i),
+                _mm512_min_epi32(dlo, clo)
+            );
+            _mm512_storeu_si512(
+                (void*)(dst_upper + i),
+                _mm512_max_epi32(dup, cup)
+            );
+        }
+    #endif
+        for (; i < n; ++i) {
+            dst_lower[i] = std::min(dst_lower[i], cand_lower[i]);
+            dst_upper[i] = std::max(dst_upper[i], cand_upper[i]);
+        }
+    }
+
+    static inline void fast_update_minmax_sum_i32_(
+        int32_t* dst_lower,
+        int32_t* dst_upper,
+        const int32_t* left_lower,
+        const int32_t* left_upper,
+        const int32_t* right_lower,
+        const int32_t* right_upper,
+        std::size_t n
+    ) {
+        std::size_t i = 0;
+    #if ArborEnum_USE_AVX512
+        for (; i + 16 <= n; i += 16) {
+            const __m512i dlo =
+                _mm512_loadu_si512((const void*)(dst_lower + i));
+            const __m512i dup =
+                _mm512_loadu_si512((const void*)(dst_upper + i));
+            const __m512i llo =
+                _mm512_loadu_si512((const void*)(left_lower + i));
+            const __m512i lup =
+                _mm512_loadu_si512((const void*)(left_upper + i));
+            const __m512i rlo =
+                _mm512_loadu_si512((const void*)(right_lower + i));
+            const __m512i rup =
+                _mm512_loadu_si512((const void*)(right_upper + i));
+            const __m512i clo = _mm512_add_epi32(llo, rlo);
+            const __m512i cup = _mm512_add_epi32(lup, rup);
+            _mm512_storeu_si512(
+                (void*)(dst_lower + i),
+                _mm512_min_epi32(dlo, clo)
+            );
+            _mm512_storeu_si512(
+                (void*)(dst_upper + i),
+                _mm512_max_epi32(dup, cup)
+            );
+        }
+    #endif
+        for (; i < n; ++i) {
+            const int32_t lo = left_lower[i] + right_lower[i];
+            const int32_t up = left_upper[i] + right_upper[i];
+            dst_lower[i] = std::min(dst_lower[i], lo);
+            dst_upper[i] = std::max(dst_upper[i], up);
+        }
+    }
+
+    static inline void fast_copy_sum_i32_(
+        int32_t* dst_lower,
+        int32_t* dst_upper,
+        const int32_t* left_lower,
+        const int32_t* left_upper,
+        const int32_t* right_lower,
+        const int32_t* right_upper,
+        std::size_t n
+    ) {
+        std::size_t i = 0;
+    #if ArborEnum_USE_AVX512
+        for (; i + 16 <= n; i += 16) {
+            const __m512i llo =
+                _mm512_loadu_si512((const void*)(left_lower + i));
+            const __m512i lup =
+                _mm512_loadu_si512((const void*)(left_upper + i));
+            const __m512i rlo =
+                _mm512_loadu_si512((const void*)(right_lower + i));
+            const __m512i rup =
+                _mm512_loadu_si512((const void*)(right_upper + i));
+            _mm512_storeu_si512(
+                (void*)(dst_lower + i),
+                _mm512_add_epi32(llo, rlo)
+            );
+            _mm512_storeu_si512(
+                (void*)(dst_upper + i),
+                _mm512_add_epi32(lup, rup)
+            );
+        }
+    #endif
+        for (; i < n; ++i) {
+            dst_lower[i] = left_lower[i] + right_lower[i];
+            dst_upper[i] = left_upper[i] + right_upper[i];
+        }
+    }
+
+    static inline void fast_include_zero_i32_(
+        int32_t* dst_lower,
+        int32_t* dst_upper,
+        std::size_t n
+    ) {
+        std::size_t i = 0;
+    #if ArborEnum_USE_AVX512
+        const __m512i z = _mm512_setzero_si512();
+        for (; i + 16 <= n; i += 16) {
+            const __m512i dlo =
+                _mm512_loadu_si512((const void*)(dst_lower + i));
+            const __m512i dup =
+                _mm512_loadu_si512((const void*)(dst_upper + i));
+            _mm512_storeu_si512(
+                (void*)(dst_lower + i),
+                _mm512_min_epi32(dlo, z)
+            );
+            _mm512_storeu_si512(
+                (void*)(dst_upper + i),
+                _mm512_max_epi32(dup, z)
+            );
+        }
+    #endif
+        for (; i < n; ++i) {
+            dst_lower[i] = std::min<int32_t>(dst_lower[i], 0);
+            dst_upper[i] = std::max<int32_t>(dst_upper[i], 0);
+        }
+    }
+
+    static inline int64_t fast_sum_i32_(
+        const int32_t* x,
+        std::size_t n
+    ) {
+        int64_t total = 0;
+        for (std::size_t i = 0; i < n; ++i) {
+            total += static_cast<int64_t>(x[i]);
+        }
+        return total;
+    }
+
+    static inline void materialize_zero_numerator_extrema_(
+        ExactLocalImportanceNumeratorExtrema_& x,
+        std::size_t n
+    ) {
+        if (!x.all_zero) return;
+        x.lower.assign(n, 0);
+        x.upper.assign(n, 0);
+        x.all_zero = false;
+    }
+
+    static inline void merge_numerator_extrema_(
+        ExactLocalImportanceNumeratorExtrema_& dst,
+        const ExactLocalImportanceNumeratorExtrema_& cand,
+        std::size_t n
+    ) {
+        if (cand.empty()) return;
+
+        if (dst.empty()) {
+            if (cand.all_zero) {
+                dst.all_zero = true;
+                return;
+            }
+            dst.lower = cand.lower;
+            dst.upper = cand.upper;
+            dst.all_zero = false;
+            return;
+        }
+
+        if (dst.all_zero) {
+            if (cand.all_zero) return;
+            materialize_zero_numerator_extrema_(dst, n);
+            fast_update_minmax_i32_(
+                dst.lower.data(),
+                dst.upper.data(),
+                cand.lower.data(),
+                cand.upper.data(),
+                n
+            );
+            return;
+        }
+
+        if (cand.all_zero) {
+            fast_include_zero_i32_(
+                dst.lower.data(),
+                dst.upper.data(),
+                n
+            );
+            return;
+        }
+
+        fast_update_minmax_i32_(
+            dst.lower.data(),
+            dst.upper.data(),
+            cand.lower.data(),
+            cand.upper.data(),
+            n
+        );
+    }
+
+    static inline void merge_numerator_extrema_move_(
+        ExactLocalImportanceNumeratorExtrema_& dst,
+        ExactLocalImportanceNumeratorExtrema_&& cand,
+        std::size_t n
+    ) {
+        if (cand.empty()) return;
+        if (dst.empty()) {
+            dst = std::move(cand);
+            return;
+        }
+        merge_numerator_extrema_(dst, cand, n);
+    }
+
+    static inline void update_numerator_extrema_from_sum_(
+        ExactLocalImportanceNumeratorExtrema_& dst,
+        ExactLocalImportanceNumeratorExtrema_&& left,
+        ExactLocalImportanceNumeratorExtrema_&& right,
+        std::size_t n
+    ) {
+        if (left.empty() || right.empty()) return;
+
+        if (left.all_zero && right.all_zero) {
+            ExactLocalImportanceNumeratorExtrema_ z;
+            z.all_zero = true;
+            merge_numerator_extrema_move_(dst, std::move(z), n);
+            return;
+        }
+
+        if (left.all_zero) {
+            merge_numerator_extrema_move_(dst, std::move(right), n);
+            return;
+        }
+
+        if (right.all_zero) {
+            merge_numerator_extrema_move_(dst, std::move(left), n);
+            return;
+        }
+
+        if (dst.empty()) {
+            dst.lower.resize(n);
+            dst.upper.resize(n);
+            fast_copy_sum_i32_(
+                dst.lower.data(),
+                dst.upper.data(),
+                left.lower.data(),
+                left.upper.data(),
+                right.lower.data(),
+                right.upper.data(),
+                n
+            );
+            return;
+        }
+
+        if (dst.all_zero) {
+            materialize_zero_numerator_extrema_(dst, n);
+        }
+
+        fast_update_minmax_sum_i32_(
+            dst.lower.data(),
+            dst.upper.data(),
+            left.lower.data(),
+            left.upper.data(),
+            right.lower.data(),
+            right.upper.data(),
+            n
+        );
+    }
+
+    void build_exact_node_variable_masks_(
+        const TreeTrieNode* node,
+        const std::vector<int>& internal_to_variable,
+        int number_of_variables,
+        ExactNodeVariableMasks_& masks
+    ) const {
+        if (!node || masks.find(node) != masks.end()) return;
+
+        const std::size_t word_count =
+            static_cast<std::size_t>((number_of_variables + 63) >> 6);
+        std::vector<uint64_t> mask(word_count, 0ULL);
+
+        for (const auto& split : node->splits) {
+            const int variable =
+                internal_to_variable[
+                    static_cast<std::size_t>(split.feature)
+                ];
+            mask[static_cast<std::size_t>(variable >> 6)] |=
+                1ULL << (variable & 63);
+
+            const TreeTrieNode* L = split.left.get();
+            const TreeTrieNode* R = split.right.get();
+
+            build_exact_node_variable_masks_(
+                L,
+                internal_to_variable,
+                number_of_variables,
+                masks
+            );
+            build_exact_node_variable_masks_(
+                R,
+                internal_to_variable,
+                number_of_variables,
+                masks
+            );
+
+            if (L) {
+                auto it = masks.find(L);
+                if (it != masks.end()) {
+                    for (std::size_t w = 0; w < word_count; ++w) {
+                        mask[w] |= it->second[w];
+                    }
+                }
+            }
+
+            if (R) {
+                auto it = masks.find(R);
+                if (it != masks.end()) {
+                    for (std::size_t w = 0; w < word_count; ++w) {
+                        mask[w] |= it->second[w];
+                    }
+                }
+            }
+        }
+
+        masks.emplace(node, std::move(mask));
+    }
+
+    static inline bool exact_node_can_contain_variable_(
+        const TreeTrieNode* node,
+        int variable,
+        const ExactNodeVariableMasks_& masks
+    ) {
+        const auto it = masks.find(node);
+        if (it == masks.end()) return false;
+        const std::size_t w = static_cast<std::size_t>(variable >> 6);
+        return
+            w < it->second.size() &&
+            ((it->second[w] >> (variable & 63)) & 1ULL) != 0ULL;
+    }
+
+    void update_numerator_extrema_from_leaf_(
+        ExactLocalImportanceNumeratorExtrema_& acc,
+        const Packed& original_mask,
+        const ExactReplacementState_& state,
+        int prediction,
+        const EvalCtx& ctx,
+        const std::vector<Packed>& Y_eval_bits,
+        const Packed* BBwrong_eval,
+        const std::vector<int>* matched_group_of_row_eval,
+        const std::vector<int>* matched_group_size_eval,
+        bool matched_effectively_uniform,
+        ExactMatchedScratch_* matched_scratch
+    ) const {
+        const std::size_t n = static_cast<std::size_t>(ctx.n_eval);
+
+        if (!state.replacement_feature_used) {
+            ExactLocalImportanceNumeratorExtrema_ z;
+            z.all_zero = true;
+            merge_numerator_extrema_move_(acc, std::move(z), n);
+            return;
+        }
+
+        if (
+            prediction != DEFER_PREDICTION &&
+            (prediction < 0 || prediction >= num_classes)
+        ) {
+            throw std::runtime_error(
+                "Leaf prediction is outside valid class range."
+            );
+        }
+
+        if (prediction == DEFER_PREDICTION && !BBwrong_eval) {
+            throw std::runtime_error(
+                "Deferred leaf encountered, but eval bb_pred was not provided."
+            );
+        }
+
+        const bool grouped =
+            matched_group_of_row_eval != nullptr &&
+            !matched_effectively_uniform;
+
+        int donor_count = 0;
+
+        if (!grouped) {
+            donor_count =
+                count_eval_mask_(state.replacement_values, ctx.n_words);
+        } else {
+            if (
+                matched_group_size_eval == nullptr ||
+                matched_scratch == nullptr
+            ) {
+                throw std::runtime_error(
+                    "Matched-group local exact replacement state is incomplete."
+                );
+            }
+
+            const int number_of_groups =
+                static_cast<int>(matched_group_size_eval->size());
+            matched_scratch->begin(number_of_groups);
+
+            for (int wi = 0; wi < ctx.n_words; ++wi) {
+                uint64_t replacement_bits =
+                    state.replacement_values.w[
+                        static_cast<std::size_t>(wi)
+                    ];
+
+                while (replacement_bits) {
+                    const int bit = exact_ctz64_(replacement_bits);
+                    const int row = (wi << 6) + bit;
+                    replacement_bits &= replacement_bits - 1;
+                    const int group =
+                        (*matched_group_of_row_eval)[
+                            static_cast<std::size_t>(row)
+                        ];
+                    matched_scratch->touch(group);
+                    ++matched_scratch->replacement_counts[
+                        static_cast<std::size_t>(group)
+                    ];
+                }
+            }
+        }
+
+        auto wrong_word = [&](const Packed& mask, int wi) -> uint64_t {
+            uint64_t bits = mask.w[static_cast<std::size_t>(wi)];
+            if (prediction == DEFER_PREDICTION) {
+                bits &= BBwrong_eval->w[static_cast<std::size_t>(wi)];
+            } else {
+                bits &=
+                    ~Y_eval_bits[
+                        static_cast<std::size_t>(prediction)
+                    ].w[static_cast<std::size_t>(wi)];
+            }
+            if (wi == ctx.n_words - 1) bits &= ctx.tail_mask;
+            return bits;
+        };
+
+        bool any_special = false;
+        for (int wi = 0; wi < ctx.n_words; ++wi) {
+            if (
+                (wrong_word(original_mask, wi) |
+                 wrong_word(state.target_rows, wi)) != 0ULL
+            ) {
+                any_special = true;
+                break;
+            }
+        }
+
+        if (!any_special) {
+            ExactLocalImportanceNumeratorExtrema_ z;
+            z.all_zero = true;
+            merge_numerator_extrema_move_(acc, std::move(z), n);
+            return;
+        }
+
+        const bool was_empty = acc.empty();
+        const bool had_zero = acc.all_zero;
+
+        if (was_empty || had_zero) {
+            acc.lower.assign(n, 0);
+            acc.upper.assign(n, 0);
+            acc.all_zero = false;
+
+            for (int wi = 0; wi < ctx.n_words; ++wi) {
+                const uint64_t wo = wrong_word(original_mask, wi);
+                const uint64_t wt = wrong_word(state.target_rows, wi);
+                uint64_t special = wo | wt;
+
+                while (special) {
+                    const int bit = exact_ctz64_(special);
+                    const int row = (wi << 6) + bit;
+                    special &= special - 1;
+
+                    int32_t value = 0;
+
+                    if (grouped) {
+                        const int group =
+                            (*matched_group_of_row_eval)[
+                                static_cast<std::size_t>(row)
+                            ];
+                        if ((wt >> bit) & 1ULL) {
+                            matched_scratch->touch(group);
+                            value +=
+                                matched_scratch->replacement_counts[
+                                    static_cast<std::size_t>(group)
+                                ];
+                        }
+                        if ((wo >> bit) & 1ULL) {
+                            value -=
+                                (*matched_group_size_eval)[
+                                    static_cast<std::size_t>(group)
+                                ];
+                        }
+                    } else {
+                        if ((wt >> bit) & 1ULL) {
+                            value += donor_count;
+                        }
+                        if ((wo >> bit) & 1ULL) {
+                            value -= ctx.n_eval;
+                        }
+                    }
+
+                    const std::size_t r = static_cast<std::size_t>(row);
+                    if (was_empty) {
+                        acc.lower[r] = value;
+                        acc.upper[r] = value;
+                    } else {
+                        acc.lower[r] = std::min(acc.lower[r], value);
+                        acc.upper[r] = std::max(acc.upper[r], value);
+                    }
+                }
+            }
+
+            return;
+        }
+
+        for (int wi = 0; wi < ctx.n_words; ++wi) {
+            const uint64_t wo = wrong_word(original_mask, wi);
+            const uint64_t wt = wrong_word(state.target_rows, wi);
+            const uint64_t special = wo | wt;
+            const int base = wi << 6;
+            const int count =
+                std::min(64, ctx.n_eval - base);
+
+            if (special == 0ULL) {
+                fast_include_zero_i32_(
+                    acc.lower.data() + static_cast<std::size_t>(base),
+                    acc.upper.data() + static_cast<std::size_t>(base),
+                    static_cast<std::size_t>(count)
+                );
+                continue;
+            }
+
+            for (int bit = 0; bit < count; ++bit) {
+                int32_t value = 0;
+
+                if ((special >> bit) & 1ULL) {
+                    if (grouped) {
+                        const int row = base + bit;
+                        const int group =
+                            (*matched_group_of_row_eval)[
+                                static_cast<std::size_t>(row)
+                            ];
+                        if ((wt >> bit) & 1ULL) {
+                            matched_scratch->touch(group);
+                            value +=
+                                matched_scratch->replacement_counts[
+                                    static_cast<std::size_t>(group)
+                                ];
+                        }
+                        if ((wo >> bit) & 1ULL) {
+                            value -=
+                                (*matched_group_size_eval)[
+                                    static_cast<std::size_t>(group)
+                                ];
+                        }
+                    } else {
+                        if ((wt >> bit) & 1ULL) {
+                            value += donor_count;
+                        }
+                        if ((wo >> bit) & 1ULL) {
+                            value -= ctx.n_eval;
+                        }
+                    }
+                }
+
+                const std::size_t row =
+                    static_cast<std::size_t>(base + bit);
+                acc.lower[row] = std::min(acc.lower[row], value);
+                acc.upper[row] = std::max(acc.upper[row], value);
+            }
+        }
+    }
+
+    ExactLocalImportanceNumeratorExtrema_
+    collect_exact_local_importance_numerator_extrema_at_most_(
+        const TreeTrieNode* node,
+        int budget,
+        const Packed& original_mask,
+        const Packed& replacement_root_mask,
+        const ExactReplacementState_& state,
+        int variable,
+        const std::vector<int>& internal_to_variable,
+        const EvalCtx& ctx,
+        const std::vector<Packed>& Y_eval_bits,
+        const Packed* BBwrong_eval,
+        const std::vector<int>* matched_group_of_row_eval,
+        const std::vector<int>* matched_group_size_eval,
+        bool matched_effectively_uniform,
+        ExactMatchedScratch_* matched_scratch,
+        const ExactNodeVariableMasks_& node_variable_masks
+    ) const {
+        ExactLocalImportanceNumeratorExtrema_ acc;
+
+        if (!node || budget < 0) return acc;
+
+        constexpr int INF = std::numeric_limits<int>::max();
+
+        if (
+            node->min_objective == INF ||
+            node->min_objective > budget
+        ) {
+            return acc;
+        }
+
+        if (
+            !state.replacement_feature_used &&
+            !exact_node_can_contain_variable_(
+                node,
+                variable,
+                node_variable_masks
+            )
+        ) {
+            acc.all_zero = true;
+            return acc;
+        }
+
+        const std::size_t n = static_cast<std::size_t>(ctx.n_eval);
+
+        for (const auto& leaf : node->leaves) {
+            if (leaf.loss > budget) continue;
+
+            update_numerator_extrema_from_leaf_(
+                acc,
+                original_mask,
+                state,
+                leaf.prediction,
+                ctx,
+                Y_eval_bits,
+                BBwrong_eval,
+                matched_group_of_row_eval,
+                matched_group_size_eval,
+                matched_effectively_uniform,
+                matched_scratch
+            );
+        }
+
+        for (const auto& split : node->splits) {
+            const TreeTrieNode* L = split.left.get();
+            const TreeTrieNode* R = split.right.get();
+            if (!L || !R) continue;
+
+            const int minL = L->min_objective;
+            const int minR = R->min_objective;
+            if (minL == INF || minR == INF) continue;
+            if (minL + minR > budget) continue;
+
+            if (
+                split.feature < 0 ||
+                split.feature >=
+                    static_cast<int>(internal_to_variable.size())
+            ) {
+                throw std::runtime_error(
+                    "Exact local interval evaluation saw an invalid split feature."
+                );
+            }
+
+            const int split_variable =
+                internal_to_variable[
+                    static_cast<std::size_t>(split.feature)
+                ];
+
+            if (split_variable < 0) {
+                throw std::runtime_error(
+                    "Split feature is not mapped to an original variable."
+                );
+            }
+
+            const Packed& Xf =
+                ctx.X_bits_eval[
+                    static_cast<std::size_t>(split.feature)
+                ];
+
+            Packed original_left(static_cast<std::size_t>(ctx.n_words));
+            Packed original_right(static_cast<std::size_t>(ctx.n_words));
+
+            and_bits_eval(
+                original_mask,
+                Xf,
+                original_left,
+                ctx.n_words,
+                ctx.tail_mask
+            );
+            andnot_bits_eval(
+                original_mask,
+                Xf,
+                original_right,
+                ctx.n_words,
+                ctx.tail_mask
+            );
+
+            ExactReplacementState_ left_state;
+            ExactReplacementState_ right_state;
+
+            if (!state.replacement_feature_used) {
+                if (split_variable == variable) {
+                    left_state.replacement_feature_used = true;
+                    right_state.replacement_feature_used = true;
+                    left_state.target_rows = original_mask;
+                    right_state.target_rows = original_mask;
+                    left_state.replacement_values =
+                        Packed(static_cast<std::size_t>(ctx.n_words));
+                    right_state.replacement_values =
+                        Packed(static_cast<std::size_t>(ctx.n_words));
+
+                    and_bits_eval(
+                        replacement_root_mask,
+                        Xf,
+                        left_state.replacement_values,
+                        ctx.n_words,
+                        ctx.tail_mask
+                    );
+                    andnot_bits_eval(
+                        replacement_root_mask,
+                        Xf,
+                        right_state.replacement_values,
+                        ctx.n_words,
+                        ctx.tail_mask
+                    );
+                }
+            } else {
+                left_state.replacement_feature_used = true;
+                right_state.replacement_feature_used = true;
+                left_state.target_rows =
+                    Packed(static_cast<std::size_t>(ctx.n_words));
+                right_state.target_rows =
+                    Packed(static_cast<std::size_t>(ctx.n_words));
+                left_state.replacement_values =
+                    Packed(static_cast<std::size_t>(ctx.n_words));
+                right_state.replacement_values =
+                    Packed(static_cast<std::size_t>(ctx.n_words));
+
+                if (split_variable == variable) {
+                    left_state.target_rows.w = state.target_rows.w;
+                    right_state.target_rows.w = state.target_rows.w;
+
+                    and_bits_eval(
+                        state.replacement_values,
+                        Xf,
+                        left_state.replacement_values,
+                        ctx.n_words,
+                        ctx.tail_mask
+                    );
+                    andnot_bits_eval(
+                        state.replacement_values,
+                        Xf,
+                        right_state.replacement_values,
+                        ctx.n_words,
+                        ctx.tail_mask
+                    );
+                } else {
+                    and_bits_eval(
+                        state.target_rows,
+                        Xf,
+                        left_state.target_rows,
+                        ctx.n_words,
+                        ctx.tail_mask
+                    );
+                    andnot_bits_eval(
+                        state.target_rows,
+                        Xf,
+                        right_state.target_rows,
+                        ctx.n_words,
+                        ctx.tail_mask
+                    );
+                    left_state.replacement_values.w =
+                        state.replacement_values.w;
+                    right_state.replacement_values.w =
+                        state.replacement_values.w;
+                }
+            }
+
+            if (split_variable != variable) {
+                const int left_budget =
+                    std::min(L->budget, budget - minR);
+                const int right_budget =
+                    std::min(R->budget, budget - minL);
+
+                auto left_ext =
+                    collect_exact_local_importance_numerator_extrema_at_most_(
+                        L,
+                        left_budget,
+                        original_left,
+                        replacement_root_mask,
+                        left_state,
+                        variable,
+                        internal_to_variable,
+                        ctx,
+                        Y_eval_bits,
+                        BBwrong_eval,
+                        matched_group_of_row_eval,
+                        matched_group_size_eval,
+                        matched_effectively_uniform,
+                        matched_scratch,
+                        node_variable_masks
+                    );
+
+                auto right_ext =
+                    collect_exact_local_importance_numerator_extrema_at_most_(
+                        R,
+                        right_budget,
+                        original_right,
+                        replacement_root_mask,
+                        right_state,
+                        variable,
+                        internal_to_variable,
+                        ctx,
+                        Y_eval_bits,
+                        BBwrong_eval,
+                        matched_group_of_row_eval,
+                        matched_group_size_eval,
+                        matched_effectively_uniform,
+                        matched_scratch,
+                        node_variable_masks
+                    );
+
+                if (left_ext.empty() || right_ext.empty()) continue;
+
+                update_numerator_extrema_from_sum_(
+                    acc,
+                    std::move(left_ext),
+                    std::move(right_ext),
+                    n
+                );
+                continue;
+            }
+
+            L->ensure_hist_built();
+            R->ensure_hist_built();
+
+            const int max_left_budget =
+                std::min(L->budget, budget - minR);
+            const int max_right_budget =
+                std::min(R->budget, budget - minL);
+
+            std::size_t left_count = 0;
+            for (const auto& e : L->hist) {
+                if (e.obj > max_left_budget) break;
+                ++left_count;
+            }
+
+            std::size_t right_count = 0;
+            for (const auto& e : R->hist) {
+                if (e.obj > max_right_budget) break;
+                ++right_count;
+            }
+
+            ExactLocalImportanceNumeratorExtrema_ split_acc;
+
+            if (left_count <= right_count) {
+                for (const auto& e : L->hist) {
+                    if (e.obj > max_left_budget) break;
+
+                    const int left_budget = e.obj;
+                    const int right_budget =
+                        std::min(R->budget, budget - left_budget);
+                    if (right_budget < minR) continue;
+
+                    auto left_ext =
+                        collect_exact_local_importance_numerator_extrema_at_most_(
+                            L,
+                            left_budget,
+                            original_left,
+                            replacement_root_mask,
+                            left_state,
+                            variable,
+                            internal_to_variable,
+                            ctx,
+                            Y_eval_bits,
+                            BBwrong_eval,
+                            matched_group_of_row_eval,
+                            matched_group_size_eval,
+                            matched_effectively_uniform,
+                            matched_scratch,
+                            node_variable_masks
+                        );
+
+                    auto right_ext =
+                        collect_exact_local_importance_numerator_extrema_at_most_(
+                            R,
+                            right_budget,
+                            original_right,
+                            replacement_root_mask,
+                            right_state,
+                            variable,
+                            internal_to_variable,
+                            ctx,
+                            Y_eval_bits,
+                            BBwrong_eval,
+                            matched_group_of_row_eval,
+                            matched_group_size_eval,
+                            matched_effectively_uniform,
+                            matched_scratch,
+                            node_variable_masks
+                        );
+
+                    if (left_ext.empty() || right_ext.empty()) continue;
+
+                    update_numerator_extrema_from_sum_(
+                        split_acc,
+                        std::move(left_ext),
+                        std::move(right_ext),
+                        n
+                    );
+                }
+            } else {
+                for (const auto& e : R->hist) {
+                    if (e.obj > max_right_budget) break;
+
+                    const int right_budget = e.obj;
+                    const int left_budget =
+                        std::min(L->budget, budget - right_budget);
+                    if (left_budget < minL) continue;
+
+                    auto left_ext =
+                        collect_exact_local_importance_numerator_extrema_at_most_(
+                            L,
+                            left_budget,
+                            original_left,
+                            replacement_root_mask,
+                            left_state,
+                            variable,
+                            internal_to_variable,
+                            ctx,
+                            Y_eval_bits,
+                            BBwrong_eval,
+                            matched_group_of_row_eval,
+                            matched_group_size_eval,
+                            matched_effectively_uniform,
+                            matched_scratch,
+                            node_variable_masks
+                        );
+
+                    auto right_ext =
+                        collect_exact_local_importance_numerator_extrema_at_most_(
+                            R,
+                            right_budget,
+                            original_right,
+                            replacement_root_mask,
+                            right_state,
+                            variable,
+                            internal_to_variable,
+                            ctx,
+                            Y_eval_bits,
+                            BBwrong_eval,
+                            matched_group_of_row_eval,
+                            matched_group_size_eval,
+                            matched_effectively_uniform,
+                            matched_scratch,
+                            node_variable_masks
+                        );
+
+                    if (left_ext.empty() || right_ext.empty()) continue;
+
+                    update_numerator_extrema_from_sum_(
+                        split_acc,
+                        std::move(left_ext),
+                        std::move(right_ext),
+                        n
+                    );
+                }
+            }
+
+            if (!split_acc.empty()) {
+                merge_numerator_extrema_move_(
+                    acc,
+                    std::move(split_acc),
+                    n
+                );
+            }
+        }
+
+        return acc;
+    }
+
+    ExactLocalImportanceExtrema_
+    collect_exact_local_importance_extrema_at_most_(
+        const TreeTrieNode* node,
+        int budget,
+        const Packed& original_mask,
+        const Packed& replacement_root_mask,
+        const ExactReplacementState_& state,
+        int variable,
+        const std::vector<int>& internal_to_variable,
+        const EvalCtx& ctx,
+        const std::vector<Packed>& Y_eval_bits,
+        const Packed* BBwrong_eval,
+        const std::vector<int>* matched_group_of_row_eval,
+        const std::vector<double>* matched_group_inv_size_eval,
+        bool matched_effectively_uniform,
+        ExactMatchedScratch_* matched_scratch
+    ) const {
+        ExactLocalImportanceExtrema_ acc;
+
+        if (!node || budget < 0) return acc;
+
+        constexpr int INF = std::numeric_limits<int>::max();
+
+        if (
+            node->min_objective == INF ||
+            node->min_objective > budget
+        ) {
+            return acc;
+        }
+
+        const std::size_t n = static_cast<std::size_t>(ctx.n_eval);
+        std::vector<double> scratch;
+
+        auto ensure_acc = [&]() {
+            if (!acc.lower.empty()) return;
+            acc.lower.assign(n, std::numeric_limits<double>::infinity());
+            acc.upper.assign(n, -std::numeric_limits<double>::infinity());
+        };
+
+        // OR alternative: leaf.
+        for (const auto& leaf : node->leaves) {
+            if (leaf.loss > budget) continue;
+
+            exact_local_importance_for_leaf_variable_into_(
+                original_mask,
+                state,
+                leaf.prediction,
+                ctx,
+                Y_eval_bits,
+                BBwrong_eval,
+                matched_group_of_row_eval,
+                matched_group_inv_size_eval,
+                matched_effectively_uniform,
+                matched_scratch,
+                scratch
+            );
+
+            ensure_acc();
+            fast_update_minmax_(
+                acc.lower.data(),
+                acc.upper.data(),
+                scratch.data(),
+                scratch.data(),
+                n
+            );
+        }
+
+        // OR alternatives: splits.
+        for (const auto& split : node->splits) {
+            const TreeTrieNode* L = split.left.get();
+            const TreeTrieNode* R = split.right.get();
+            if (!L || !R) continue;
+
+            const int minL = L->min_objective;
+            const int minR = R->min_objective;
+            if (minL == INF || minR == INF) continue;
+            if (minL + minR > budget) continue;
+
+            if (
+                split.feature < 0 ||
+                split.feature >=
+                    static_cast<int>(internal_to_variable.size())
+            ) {
+                throw std::runtime_error(
+                    "Exact local interval evaluation saw an invalid split feature."
+                );
+            }
+
+            const int split_variable =
+                internal_to_variable[
+                    static_cast<std::size_t>(split.feature)
+                ];
+
+            if (split_variable < 0) {
+                throw std::runtime_error(
+                    "Split feature is not mapped to an original variable."
+                );
+            }
+
+            const Packed& Xf =
+                ctx.X_bits_eval[
+                    static_cast<std::size_t>(split.feature)
+                ];
+
+            Packed original_left(static_cast<std::size_t>(ctx.n_words));
+            Packed original_right(static_cast<std::size_t>(ctx.n_words));
+
+            and_bits_eval(
+                original_mask,
+                Xf,
+                original_left,
+                ctx.n_words,
+                ctx.tail_mask
+            );
+            andnot_bits_eval(
+                original_mask,
+                Xf,
+                original_right,
+                ctx.n_words,
+                ctx.tail_mask
+            );
+
+            ExactReplacementState_ left_state;
+            ExactReplacementState_ right_state;
+
+            if (!state.replacement_feature_used) {
+                if (split_variable == variable) {
+                    left_state.replacement_feature_used = true;
+                    right_state.replacement_feature_used = true;
+                    left_state.target_rows = original_mask;
+                    right_state.target_rows = original_mask;
+                    left_state.replacement_values =
+                        Packed(static_cast<std::size_t>(ctx.n_words));
+                    right_state.replacement_values =
+                        Packed(static_cast<std::size_t>(ctx.n_words));
+
+                    and_bits_eval(
+                        replacement_root_mask,
+                        Xf,
+                        left_state.replacement_values,
+                        ctx.n_words,
+                        ctx.tail_mask
+                    );
+                    andnot_bits_eval(
+                        replacement_root_mask,
+                        Xf,
+                        right_state.replacement_values,
+                        ctx.n_words,
+                        ctx.tail_mask
+                    );
+                }
+            } else {
+                left_state.replacement_feature_used = true;
+                right_state.replacement_feature_used = true;
+                left_state.target_rows =
+                    Packed(static_cast<std::size_t>(ctx.n_words));
+                right_state.target_rows =
+                    Packed(static_cast<std::size_t>(ctx.n_words));
+                left_state.replacement_values =
+                    Packed(static_cast<std::size_t>(ctx.n_words));
+                right_state.replacement_values =
+                    Packed(static_cast<std::size_t>(ctx.n_words));
+
+                if (split_variable == variable) {
+                    left_state.target_rows.w = state.target_rows.w;
+                    right_state.target_rows.w = state.target_rows.w;
+
+                    and_bits_eval(
+                        state.replacement_values,
+                        Xf,
+                        left_state.replacement_values,
+                        ctx.n_words,
+                        ctx.tail_mask
+                    );
+                    andnot_bits_eval(
+                        state.replacement_values,
+                        Xf,
+                        right_state.replacement_values,
+                        ctx.n_words,
+                        ctx.tail_mask
+                    );
+                } else {
+                    and_bits_eval(
+                        state.target_rows,
+                        Xf,
+                        left_state.target_rows,
+                        ctx.n_words,
+                        ctx.tail_mask
+                    );
+                    andnot_bits_eval(
+                        state.target_rows,
+                        Xf,
+                        right_state.target_rows,
+                        ctx.n_words,
+                        ctx.tail_mask
+                    );
+                    left_state.replacement_values.w =
+                        state.replacement_values.w;
+                    right_state.replacement_values.w =
+                        state.replacement_values.w;
+                }
+            }
+
+            // the major optimization
+            // if this split is not on j, each evaluation row has nonzero local
+            // contribution in at most one child. Therefore the sibling can be
+            // fixed to its minimum-objective subtree, freeing all remaining
+            // budget for the child that matters to that row.
+            if (split_variable != variable) {
+                const int left_budget =
+                    std::min(L->budget, budget - minR);
+                const int right_budget =
+                    std::min(R->budget, budget - minL);
+
+                auto left_ext =
+                    collect_exact_local_importance_extrema_at_most_(
+                        L,
+                        left_budget,
+                        original_left,
+                        replacement_root_mask,
+                        left_state,
+                        variable,
+                        internal_to_variable,
+                        ctx,
+                        Y_eval_bits,
+                        BBwrong_eval,
+                        matched_group_of_row_eval,
+                        matched_group_inv_size_eval,
+                        matched_effectively_uniform,
+                        matched_scratch
+                    );
+
+                auto right_ext =
+                    collect_exact_local_importance_extrema_at_most_(
+                        R,
+                        right_budget,
+                        original_right,
+                        replacement_root_mask,
+                        right_state,
+                        variable,
+                        internal_to_variable,
+                        ctx,
+                        Y_eval_bits,
+                        BBwrong_eval,
+                        matched_group_of_row_eval,
+                        matched_group_inv_size_eval,
+                        matched_effectively_uniform,
+                        matched_scratch
+                    );
+
+                if (left_ext.lower.empty() || right_ext.lower.empty()) continue;
+
+                ensure_acc();
+                fast_update_minmax_sum_(
+                    acc.lower.data(),
+                    acc.upper.data(),
+                    left_ext.lower.data(),
+                    left_ext.upper.data(),
+                    right_ext.lower.data(),
+                    right_ext.upper.data(),
+                    n
+                );
+                continue;
+            }
+
+            // split is on j: the same target row can receive perturbed mass from
+            // both children, so we do need a true budget convolution. 
+            // we convolve only at these j-splits, and over at-most-budget extrema.
+            L->ensure_hist_built();
+            R->ensure_hist_built();
+
+            const int max_left_budget =
+                std::min(L->budget, budget - minR);
+            const int max_right_budget =
+                std::min(R->budget, budget - minL);
+
+            std::size_t left_count = 0;
+            for (const auto& e : L->hist) {
+                if (e.obj > max_left_budget) break;
+                ++left_count;
+            }
+
+            std::size_t right_count = 0;
+            for (const auto& e : R->hist) {
+                if (e.obj > max_right_budget) break;
+                ++right_count;
+            }
+
+            ExactLocalImportanceExtrema_ split_acc;
+            auto ensure_split_acc = [&]() {
+                if (!split_acc.lower.empty()) return;
+                split_acc.lower.assign(
+                    n,
+                    std::numeric_limits<double>::infinity()
+                );
+                split_acc.upper.assign(
+                    n,
+                    -std::numeric_limits<double>::infinity()
+                );
+            };
+
+            if (left_count <= right_count) {
+                for (const auto& e : L->hist) {
+                    if (e.obj > max_left_budget) break;
+
+                    const int left_budget = e.obj;
+                    const int right_budget =
+                        std::min(R->budget, budget - left_budget);
+                    if (right_budget < minR) continue;
+
+                    auto left_ext =
+                        collect_exact_local_importance_extrema_at_most_(
+                            L,
+                            left_budget,
+                            original_left,
+                            replacement_root_mask,
+                            left_state,
+                            variable,
+                            internal_to_variable,
+                            ctx,
+                            Y_eval_bits,
+                            BBwrong_eval,
+                            matched_group_of_row_eval,
+                            matched_group_inv_size_eval,
+                            matched_effectively_uniform,
+                            matched_scratch
+                        );
+
+                    auto right_ext =
+                        collect_exact_local_importance_extrema_at_most_(
+                            R,
+                            right_budget,
+                            original_right,
+                            replacement_root_mask,
+                            right_state,
+                            variable,
+                            internal_to_variable,
+                            ctx,
+                            Y_eval_bits,
+                            BBwrong_eval,
+                            matched_group_of_row_eval,
+                            matched_group_inv_size_eval,
+                            matched_effectively_uniform,
+                            matched_scratch
+                        );
+
+                    
+                    if (
+                        left_ext.lower.empty() ||
+                        right_ext.lower.empty()
+                    ) {
+                        continue;
+                    }
+
+                    ensure_split_acc();
+                    fast_update_minmax_sum_(
+                        split_acc.lower.data(),
+                        split_acc.upper.data(),
+                        left_ext.lower.data(),
+                        left_ext.upper.data(),
+                        right_ext.lower.data(),
+                        right_ext.upper.data(),
+                        n
+                    );
+                }
+            } else {
+
+                for (const auto& e : R->hist) {
+                    if (e.obj > max_right_budget) break;
+
+                    const int right_budget = e.obj;
+                    const int left_budget =
+                        std::min(L->budget, budget - right_budget);
+                    if (left_budget < minL) continue;
+
+                    auto left_ext =
+                        collect_exact_local_importance_extrema_at_most_(
+                            L,
+                            left_budget,
+                            original_left,
+                            replacement_root_mask,
+                            left_state,
+                            variable,
+                            internal_to_variable,
+                            ctx,
+                            Y_eval_bits,
+                            BBwrong_eval,
+                            matched_group_of_row_eval,
+                            matched_group_inv_size_eval,
+                            matched_effectively_uniform,
+                            matched_scratch
+                        );
+
+                    auto right_ext =
+                        collect_exact_local_importance_extrema_at_most_(
+                            R,
+                            right_budget,
+                            original_right,
+                            replacement_root_mask,
+                            right_state,
+                            variable,
+                            internal_to_variable,
+                            ctx,
+                            Y_eval_bits,
+                            BBwrong_eval,
+                            matched_group_of_row_eval,
+                            matched_group_inv_size_eval,
+                            matched_effectively_uniform,
+                            matched_scratch
+                        );
+
+                    if (
+                        left_ext.lower.empty() ||
+                        right_ext.lower.empty()
+                    ) {
+                        continue;
+                    }
+
+                    ensure_split_acc();
+                    fast_update_minmax_sum_(
+                        split_acc.lower.data(),
+                        split_acc.upper.data(),
+                        left_ext.lower.data(),
+                        left_ext.upper.data(),
+                        right_ext.lower.data(),
+                        right_ext.upper.data(),
+                        n
+                    );
+                }
+            }
+
+            if (!split_acc.lower.empty()) {
+                ensure_acc();
+                fast_update_minmax_(
+                    acc.lower.data(),
+                    acc.upper.data(),
+                    split_acc.lower.data(),
+                    split_acc.upper.data(),
+                    n
+                );
+            }
+        }
+
+        return acc;
+    }
+
+
+    ExactAllLocalImportanceExtrema_
+    collect_exact_all_local_importance_extrema_at_most_(
+        const TreeTrieNode* node,
+        int budget,
+        const Packed& original_mask,
+        const Packed& replacement_root_mask,
+        const std::vector<ExactReplacementState_>& states,
+        const std::vector<int>& internal_to_variable,
+        const EvalCtx& ctx,
+        const std::vector<Packed>& Y_eval_bits,
+        const Packed* BBwrong_eval,
+        const std::vector<std::vector<int>>*
+            matched_group_of_row_by_variable_eval,
+        const std::vector<std::vector<double>>*
+            matched_group_inv_size_by_variable_eval,
+        const std::vector<uint8_t>*
+            matched_group_effectively_uniform_by_variable_eval
+    ) const {
+        ExactAllLocalImportanceExtrema_ acc;
+
+        if (!node || budget < 0) return acc;
+
+        constexpr int INF = std::numeric_limits<int>::max();
+        if (
+            node->min_objective == INF ||
+            node->min_objective > budget
+        ) {
+            return acc;
+        }
+
+        const int number_of_variables =
+            static_cast<int>(states.size());
+        const std::size_t n = static_cast<std::size_t>(ctx.n_eval);
+        const std::size_t total =
+            static_cast<std::size_t>(number_of_variables) * n;
+
+        acc.number_of_variables = number_of_variables;
+        acc.n_eval = ctx.n_eval;
+        acc.lower.assign(total, std::numeric_limits<double>::infinity());
+        acc.upper.assign(total, -std::numeric_limits<double>::infinity());
+
+        std::vector<double> scratch;
+        scratch.reserve(n);
+        ExactMatchedScratch_ matched_scratch;
+
+        // leaf alternatives. For variables not yet used on the path, every
+        // feasible leaf has exactly zero local importance, so include zero once.
+        bool has_feasible_leaf = false;
+        for (const auto& leaf : node->leaves) {
+            if (leaf.loss <= budget) {
+                has_feasible_leaf = true;
+                break;
+            }
+        }
+
+        if (has_feasible_leaf) {
+            for (int variable = 0;
+                 variable < number_of_variables;
+                 ++variable) {
+                if (!states[static_cast<std::size_t>(variable)]
+                         .replacement_feature_used) {
+                    fast_include_zero_(
+                        acc.lower_ptr(variable),
+                        acc.upper_ptr(variable),
+                        n
+                    );
+                }
+            }
+        }
+
+        for (const auto& leaf : node->leaves) {
+            if (leaf.loss > budget) continue;
+
+            for (int variable = 0;
+                 variable < number_of_variables;
+                 ++variable) {
+                const auto& state =
+                    states[static_cast<std::size_t>(variable)];
+                if (!state.replacement_feature_used) continue;
+
+                const std::vector<int>* group_of_row_ptr = nullptr;
+                const std::vector<double>* inv_group_size_ptr = nullptr;
+                bool matched_effectively_uniform = false;
+                ExactMatchedScratch_* matched_scratch_ptr = nullptr;
+
+                if (matched_group_of_row_by_variable_eval != nullptr) {
+                    group_of_row_ptr =
+                        &(*matched_group_of_row_by_variable_eval)[
+                            static_cast<std::size_t>(variable)
+                        ];
+                    inv_group_size_ptr =
+                        &(*matched_group_inv_size_by_variable_eval)[
+                            static_cast<std::size_t>(variable)
+                        ];
+                    matched_effectively_uniform =
+                        (*matched_group_effectively_uniform_by_variable_eval)[
+                            static_cast<std::size_t>(variable)
+                        ] != 0;
+                    matched_scratch_ptr = &matched_scratch;
+                }
+
+                exact_local_importance_for_leaf_variable_into_(
+                    original_mask,
+                    state,
+                    leaf.prediction,
+                    ctx,
+                    Y_eval_bits,
+                    BBwrong_eval,
+                    group_of_row_ptr,
+                    inv_group_size_ptr,
+                    matched_effectively_uniform,
+                    matched_scratch_ptr,
+                    scratch
+                );
+
+                fast_update_minmax_(
+                    acc.lower_ptr(variable),
+                    acc.upper_ptr(variable),
+                    scratch.data(),
+                    scratch.data(),
+                    n
+                );
+            }
+        }
+
+        for (const auto& split : node->splits) {
+            const TreeTrieNode* L = split.left.get();
+            const TreeTrieNode* R = split.right.get();
+            if (!L || !R) continue;
+
+            const int minL = L->min_objective;
+            const int minR = R->min_objective;
+            if (minL == INF || minR == INF) continue;
+            if (minL + minR > budget) continue;
+
+            if (
+                split.feature < 0 ||
+                split.feature >=
+                    static_cast<int>(internal_to_variable.size())
+            ) {
+                throw std::runtime_error(
+                    "Exact all-variable local interval evaluation saw an invalid split feature."
+                );
+            }
+
+            const int split_variable =
+                internal_to_variable[
+                    static_cast<std::size_t>(split.feature)
+                ];
+            if (
+                split_variable < 0 ||
+                split_variable >= number_of_variables
+            ) {
+                throw std::runtime_error(
+                    "Split feature is not mapped to an original variable."
+                );
+            }
+
+            const Packed& Xf =
+                ctx.X_bits_eval[
+                    static_cast<std::size_t>(split.feature)
+                ];
+
+            Packed original_left(static_cast<std::size_t>(ctx.n_words));
+            Packed original_right(static_cast<std::size_t>(ctx.n_words));
+            and_bits_eval(
+                original_mask,
+                Xf,
+                original_left,
+                ctx.n_words,
+                ctx.tail_mask
+            );
+            andnot_bits_eval(
+                original_mask,
+                Xf,
+                original_right,
+                ctx.n_words,
+                ctx.tail_mask
+            );
+
+            std::vector<ExactReplacementState_> left_states(
+                static_cast<std::size_t>(number_of_variables)
+            );
+            std::vector<ExactReplacementState_> right_states(
+                static_cast<std::size_t>(number_of_variables)
+            );
+
+            for (int variable = 0;
+                 variable < number_of_variables;
+                 ++variable) {
+                const auto& cur =
+                    states[static_cast<std::size_t>(variable)];
+                auto& ls =
+                    left_states[static_cast<std::size_t>(variable)];
+                auto& rs =
+                    right_states[static_cast<std::size_t>(variable)];
+
+                if (!cur.replacement_feature_used) {
+                    if (variable != split_variable) continue;
+
+                    ls.replacement_feature_used = true;
+                    rs.replacement_feature_used = true;
+                    ls.target_rows = original_mask;
+                    rs.target_rows = original_mask;
+                    ls.replacement_values =
+                        Packed(static_cast<std::size_t>(ctx.n_words));
+                    rs.replacement_values =
+                        Packed(static_cast<std::size_t>(ctx.n_words));
+                    and_bits_eval(
+                        replacement_root_mask,
+                        Xf,
+                        ls.replacement_values,
+                        ctx.n_words,
+                        ctx.tail_mask
+                    );
+                    andnot_bits_eval(
+                        replacement_root_mask,
+                        Xf,
+                        rs.replacement_values,
+                        ctx.n_words,
+                        ctx.tail_mask
+                    );
+                    continue;
+                }
+
+                ls.replacement_feature_used = true;
+                rs.replacement_feature_used = true;
+                ls.target_rows = Packed(static_cast<std::size_t>(ctx.n_words));
+                rs.target_rows = Packed(static_cast<std::size_t>(ctx.n_words));
+                ls.replacement_values = Packed(static_cast<std::size_t>(ctx.n_words));
+                rs.replacement_values = Packed(static_cast<std::size_t>(ctx.n_words));
+
+                if (variable == split_variable) {
+                    ls.target_rows.w = cur.target_rows.w;
+                    rs.target_rows.w = cur.target_rows.w;
+                    and_bits_eval(
+                        cur.replacement_values,
+                        Xf,
+                        ls.replacement_values,
+                        ctx.n_words,
+                        ctx.tail_mask
+                    );
+                    andnot_bits_eval(
+                        cur.replacement_values,
+                        Xf,
+                        rs.replacement_values,
+                        ctx.n_words,
+                        ctx.tail_mask
+                    );
+                } else {
+                    and_bits_eval(
+                        cur.target_rows,
+                        Xf,
+                        ls.target_rows,
+                        ctx.n_words,
+                        ctx.tail_mask
+                    );
+                    andnot_bits_eval(
+                        cur.target_rows,
+                        Xf,
+                        rs.target_rows,
+                        ctx.n_words,
+                        ctx.tail_mask
+                    );
+                    ls.replacement_values.w = cur.replacement_values.w;
+                    rs.replacement_values.w = cur.replacement_values.w;
+                }
+            }
+
+            const int left_budget =
+                std::min(L->budget, budget - minR);
+            const int right_budget =
+                std::min(R->budget, budget - minL);
+
+            // one batched traversal for every variable at the maximum budget each
+            // side can receive when the sibling is fixed to its optimal objective.
+            auto left_all =
+                collect_exact_all_local_importance_extrema_at_most_(
+                    L,
+                    left_budget,
+                    original_left,
+                    replacement_root_mask,
+                    left_states,
+                    internal_to_variable,
+                    ctx,
+                    Y_eval_bits,
+                    BBwrong_eval,
+                    matched_group_of_row_by_variable_eval,
+                    matched_group_inv_size_by_variable_eval,
+                    matched_group_effectively_uniform_by_variable_eval
+                );
+
+            auto right_all =
+                collect_exact_all_local_importance_extrema_at_most_(
+                    R,
+                    right_budget,
+                    original_right,
+                    replacement_root_mask,
+                    right_states,
+                    internal_to_variable,
+                    ctx,
+                    Y_eval_bits,
+                    BBwrong_eval,
+                    matched_group_of_row_by_variable_eval,
+                    matched_group_inv_size_by_variable_eval,
+                    matched_group_effectively_uniform_by_variable_eval
+                );
+
+            if (left_all.empty() || right_all.empty()) continue;
+
+            // every feature except the split variable gets the optimal-sibling shortcut
+            for (int variable = 0;
+                 variable < number_of_variables;
+                 ++variable) {
+                if (variable == split_variable) continue;
+
+                fast_update_minmax_sum_(
+                    acc.lower_ptr(variable),
+                    acc.upper_ptr(variable),
+                    left_all.lower_ptr(variable),
+                    left_all.upper_ptr(variable),
+                    right_all.lower_ptr(variable),
+                    right_all.upper_ptr(variable),
+                    n
+                );
+            }
+
+            // only the split variable needs a true convolution (major optimzation)
+            const auto& split_left_state =
+                left_states[static_cast<std::size_t>(split_variable)];
+            const auto& split_right_state =
+                right_states[static_cast<std::size_t>(split_variable)];
+
+            const std::vector<int>* group_of_row_ptr = nullptr;
+            const std::vector<double>* inv_group_size_ptr = nullptr;
+            bool matched_effectively_uniform = false;
+
+            if (matched_group_of_row_by_variable_eval != nullptr) {
+                group_of_row_ptr =
+                    &(*matched_group_of_row_by_variable_eval)[
+                        static_cast<std::size_t>(split_variable)
+                    ];
+                inv_group_size_ptr =
+                    &(*matched_group_inv_size_by_variable_eval)[
+                        static_cast<std::size_t>(split_variable)
+                    ];
+                matched_effectively_uniform =
+                    (*matched_group_effectively_uniform_by_variable_eval)[
+                        static_cast<std::size_t>(split_variable)
+                    ] != 0;
+            }
+
+            L->ensure_hist_built();
+            R->ensure_hist_built();
+
+            const int max_left_budget = left_budget;
+            const int max_right_budget = right_budget;
+
+            std::size_t left_count = 0;
+            for (const auto& e : L->hist) {
+                if (e.obj > max_left_budget) break;
+                ++left_count;
+            }
+            std::size_t right_count = 0;
+            for (const auto& e : R->hist) {
+                if (e.obj > max_right_budget) break;
+                ++right_count;
+            }
+
+            ExactLocalImportanceExtrema_ split_ext;
+            split_ext.lower.assign(
+                n,
+                std::numeric_limits<double>::infinity()
+            );
+            split_ext.upper.assign(
+                n,
+                -std::numeric_limits<double>::infinity()
+            );
+            bool saw_split_pair = false;
+            ExactMatchedScratch_ split_matched_scratch;
+            ExactMatchedScratch_* split_matched_scratch_ptr =
+                matched_group_of_row_by_variable_eval != nullptr
+                    ? &split_matched_scratch
+                    : nullptr;
+
+            if (left_count <= right_count) {
+                int last_right_budget = -1;
+                ExactLocalImportanceExtrema_ last_right_ext;
+
+                for (const auto& e : L->hist) {
+                    if (e.obj > max_left_budget) break;
+                    const int lb = e.obj;
+                    const int rb = std::min(R->budget, budget - lb);
+                    if (rb < minR) continue;
+
+                    auto lext =
+                        collect_exact_local_importance_extrema_at_most_(
+                            L,
+                            lb,
+                            original_left,
+                            replacement_root_mask,
+                            split_left_state,
+                            split_variable,
+                            internal_to_variable,
+                            ctx,
+                            Y_eval_bits,
+                            BBwrong_eval,
+                            group_of_row_ptr,
+                            inv_group_size_ptr,
+                            matched_effectively_uniform,
+                            split_matched_scratch_ptr
+                        );
+
+                    ExactLocalImportanceExtrema_ rext;
+                    if (rb == last_right_budget) {
+                        rext = last_right_ext;
+                    } else {
+                        rext =
+                            collect_exact_local_importance_extrema_at_most_(
+                                R,
+                                rb,
+                                original_right,
+                                replacement_root_mask,
+                                split_right_state,
+                                split_variable,
+                                internal_to_variable,
+                                ctx,
+                                Y_eval_bits,
+                                BBwrong_eval,
+                                group_of_row_ptr,
+                                inv_group_size_ptr,
+                                matched_effectively_uniform,
+                                split_matched_scratch_ptr
+                            );
+                        last_right_budget = rb;
+                        last_right_ext = rext;
+                    }
+
+                    if (lext.lower.empty() || rext.lower.empty()) continue;
+                    saw_split_pair = true;
+                    fast_update_minmax_sum_(
+                        split_ext.lower.data(),
+                        split_ext.upper.data(),
+                        lext.lower.data(),
+                        lext.upper.data(),
+                        rext.lower.data(),
+                        rext.upper.data(),
+                        n
+                    );
+                }
+            } else {
+                int last_left_budget = -1;
+                ExactLocalImportanceExtrema_ last_left_ext;
+
+                for (const auto& e : R->hist) {
+                    if (e.obj > max_right_budget) break;
+                    const int rb = e.obj;
+                    const int lb = std::min(L->budget, budget - rb);
+                    if (lb < minL) continue;
+
+                    ExactLocalImportanceExtrema_ lext;
+                    if (lb == last_left_budget) {
+                        lext = last_left_ext;
+                    } else {
+                        lext =
+                            collect_exact_local_importance_extrema_at_most_(
+                                L,
+                                lb,
+                                original_left,
+                                replacement_root_mask,
+                                split_left_state,
+                                split_variable,
+                                internal_to_variable,
+                                ctx,
+                                Y_eval_bits,
+                                BBwrong_eval,
+                                group_of_row_ptr,
+                                inv_group_size_ptr,
+                                matched_effectively_uniform,
+                                split_matched_scratch_ptr
+                            );
+                        last_left_budget = lb;
+                        last_left_ext = lext;
+                    }
+
+                    auto rext =
+                        collect_exact_local_importance_extrema_at_most_(
+                            R,
+                            rb,
+                            original_right,
+                            replacement_root_mask,
+                            split_right_state,
+                            split_variable,
+                            internal_to_variable,
+                            ctx,
+                            Y_eval_bits,
+                            BBwrong_eval,
+                            group_of_row_ptr,
+                            inv_group_size_ptr,
+                            matched_effectively_uniform,
+                            split_matched_scratch_ptr
+                        );
+
+                    if (lext.lower.empty() || rext.lower.empty()) continue;
+                    saw_split_pair = true;
+                    fast_update_minmax_sum_(
+                        split_ext.lower.data(),
+                        split_ext.upper.data(),
+                        lext.lower.data(),
+                        lext.upper.data(),
+                        rext.lower.data(),
+                        rext.upper.data(),
+                        n
+                    );
+                }
+            }
+
+            if (saw_split_pair) {
+                fast_update_minmax_(
+                    acc.lower_ptr(split_variable),
+                    acc.upper_ptr(split_variable),
+                    split_ext.lower.data(),
+                    split_ext.upper.data(),
+                    n
+                );
+            }
+        }
+
+        return acc;
+    }
+
+
+    struct ExactReplacementIntervalEvalSetup_ {
+        EvalCtx ctx;
+        int budget = 0;
+        std::vector<std::vector<int>> variable_columns;
+        std::vector<int> internal_to_variable;
+        bool use_matched_groups = false;
+        std::vector<std::vector<double>> matched_group_inv_sizes;
+        std::vector<uint8_t> matched_group_effectively_uniform;
+        Packed root_mask;
+        std::vector<Packed> y_bits;
+        Packed bb_wrong;
+        bool has_bb_wrong = false;
+    };
+
+    ExactReplacementIntervalEvalSetup_
+    prepare_exact_replacement_interval_eval_(
+        const std::vector<std::vector<uint8_t>>& X_row_major,
+        const std::vector<int>& y_eval,
+        int budget_override,
+        const std::vector<std::vector<int>>& variable_columns_in,
+        const std::vector<int>& bb_pred_eval,
+        const std::vector<std::vector<int>>&
+            matched_group_of_row_by_variable_eval,
+        const std::vector<std::vector<int>>&
+            matched_group_size_by_variable_eval
+    ) const {
+        if (!result) {
+            throw std::runtime_error(
+                "No Rashomon trie has been constructed. Call fit() first."
+            );
+        }
+
+        ExactReplacementIntervalEvalSetup_ out;
+
+        out.ctx =
+            build_eval_ctx_(
+                X_row_major,
+                this->n_features
+            );
+
+        if (static_cast<int>(y_eval.size()) != out.ctx.n_eval) {
+            throw std::runtime_error(
+                "Eval y has different number of rows than Eval X."
+            );
+        }
+
+        out.budget =
+            (budget_override >= 0)
+                ? budget_override
+                : result->budget;
+
+        if (!variable_columns_in.empty()) {
+            out.variable_columns = variable_columns_in;
+        } else {
+            const int first_cont = first_continuous_feature_();
+
+            for (int f = 0; f < first_cont; ++f) {
+                out.variable_columns.push_back({f});
+            }
+
+            for (int g = 0;
+                 g < static_cast<int>(continuous_starts.size());
+                 ++g) {
+
+                const int start =
+                    continuous_starts[static_cast<std::size_t>(g)];
+                const int end = continuous_group_end_(g);
+
+                std::vector<int> cols;
+                cols.reserve(static_cast<std::size_t>(end - start));
+
+                for (int f = start; f < end; ++f) {
+                    cols.push_back(f);
+                }
+
+                out.variable_columns.push_back(std::move(cols));
+            }
+        }
+
+        const int number_of_variables =
+            static_cast<int>(out.variable_columns.size());
+
+        const bool has_group_of_row =
+            !matched_group_of_row_by_variable_eval.empty();
+        const bool has_group_sizes =
+            !matched_group_size_by_variable_eval.empty();
+
+        if (has_group_of_row != has_group_sizes) {
+            throw std::runtime_error(
+                "Matched-group evaluation requires both group-of-row and "
+                "group-size arrays."
+            );
+        }
+
+        out.use_matched_groups = has_group_of_row;
+
+        if (out.use_matched_groups) {
+            if (
+                static_cast<int>(
+                    matched_group_of_row_by_variable_eval.size()
+                ) != number_of_variables ||
+                static_cast<int>(
+                    matched_group_size_by_variable_eval.size()
+                ) != number_of_variables
+            ) {
+                throw std::runtime_error(
+                    "Matched-group arrays must contain exactly one entry "
+                    "per original variable."
+                );
+            }
+
+            out.matched_group_inv_sizes.resize(
+                static_cast<std::size_t>(number_of_variables)
+            );
+            out.matched_group_effectively_uniform.assign(
+                static_cast<std::size_t>(number_of_variables),
+                0
+            );
+
+            for (int variable = 0;
+                 variable < number_of_variables;
+                 ++variable) {
+
+                const auto& group_of_row =
+                    matched_group_of_row_by_variable_eval[
+                        static_cast<std::size_t>(variable)
+                    ];
+                const auto& group_sizes =
+                    matched_group_size_by_variable_eval[
+                        static_cast<std::size_t>(variable)
+                    ];
+
+                if (static_cast<int>(group_of_row.size()) != out.ctx.n_eval) {
+                    throw std::runtime_error(
+                        "Matched-group row map has the wrong number of "
+                        "evaluation rows."
+                    );
+                }
+
+                if (group_sizes.empty()) {
+                    throw std::runtime_error(
+                        "Matched-group size array is empty."
+                    );
+                }
+
+                std::vector<int> observed_group_sizes(
+                    group_sizes.size(),
+                    0
+                );
+
+                for (int row = 0; row < out.ctx.n_eval; ++row) {
+                    const int group =
+                        group_of_row[static_cast<std::size_t>(row)];
+
+                    if (
+                        group < 0 ||
+                        group >= static_cast<int>(group_sizes.size())
+                    ) {
+                        throw std::runtime_error(
+                            "Matched-group row map contains an out-of-range "
+                            "group ID."
+                        );
+                    }
+
+                    ++observed_group_sizes[
+                        static_cast<std::size_t>(group)
+                    ];
+                }
+
+                auto& inv =
+                    out.matched_group_inv_sizes[
+                        static_cast<std::size_t>(variable)
+                    ];
+                inv.assign(group_sizes.size(), 0.0);
+
+                int number_of_nonempty_groups = 0;
+
+                for (std::size_t group = 0;
+                     group < group_sizes.size();
+                     ++group) {
+
+                    if (group_sizes[group] < 0) {
+                        throw std::runtime_error(
+                            "Matched-group size cannot be negative."
+                        );
+                    }
+
+                    if (observed_group_sizes[group] != group_sizes[group]) {
+                        throw std::runtime_error(
+                            "Matched-group size array does not agree with the "
+                            "row-to-group map."
+                        );
+                    }
+
+                    if (group_sizes[group] > 0) {
+                        inv[group] =
+                            1.0 /
+                            static_cast<double>(group_sizes[group]);
+                        ++number_of_nonempty_groups;
+                    }
+                }
+
+                if (number_of_nonempty_groups <= 0) {
+                    throw std::runtime_error(
+                        "Matched-group partition has no rows."
+                    );
+                }
+
+                out.matched_group_effectively_uniform[
+                    static_cast<std::size_t>(variable)
+                ] =
+                    number_of_nonempty_groups == 1 ? 1 : 0;
+            }
+        }
+
+        out.internal_to_variable.assign(
+            static_cast<std::size_t>(this->n_features),
+            -1
+        );
+
+        for (int variable = 0;
+             variable < number_of_variables;
+             ++variable) {
+
+            const auto& cols =
+                out.variable_columns[static_cast<std::size_t>(variable)];
+
+            if (cols.empty()) {
+                throw std::runtime_error(
+                    "variable_columns contains an empty variable."
+                );
+            }
+
+            for (int f : cols) {
+                if (f < 0 || f >= this->n_features) {
+                    throw std::runtime_error(
+                        "variable_columns contains an out-of-range internal "
+                        "column."
+                    );
+                }
+
+                if (
+                    out.internal_to_variable[
+                        static_cast<std::size_t>(f)
+                    ] != -1
+                ) {
+                    throw std::runtime_error(
+                        "An internal column appears in more than one variable."
+                    );
+                }
+
+                out.internal_to_variable[
+                    static_cast<std::size_t>(f)
+                ] = variable;
+            }
+        }
+
+        for (int f = 0; f < this->n_features; ++f) {
+            if (
+                out.internal_to_variable[
+                    static_cast<std::size_t>(f)
+                ] < 0
+            ) {
+                throw std::runtime_error(
+                    "Every internal feature column must belong to exactly "
+                    "one variable."
+                );
+            }
+        }
+
+        out.root_mask =
+            eval_root_mask_(
+                out.ctx.n_words,
+                out.ctx.tail_mask
+            );
+
+        out.y_bits =
+            build_eval_y_bits_(
+                y_eval,
+                num_classes,
+                out.ctx.n_words,
+                out.ctx.tail_mask
+            );
+
+        if (use_deferral) {
+            if (bb_pred_eval.empty()) {
+                throw std::runtime_error(
+                    "Deferral was enabled during fit, so bb_pred_eval is required."
+                );
+            }
+
+            out.bb_wrong =
+                build_eval_bb_wrong_bits_(
+                    y_eval,
+                    bb_pred_eval,
+                    num_classes,
+                    out.ctx.n_words,
+                    out.ctx.tail_mask
+                );
+            out.has_bb_wrong = true;
+        }
+
+        return out;
     }
 
 public:
@@ -16815,6 +20559,274 @@ public:
         return out;
     }
 
+
+    // if sum_samplewise_extrema=false, returns
+    //   [ min_f Phi_j(f), max_f Phi_j(f) ]
+    // if sum_samplewise_extrema=true, returns a wider range
+    //   [ (1/n) sum_i min_f phi_{ij}(f),
+    //     (1/n) sum_i max_f phi_{ij}(f) ]
+    std::vector<ExactImportanceInterval>
+    get_exact_replacement_importance_intervals_packed_trie(
+        const std::vector<std::vector<uint8_t>>& X_row_major,
+        const std::vector<int>& y_eval,
+        int budget_override = -1,
+        const std::vector<std::vector<int>>& variable_columns_in = {},
+        const std::vector<int>& bb_pred_eval = {},
+        const std::vector<std::vector<int>>&
+            matched_group_of_row_by_variable_eval = {},
+        const std::vector<std::vector<int>>&
+            matched_group_size_by_variable_eval = {},
+        bool sum_samplewise_extrema = false
+    ) const {
+        auto setup =
+            prepare_exact_replacement_interval_eval_(
+                X_row_major,
+                y_eval,
+                budget_override,
+                variable_columns_in,
+                bb_pred_eval,
+                matched_group_of_row_by_variable_eval,
+                matched_group_size_by_variable_eval
+            );
+
+        if (setup.ctx.n_eval <= 0) {
+            return {};
+        }
+
+        const int number_of_variables =
+            static_cast<int>(setup.variable_columns.size());
+
+        std::vector<ExactImportanceInterval> out(
+            static_cast<std::size_t>(number_of_variables),
+            {0.0, 0.0}
+        );
+
+        const Packed* BBwrong_eval_ptr =
+            setup.has_bb_wrong
+                ? &setup.bb_wrong
+                : nullptr;
+
+        const std::vector<std::vector<int>>*
+            matched_group_of_row_by_variable_eval_ptr =
+                setup.use_matched_groups
+                    ? &matched_group_of_row_by_variable_eval
+                    : nullptr;
+
+        const std::vector<std::vector<double>>*
+            matched_group_inv_size_by_variable_eval_ptr =
+                setup.use_matched_groups
+                    ? &setup.matched_group_inv_sizes
+                    : nullptr;
+
+        const std::vector<uint8_t>*
+            matched_group_effectively_uniform_by_variable_eval_ptr =
+                setup.use_matched_groups
+                    ? &setup.matched_group_effectively_uniform
+                    : nullptr;
+
+        if (!sum_samplewise_extrema) {
+            std::vector<ExactReplacementState_> root_states(
+                static_cast<std::size_t>(number_of_variables)
+            );
+
+            ExactMatchedScratch_ matched_scratch;
+            ExactMatchedScratch_* matched_scratch_ptr =
+                setup.use_matched_groups
+                    ? &matched_scratch
+                    : nullptr;
+
+            auto buckets =
+                collect_exact_global_importance_extrema_by_obj_(
+                    result.get(),
+                    setup.budget,
+                    setup.root_mask,
+                    setup.root_mask,
+                    root_states,
+                    setup.internal_to_variable,
+                    setup.ctx,
+                    setup.y_bits,
+                    BBwrong_eval_ptr,
+                    matched_group_of_row_by_variable_eval_ptr,
+                    matched_group_inv_size_by_variable_eval_ptr,
+                    matched_group_effectively_uniform_by_variable_eval_ptr,
+                    matched_scratch_ptr
+                );
+
+            if (buckets.empty()) {
+                return {};
+            }
+
+            std::vector<double> lower(
+                static_cast<std::size_t>(number_of_variables),
+                std::numeric_limits<double>::infinity()
+            );
+            std::vector<double> upper(
+                static_cast<std::size_t>(number_of_variables),
+                -std::numeric_limits<double>::infinity()
+            );
+
+            for (const auto& bucket : buckets) {
+                for (int variable = 0;
+                     variable < number_of_variables;
+                     ++variable) {
+
+                    const std::size_t j =
+                        static_cast<std::size_t>(variable);
+
+                    lower[j] =
+                        std::min(lower[j], bucket.extrema.lower[j]);
+                    upper[j] =
+                        std::max(upper[j], bucket.extrema.upper[j]);
+                }
+            }
+
+            const double inv_n =
+                1.0 / static_cast<double>(setup.ctx.n_eval);
+
+            for (int variable = 0;
+                 variable < number_of_variables;
+                 ++variable) {
+
+                const std::size_t j =
+                    static_cast<std::size_t>(variable);
+
+                out[j] = {
+                    lower[j] * inv_n,
+                    upper[j] * inv_n
+                };
+            }
+
+            return out;
+        }
+        
+        // one variable at a time to avoid dense matrix
+        const double inv_n =
+            1.0 / static_cast<double>(setup.ctx.n_eval);
+
+        ExactNodeVariableMasks_ node_variable_masks;
+        build_exact_node_variable_masks_(
+            result.get(),
+            setup.internal_to_variable,
+            number_of_variables,
+            node_variable_masks
+        );
+
+        for (int variable = 0;
+             variable < number_of_variables;
+             ++variable) {
+
+            ExactReplacementState_ root_state;
+            ExactMatchedScratch_ matched_scratch;
+
+            const std::vector<int>* group_of_row_ptr =
+                setup.use_matched_groups
+                    ? &matched_group_of_row_by_variable_eval[
+                        static_cast<std::size_t>(variable)
+                    ]
+                    : nullptr;
+
+            const std::vector<int>* group_size_ptr =
+                setup.use_matched_groups
+                    ? &matched_group_size_by_variable_eval[
+                        static_cast<std::size_t>(variable)
+                    ]
+                    : nullptr;
+
+            const bool matched_effectively_uniform =
+                setup.use_matched_groups &&
+                setup.matched_group_effectively_uniform[
+                    static_cast<std::size_t>(variable)
+                ] != 0;
+
+            auto extrema =
+                collect_exact_local_importance_numerator_extrema_at_most_(
+                    result.get(),
+                    setup.budget,
+                    setup.root_mask,
+                    setup.root_mask,
+                    root_state,
+                    variable,
+                    setup.internal_to_variable,
+                    setup.ctx,
+                    setup.y_bits,
+                    BBwrong_eval_ptr,
+                    group_of_row_ptr,
+                    group_size_ptr,
+                    matched_effectively_uniform,
+                    setup.use_matched_groups
+                        ? &matched_scratch
+                        : nullptr,
+                    node_variable_masks
+                );
+
+            if (extrema.empty()) {
+                return {};
+            }
+
+            if (extrema.all_zero) {
+                out[static_cast<std::size_t>(variable)] = {0.0, 0.0};
+                continue;
+            }
+
+            if (!setup.use_matched_groups || matched_effectively_uniform) {
+                const int64_t lower_sum =
+                    fast_sum_i32_(
+                        extrema.lower.data(),
+                        static_cast<std::size_t>(setup.ctx.n_eval)
+                    );
+
+                const int64_t upper_sum =
+                    fast_sum_i32_(
+                        extrema.upper.data(),
+                        static_cast<std::size_t>(setup.ctx.n_eval)
+                    );
+
+                const double scale =
+                    inv_n / static_cast<double>(setup.ctx.n_eval);
+
+                out[static_cast<std::size_t>(variable)] = {
+                    static_cast<double>(lower_sum) * scale,
+                    static_cast<double>(upper_sum) * scale
+                };
+                continue;
+            }
+
+            double lower_sum = 0.0;
+            double upper_sum = 0.0;
+
+            for (int row = 0; row < setup.ctx.n_eval; ++row) {
+                const int group =
+                    (*group_of_row_ptr)[
+                        static_cast<std::size_t>(row)
+                    ];
+                const int group_size =
+                    (*group_size_ptr)[
+                        static_cast<std::size_t>(group)
+                    ];
+
+                lower_sum +=
+                    static_cast<double>(
+                        extrema.lower[static_cast<std::size_t>(row)]
+                    ) /
+                    static_cast<double>(group_size);
+
+                upper_sum +=
+                    static_cast<double>(
+                        extrema.upper[static_cast<std::size_t>(row)]
+                    ) /
+                    static_cast<double>(group_size);
+            }
+
+            out[static_cast<std::size_t>(variable)] = {
+                lower_sum * inv_n,
+                upper_sum * inv_n
+            };
+        }
+
+        return out;
+    }
+
+
     std::vector<ExactReplacementMistakesWithObj>
     get_all_exact_replacement_misclassifications_packed_trie(
         const std::vector<std::vector<uint8_t>>& X_row_major,
@@ -16835,7 +20847,7 @@ public:
 
         // matched_group_size_by_variable_eval[j][g]
         // gives the number of evaluation rows in group g
-        // for replacement variable j. Zero-sized groups are allowed because
+        // for replacement variable j. zero-sized groups are allowed because
         // an original group may be absent from a bootstrap.
         const std::vector<std::vector<int>>&
             matched_group_size_by_variable_eval = {}
@@ -16867,8 +20879,6 @@ public:
                 ? budget_override
                 : result->budget;
 
-        // resolve original-variable -> internal-column grouping.
-        // no graph scan is done.
         std::vector<std::vector<int>> variable_columns;
 
         if (!variable_columns_in.empty()) {
@@ -16877,12 +20887,10 @@ public:
             const int first_cont =
                 first_continuous_feature_();
 
-            // ordinary binary variables.
             for (int f = 0; f < first_cont; ++f) {
                 variable_columns.push_back({f});
             }
 
-            // each continuous threshold block is one variable.
             for (int g = 0;
                  g < (int)continuous_starts.size();
                  ++g) {
