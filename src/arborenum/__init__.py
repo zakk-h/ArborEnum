@@ -776,6 +776,7 @@ class ArborEnum:
         self.multiplicative_slack_ = float(multiplicative_slack)
         self.lookahead_k_ = int(lookahead_k)
         self.eta_defer_ = float(eta_defer)
+        self._model.set_additive(bool(additive))
 
         if X_initial is None:
             if early_stopping and X_num.shape[1] > 0:
@@ -856,7 +857,7 @@ class ArborEnum:
                 memory_limit_mb=memory_limit_mb,
                 use_deferral=use_deferral,
                 eta_defer=eta_defer,
-                
+                additive=additive,         
             )
 
         return self.fit_prepared(
@@ -1361,6 +1362,8 @@ class ArborEnum:
 
         key_mode_parsed = parse_key_mode(key_mode)
 
+        self._model.set_additive(bool(additive))
+
         self._model.fit_then_extend(
             X,
             y,
@@ -1392,7 +1395,6 @@ class ArborEnum:
             bool(use_deferral),
             float(eta_defer),
             bb_pred_vec,
-            bool(additive)
         )
 
         return self
@@ -1432,6 +1434,7 @@ class ArborEnum:
         use_deferral=False,
         eta_defer=0.0,
         bb_pred=None,
+        additive=False,
     ):
         X = np.asarray(X, dtype=np.uint8)
         y = np.asarray(y, dtype=int)
@@ -1551,6 +1554,8 @@ class ArborEnum:
             greedy_continuous_mode
         )
         key_mode_parsed = parse_key_mode(key_mode)
+
+        self._model.set_additive(bool(additive))
 
         self._model.fit_anytime(
             X,
@@ -1944,6 +1949,8 @@ class ArborEnum:
 
         key_mode_parsed = parse_key_mode(key_mode)
 
+        self._model.set_additive(bool(additive))
+
         self._model.fit_prepared_then_extend(
             float(lambda_reg),
             int(depth_budget),
@@ -1970,7 +1977,6 @@ class ArborEnum:
             float(memory_limit_mb),
             bool(use_deferral),
             float(eta_defer),
-            bool(additive)
         )
 
         return self
@@ -2006,6 +2012,7 @@ class ArborEnum:
         memory_limit_mb=-1.0,
         use_deferral=False,
         eta_defer=0.0,
+        additive=False,
     ):
         rashomon_mult = float(rashomon_mult)
 
@@ -2062,6 +2069,8 @@ class ArborEnum:
             )
 
         key_mode_parsed = parse_key_mode(key_mode)
+
+        self._model.set_additive(bool(additive))
 
         self._model.fit_prepared_anytime(
             float(lambda_reg),
