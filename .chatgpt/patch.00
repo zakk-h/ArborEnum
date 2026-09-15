@@ -1,0 +1,137 @@
+diff --git a/src/arborenum/cpp/arborenum.cpp b/src/arborenum/cpp/arborenum.cpp
+index c4ef10e..777c762 100644
+--- a/src/arborenum/cpp/arborenum.cpp
++++ b/src/arborenum/cpp/arborenum.cpp
+@@ -17016,6 +17016,429 @@ private:
+         return local;
+     }
+ 
++    struct ExactDivisivePoint_ {
++        int obj = 0;
++        int original_mistakes = 0;
++        double replacement_mistakes = 0.0;
++    };
++
++    struct ExactDivisiveFrontiers_ {
++        std::vector<ExactDivisivePoint_> lower;
++        std::vector<ExactDivisivePoint_> upper;
++        int min_zero_obj = std::numeric_limits<int>::max();
++    };
++
++    static std::vector<ExactDivisivePoint_>
++    prune_exact_divisive_points_(
++        std::vector<ExactDivisivePoint_> points,
++        bool minimize,
++        int n_eval
++    ) {
++        if (points.empty()) return points;
++
++        if (minimize) {
++            std::sort(
++                points.begin(),
++                points.end(),
++                [](const ExactDivisivePoint_& a,
++                   const ExactDivisivePoint_& b) {
++                    if (a.obj != b.obj) return a.obj < b.obj;
++                    if (a.original_mistakes != b.original_mistakes) {
++                        return a.original_mistakes > b.original_mistakes;
++                    }
++                    return a.replacement_mistakes < b.replacement_mistakes;
++                }
++            );
++        } else {
++            std::sort(
++                points.begin(),
++                points.end(),
++                [](const ExactDivisivePoint_& a,
++                   const ExactDivisivePoint_& b) {
++                    if (a.obj != b.obj) return a.obj < b.obj;
++                    if (a.original_mistakes != b.original_mistakes) {
++                        return a.original_mistakes < b.original_mistakes;
++                    }
++                    return a.replacement_mistakes > b.replacement_mistakes;
++                }
++            );
++        }
++
++        const int m = n_eval + 2;
++        const double inf = std::numeric_limits<double>::infinity();
++        std::vector<double> bit(
++            static_cast<std::size_t>(m + 1),
++            minimize ? inf : -inf
++        );
++
++        auto query = [&](int idx) {
++            double best = minimize ? inf : -inf;
++            for (int i = idx; i > 0; i -= i & -i) {
++                if (minimize) {
++                    best = std::min(best, bit[static_cast<std::size_t>(i)]);
++                } else {
++                    best = std::max(best, bit[static_cast<std::size_t>(i)]);
++                }
++            }
++            return best;
++        };
++
++        auto update = [&](int idx, double value) {
++            for (int i = idx; i <= m; i += i & -i) {
++                if (minimize) {
++                    bit[static_cast<std::size_t>(i)] =
++                        std::min(bit[static_cast<std::size_t>(i)], value);
++                } else {
++                    bit[static_cast<std::size_t>(i)] =
++                        std::max(bit[static_cast<std::size_t>(i)], value);
++                }
++            }
++        };
++
++        std::vector<ExactDivisivePoint_> out;
++        out.reserve(points.size());
++
++        for (const auto& point : points) {
++            if (
++                point.original_mistakes < 0 ||
++                point.original_mistakes > n_eval
++            ) {
++                throw std::runtime_error(
++                    "Divisive frontier saw an invalid original loss."
++                );
++            }
++
++            const int idx = minimize
++                ? n_eval - point.original_mistakes + 1
++                : point.original_mistakes + 1;
++
++            const double best = query(idx);
++            const bool dominated = minimize
++                ? best <= point.replacement_mistakes
++                : best >= point.replacement_mistakes;
++
++            if (dominated) continue;
++
++            out.push_back(point);
++            update(idx, point.replacement_mistakes);
++        }
++
++        return out;
++    }
++
++    ExactDivisiveFrontiers_
++    collect_exact_divisive_frontiers_(
++        const TreeTrieNode* node,
++        int budget,
++        const Packed& original_mask,
++        const Packed& replacement_root_mask,
++        const ExactReplacementState_& state,
++        int variable,
++        const std::vector<int>& internal_to_variable,
++        const EvalCtx& ctx,
++        const std::vector<Packed>& Y_eval_bits,
++        const Packed* BBwrong_eval,
++        const std::vector<std::vector<int>>*
++            matched_group_of_row_by_variable_eval,
++        const std::vector<std::vector<double>>*
++            matched_group_inv_size_by_variable_eval,
++        const std::vector<uint8_t>*
++            matched_group_effectively_uniform_by_variable_eval,
++        ExactMatched
