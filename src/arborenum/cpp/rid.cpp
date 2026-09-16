@@ -343,7 +343,8 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
     // 2 = interval only: sum of per-sample min/max local importances
     int importance_interval_mode = 0,
     int subsample = -1,
-    int root_budget = -1
+    int root_budget = -1,
+    bool divisive_model_reliance = false
 ) {
     (void)memory_efficient;
 
@@ -410,6 +411,13 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
         throw std::runtime_error(
             "compute_rid_subtractive_mr_bootstrap: "
             "return_joint_samples is incompatible with interval-only mode."
+        );
+    }
+
+    if (divisive_model_reliance && importance_interval_mode != 1) {
+        throw std::runtime_error(
+            "compute_rid_subtractive_mr_bootstrap: "
+            "divisive model reliance requires importance_interval_mode=1."
         );
     }
 
@@ -1008,7 +1016,18 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
 
                 std::vector<ArborEnum::ExactImportanceInterval> intervals;
 
-                if (
+                if (divisive_model_reliance) {
+                    intervals =
+                        model.get_exact_replacement_divisive_importance_intervals_cached_frontier_packed_trie(
+                            X_bootstrap,
+                            y_bootstrap,
+                            budget_override,
+                            variable_columns,
+                            {},
+                            matched_group_of_bootstrap_row_by_variable,
+                            matched_group_size_bootstrap_by_variable
+                        );
+                } else if (
                     use_new_cached_frontier_method &&
                     importance_interval_mode == 1
                 ) {

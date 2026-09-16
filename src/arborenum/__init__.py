@@ -48,6 +48,20 @@ def _normalize_key(s: str) -> str:
         s = s.replace("__", "_")
     return s
 
+
+def _parse_model_reliance(model_reliance):
+    key = _normalize_key(model_reliance)
+
+    if key in {"subtractive", "difference", "diff"}:
+        return False
+
+    if key in {"divisive", "ratio"}:
+        return True
+
+    raise ValueError(
+        "model_reliance must be 'subtractive' or 'divisive'."
+    )
+
 _PROXY_STYLE_MAP = {
     # explicit canonical names
     "recursively_choose_best_split": 0,
@@ -2386,6 +2400,97 @@ class ArborEnum:
 
         return intervals
 
+    def get_exact_replacement_divisive_importance_intervals(
+        self,
+        X_eval,
+        y_eval,
+        budget_override=None,
+    ):
+        if self.n_features_in_ is None:
+            raise RuntimeError("Fit the model first.")
+
+        X_internal = np.ascontiguousarray(
+            self.transform(X_eval),
+            dtype=np.uint8,
+        )
+
+        y_eval = np.ascontiguousarray(
+            np.asarray(y_eval, dtype=np.int32)
+        )
+
+        if y_eval.ndim != 1:
+            raise ValueError("y_eval must be 1D.")
+
+        if y_eval.shape[0] != X_internal.shape[0]:
+            raise ValueError(
+                "y_eval must have the same number of rows as X_eval."
+            )
+
+        variable_columns = [
+            [] for _ in range(self.n_features_in_)
+        ]
+
+        for internal_feature, spec in enumerate(
+            self.binary_feature_specs_
+        ):
+            original_feature = int(spec["original_feature"])
+            variable_columns[original_feature].append(
+                int(internal_feature)
+            )
+
+        starts = self.get_continuous_starts()
+
+        for group, original_feature in enumerate(
+            self.continuous_feature_indices_
+        ):
+            original_feature = int(original_feature)
+            start = int(starts[group])
+            end = int(self.get_continuous_group_end(group))
+            variable_columns[original_feature].extend(
+                range(start, end)
+            )
+
+        active_features = [
+            j
+            for j, cols in enumerate(variable_columns)
+            if cols
+        ]
+
+        active_variable_columns = [
+            variable_columns[j]
+            for j in active_features
+        ]
+
+        budget = (
+            -1
+            if budget_override is None
+            else int(budget_override)
+        )
+
+        active_intervals = np.asarray(
+            self._model
+                .get_exact_replacement_divisive_importance_intervals_cached_frontier_packed_trie(
+                    X_internal,
+                    y_eval,
+                    budget,
+                    active_variable_columns,
+                    np.empty(0, dtype=np.int32),
+                    [],
+                    [],
+                ),
+            dtype=float,
+        )
+
+        intervals = np.ones(
+            (self.n_features_in_, 2),
+            dtype=float,
+        )
+
+        if active_features:
+            intervals[active_features] = active_intervals
+
+        return intervals
+
 
     # WARNING: 1-indexed unlike features
     def get_tree_paths(self, tree_index: int):
@@ -3448,6 +3553,7 @@ class ArborEnum:
         matched_groups_by_variable=None,
         importance_interval_mode=0,
         subsample=-1,
+        model_reliance="subtractive",
     ):
 
         if hasattr(X, "columns"):
@@ -3505,6 +3611,9 @@ class ArborEnum:
 
         importance_interval_mode = int(importance_interval_mode)
         subsample = int(subsample)
+        divisive_model_reliance = _parse_model_reliance(
+            model_reliance
+        )
 
         if importance_interval_mode not in (0, 1, 2):
             raise ValueError(
@@ -3520,6 +3629,12 @@ class ArborEnum:
             raise ValueError(
                 "return_joint_samples is incompatible with "
                 "importance_interval_mode != 0."
+            )
+
+        if divisive_model_reliance and importance_interval_mode != 1:
+            raise ValueError(
+                "model_reliance='divisive' requires "
+                "importance_interval_mode=1."
             )
 
         if subsample != -1 and (
@@ -3727,6 +3842,7 @@ class ArborEnum:
             int(importance_interval_mode),
             int(subsample),
             int(root_budget_int),
+            bool(divisive_model_reliance),
         )
 
         if (
@@ -3775,6 +3891,7 @@ class ArborEnum:
         additive=False,
         importance_interval_mode=0,
         subsample=-1,
+        model_reliance="subtractive",
     ):
         X = np.asarray(X, dtype=np.uint8)
         y = np.asarray(y, dtype=int)
@@ -3803,6 +3920,9 @@ class ArborEnum:
 
         importance_interval_mode = int(importance_interval_mode)
         subsample = int(subsample)
+        divisive_model_reliance = _parse_model_reliance(
+            model_reliance
+        )
 
         if importance_interval_mode not in (0, 1, 2):
             raise ValueError(
@@ -3818,6 +3938,12 @@ class ArborEnum:
             raise ValueError(
                 "return_joint_samples is incompatible with "
                 "importance_interval_mode != 0."
+            )
+
+        if divisive_model_reliance and importance_interval_mode != 1:
+            raise ValueError(
+                "model_reliance='divisive' requires "
+                "importance_interval_mode=1."
             )
 
         if subsample != -1 and (
@@ -3889,6 +4015,7 @@ class ArborEnum:
             int(importance_interval_mode),
             int(subsample),
             int(root_budget_int),
+            bool(divisive_model_reliance),
         )
 
         if (
@@ -3959,6 +4086,7 @@ class ArborEnum:
         additive=False,
         importance_interval_mode=0,
         subsample=-1,
+        model_reliance="subtractive",
     ):
         X_num = np.asarray(X_num, dtype=np.float64)
         y = np.asarray(y, dtype=int)
@@ -3989,6 +4117,9 @@ class ArborEnum:
 
         importance_interval_mode = int(importance_interval_mode)
         subsample = int(subsample)
+        divisive_model_reliance = _parse_model_reliance(
+            model_reliance
+        )
 
         if importance_interval_mode not in (0, 1, 2):
             raise ValueError(
@@ -4004,6 +4135,12 @@ class ArborEnum:
             raise ValueError(
                 "return_joint_samples is incompatible with "
                 "importance_interval_mode != 0."
+            )
+
+        if divisive_model_reliance and importance_interval_mode != 1:
+            raise ValueError(
+                "model_reliance='divisive' requires "
+                "importance_interval_mode=1."
             )
 
         if subsample != -1 and (
@@ -4216,6 +4353,7 @@ class ArborEnum:
             int(importance_interval_mode),
             int(subsample),
             int(root_budget_int),
+            bool(divisive_model_reliance),
         )
 
         if "bootstrap_importance_intervals" in self._rid_out:

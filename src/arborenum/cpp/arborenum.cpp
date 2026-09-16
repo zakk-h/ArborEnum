@@ -20819,6 +20819,53 @@ private:
         std::vector<ExactSparseFeatureImportanceFrontiers_> features;
     };
 
+
+    struct ExactDivisiveFrontierPoint_ {
+        int obj = 0;
+        int original = 0;
+        double replacement = 0.0;
+    };
+
+    using ExactDivisiveFrontier_ =
+        std::vector<ExactDivisiveFrontierPoint_>;
+
+    struct ExactBaseLossFrontierPoint_ {
+        int obj = 0;
+        int original = 0;
+    };
+
+    using ExactBaseLossFrontier_ =
+        std::vector<ExactBaseLossFrontierPoint_>;
+
+    struct ExactSparseFeatureDivisiveFrontiers_ {
+        int variable = -1;
+        ExactDivisiveFrontier_ lower;
+        ExactDivisiveFrontier_ upper;
+    };
+
+    struct ExactGlobalDivisiveFrontiers_ {
+        int min_feasible_obj = std::numeric_limits<int>::max();
+        ExactBaseLossFrontier_ base_lower;
+        ExactBaseLossFrontier_ base_upper;
+        std::vector<ExactSparseFeatureDivisiveFrontiers_> features;
+    };
+
+    struct ExactGlobalDivisiveFrontierCacheEntry_ {
+        int solved_budget = -1;
+        ExactGlobalDivisiveFrontiers_ frontiers;
+    };
+
+    using ExactGlobalDivisiveFrontierCache_ =
+        std::unordered_map<
+            std::string,
+            std::shared_ptr<ExactGlobalDivisiveFrontierCacheEntry_>
+        >;
+
+    struct ExactDivisiveFeatureFrontierAccumulator_ {
+        ExactDivisiveFrontier_ lower;
+        ExactDivisiveFrontier_ upper;
+    };
+
     struct ExactImportanceBinaryConstraint_ {
         int feature = -1; // internal binary feature column
         int8_t value = -1; // 0 = false/right, 1 = true/left
@@ -21394,6 +21441,273 @@ private:
         return out;
     }
 
+
+    static inline void insert_exact_base_min_frontier_point_(
+        std::map<int, int>& frontier,
+        int obj,
+        int original
+    ) {
+        auto it = frontier.lower_bound(obj);
+
+        if (it != frontier.end() && it->first == obj) {
+            if (it->second <= original) return;
+            it->second = original;
+        } else {
+            if (it != frontier.begin()) {
+                const auto prev = std::prev(it);
+                if (prev->second <= original) return;
+            }
+            it = frontier.emplace_hint(it, obj, original);
+        }
+
+        if (it != frontier.begin()) {
+            const auto prev = std::prev(it);
+            if (prev->second <= it->second) {
+                frontier.erase(it);
+                return;
+            }
+        }
+
+        auto next = std::next(it);
+        while (next != frontier.end() && next->second >= it->second) {
+            next = frontier.erase(next);
+        }
+    }
+
+    static inline void insert_exact_base_max_frontier_point_(
+        std::map<int, int>& frontier,
+        int obj,
+        int original
+    ) {
+        auto it = frontier.lower_bound(obj);
+
+        if (it != frontier.end() && it->first == obj) {
+            if (it->second >= original) return;
+            it->second = original;
+        } else {
+            if (it != frontier.begin()) {
+                const auto prev = std::prev(it);
+                if (prev->second >= original) return;
+            }
+            it = frontier.emplace_hint(it, obj, original);
+        }
+
+        if (it != frontier.begin()) {
+            const auto prev = std::prev(it);
+            if (prev->second >= it->second) {
+                frontier.erase(it);
+                return;
+            }
+        }
+
+        auto next = std::next(it);
+        while (next != frontier.end() && next->second <= it->second) {
+            next = frontier.erase(next);
+        }
+    }
+
+    static inline void insert_exact_divisive_min_frontier_point_(
+        ExactDivisiveFrontier_& frontier,
+        int obj,
+        int original,
+        double replacement
+    ) {
+        for (const auto& p : frontier) {
+            if (
+                p.obj <= obj &&
+                p.original >= original &&
+                p.replacement <= replacement
+            ) {
+                return;
+            }
+        }
+
+        frontier.erase(
+            std::remove_if(
+                frontier.begin(),
+                frontier.end(),
+                [&](const ExactDivisiveFrontierPoint_& p) {
+                    return
+                        obj <= p.obj &&
+                        original >= p.original &&
+                        replacement <= p.replacement;
+                }
+            ),
+            frontier.end()
+        );
+
+        auto it = std::upper_bound(
+            frontier.begin(),
+            frontier.end(),
+            obj,
+            [](int o, const ExactDivisiveFrontierPoint_& p) {
+                return o < p.obj;
+            }
+        );
+
+        frontier.insert(
+            it,
+            ExactDivisiveFrontierPoint_{obj, original, replacement}
+        );
+    }
+
+    static inline void insert_exact_divisive_max_frontier_point_(
+        ExactDivisiveFrontier_& frontier,
+        int obj,
+        int original,
+        double replacement
+    ) {
+        for (const auto& p : frontier) {
+            if (
+                p.obj <= obj &&
+                p.original <= original &&
+                p.replacement >= replacement
+            ) {
+                return;
+            }
+        }
+
+        frontier.erase(
+            std::remove_if(
+                frontier.begin(),
+                frontier.end(),
+                [&](const ExactDivisiveFrontierPoint_& p) {
+                    return
+                        obj <= p.obj &&
+                        original <= p.original &&
+                        replacement >= p.replacement;
+                }
+            ),
+            frontier.end()
+        );
+
+        auto it = std::upper_bound(
+            frontier.begin(),
+            frontier.end(),
+            obj,
+            [](int o, const ExactDivisiveFrontierPoint_& p) {
+                return o < p.obj;
+            }
+        );
+
+        frontier.insert(
+            it,
+            ExactDivisiveFrontierPoint_{obj, original, replacement}
+        );
+    }
+
+    static inline ExactBaseLossFrontier_
+    exact_base_frontier_map_to_vector_(
+        const std::map<int, int>& frontier
+    ) {
+        ExactBaseLossFrontier_ out;
+        out.reserve(frontier.size());
+        for (const auto& [obj, original] : frontier) {
+            out.push_back(ExactBaseLossFrontierPoint_{obj, original});
+        }
+        return out;
+    }
+
+    static inline const ExactSparseFeatureDivisiveFrontiers_*
+    find_exact_sparse_divisive_feature_frontiers_(
+        const ExactGlobalDivisiveFrontiers_& frontiers,
+        int variable
+    ) {
+        auto it = std::lower_bound(
+            frontiers.features.begin(),
+            frontiers.features.end(),
+            variable,
+            [](const ExactSparseFeatureDivisiveFrontiers_& f, int v) {
+                return f.variable < v;
+            }
+        );
+
+        if (
+            it == frontiers.features.end() ||
+            it->variable != variable
+        ) {
+            return nullptr;
+        }
+        return &(*it);
+    }
+
+    static inline std::vector<int>
+    exact_sparse_divisive_feature_union_(
+        const ExactGlobalDivisiveFrontiers_& left,
+        const ExactGlobalDivisiveFrontiers_& right
+    ) {
+        std::vector<int> out;
+        out.reserve(left.features.size() + right.features.size());
+
+        std::size_t li = 0;
+        std::size_t ri = 0;
+
+        while (li < left.features.size() || ri < right.features.size()) {
+            if (
+                ri >= right.features.size() ||
+                (li < left.features.size() &&
+                 left.features[li].variable < right.features[ri].variable)
+            ) {
+                out.push_back(left.features[li].variable);
+                ++li;
+            } else if (
+                li >= left.features.size() ||
+                right.features[ri].variable < left.features[li].variable
+            ) {
+                out.push_back(right.features[ri].variable);
+                ++ri;
+            } else {
+                out.push_back(left.features[li].variable);
+                ++li;
+                ++ri;
+            }
+        }
+
+        return out;
+    }
+
+    static inline void insert_exact_divisive_neutral_from_base_maps_(
+        ExactDivisiveFeatureFrontierAccumulator_& acc,
+        const std::map<int, int>& base_lower,
+        const std::map<int, int>& base_upper
+    ) {
+        auto add = [&](const std::map<int, int>& base) {
+            for (const auto& [obj, original] : base) {
+                const double replacement = static_cast<double>(original);
+                insert_exact_divisive_min_frontier_point_(
+                    acc.lower, obj, original, replacement
+                );
+                insert_exact_divisive_max_frontier_point_(
+                    acc.upper, obj, original, replacement
+                );
+            }
+        };
+        add(base_lower);
+        add(base_upper);
+    }
+
+    static inline void insert_exact_divisive_neutral_from_base_vectors_(
+        ExactDivisiveFeatureFrontierAccumulator_& acc,
+        const ExactBaseLossFrontier_& base_lower,
+        const ExactBaseLossFrontier_& base_upper,
+        int budget
+    ) {
+        auto add = [&](const ExactBaseLossFrontier_& base) {
+            for (const auto& p : base) {
+                if (p.obj > budget) break;
+                const double replacement = static_cast<double>(p.original);
+                insert_exact_divisive_min_frontier_point_(
+                    acc.lower, p.obj, p.original, replacement
+                );
+                insert_exact_divisive_max_frontier_point_(
+                    acc.upper, p.obj, p.original, replacement
+                );
+            }
+        };
+        add(base_lower);
+        add(base_upper);
+    }
+
     static inline bool packed_equal_exact_(
         const Packed& a,
         const Packed& b
@@ -21936,6 +22250,540 @@ private:
     }
 
 
+    std::shared_ptr<const ExactGlobalDivisiveFrontierCacheEntry_>
+    collect_exact_global_divisive_frontiers_cached_(
+        const TreeTrieNode* node,
+        int remaining_depth,
+        int delta,
+        const Packed& original_mask,
+        const Packed& replacement_root_mask,
+        const ExactSparseReplacementStates_& states,
+        const ExactImportanceSemanticPath_& semantic_path,
+        const std::vector<int>& internal_to_variable,
+        const EvalCtx& ctx,
+        const std::vector<Packed>& Y_eval_bits,
+        const Packed* BBwrong_eval,
+        const std::vector<std::vector<int>>*
+            matched_group_of_row_by_variable_eval,
+        const std::vector<std::vector<double>>*
+            matched_group_inv_size_by_variable_eval,
+        const std::vector<uint8_t>*
+            matched_group_effectively_uniform_by_variable_eval,
+        ExactMatchedScratch_* matched_scratch,
+        ExactGlobalDivisiveFrontierCache_& cache
+    ) const {
+        if (!node || remaining_depth < 0) return nullptr;
+
+        constexpr int INF = std::numeric_limits<int>::max();
+        const int budget = node->budget - delta;
+
+        if (
+            budget < 0 ||
+            node->min_objective == INF ||
+            node->min_objective > budget
+        ) {
+            return nullptr;
+        }
+
+        const std::string cache_key =
+            exact_importance_semantic_cache_key_(
+                semantic_path,
+                remaining_depth
+            );
+
+        if (auto it = cache.find(cache_key); it != cache.end()) {
+            if (it->second && it->second->solved_budget >= budget) {
+                return it->second;
+            }
+        }
+
+        std::map<int, ExactDivisiveFeatureFrontierAccumulator_> feature_acc;
+        std::map<int, int> base_lower_acc;
+        std::map<int, int> base_upper_acc;
+        int prior_min_feasible_obj = INF;
+        bool saw_solution = false;
+
+        for (const auto& leaf : node->leaves) {
+            if (leaf.loss > budget) continue;
+
+            const int original_mistakes =
+                exact_wrong_count_for_leaf_(
+                    original_mask,
+                    leaf.prediction,
+                    ctx,
+                    Y_eval_bits,
+                    BBwrong_eval
+                );
+
+            for (auto& [variable, acc] : feature_acc) {
+                if (
+                    find_exact_sparse_replacement_state_(
+                        states,
+                        variable
+                    ) == nullptr
+                ) {
+                    insert_exact_divisive_min_frontier_point_(
+                        acc.lower,
+                        leaf.loss,
+                        original_mistakes,
+                        static_cast<double>(original_mistakes)
+                    );
+                    insert_exact_divisive_max_frontier_point_(
+                        acc.upper,
+                        leaf.loss,
+                        original_mistakes,
+                        static_cast<double>(original_mistakes)
+                    );
+                }
+            }
+
+            for (const auto& sparse : states) {
+                const int variable = sparse.variable;
+                const auto& state = sparse.state;
+
+                auto [it, inserted] =
+                    feature_acc.try_emplace(variable);
+
+                if (inserted && prior_min_feasible_obj != INF) {
+                    insert_exact_divisive_neutral_from_base_maps_(
+                        it->second,
+                        base_lower_acc,
+                        base_upper_acc
+                    );
+                }
+
+                const double replacement_mistakes =
+                    exact_replacement_expected_mistakes_for_leaf_variable_(
+                        state,
+                        variable,
+                        leaf.prediction,
+                        original_mistakes,
+                        ctx,
+                        Y_eval_bits,
+                        BBwrong_eval,
+                        matched_group_of_row_by_variable_eval,
+                        matched_group_inv_size_by_variable_eval,
+                        matched_group_effectively_uniform_by_variable_eval,
+                        matched_scratch
+                    );
+
+                insert_exact_divisive_min_frontier_point_(
+                    it->second.lower,
+                    leaf.loss,
+                    original_mistakes,
+                    replacement_mistakes
+                );
+                insert_exact_divisive_max_frontier_point_(
+                    it->second.upper,
+                    leaf.loss,
+                    original_mistakes,
+                    replacement_mistakes
+                );
+            }
+
+            insert_exact_base_min_frontier_point_(
+                base_lower_acc,
+                leaf.loss,
+                original_mistakes
+            );
+            insert_exact_base_max_frontier_point_(
+                base_upper_acc,
+                leaf.loss,
+                original_mistakes
+            );
+
+            prior_min_feasible_obj =
+                std::min(prior_min_feasible_obj, leaf.loss);
+            saw_solution = true;
+        }
+
+        if (remaining_depth > 0) {
+            for (const auto& split : node->splits) {
+                const TreeTrieNode* L = split.left.get();
+                const TreeTrieNode* R = split.right.get();
+                if (!L || !R) continue;
+
+                const int minL = L->min_objective;
+                const int minR = R->min_objective;
+                if (minL == INF || minR == INF) continue;
+                if (minL + minR > budget) continue;
+
+                if (
+                    split.feature < 0 ||
+                    split.feature >=
+                        static_cast<int>(internal_to_variable.size())
+                ) {
+                    throw std::runtime_error(
+                        "Cached divisive importance saw an invalid split feature."
+                    );
+                }
+
+                const int split_variable =
+                    internal_to_variable[
+                        static_cast<std::size_t>(split.feature)
+                    ];
+
+                if (split_variable < 0) {
+                    throw std::runtime_error(
+                        "Cached divisive importance split feature is not mapped "
+                        "to an original variable."
+                    );
+                }
+
+                const Packed& Xf =
+                    ctx.X_bits_eval[
+                        static_cast<std::size_t>(split.feature)
+                    ];
+
+                Packed original_left(
+                    static_cast<std::size_t>(ctx.n_words)
+                );
+                Packed original_right(
+                    static_cast<std::size_t>(ctx.n_words)
+                );
+
+                and_bits_eval(
+                    original_mask,
+                    Xf,
+                    original_left,
+                    ctx.n_words,
+                    ctx.tail_mask
+                );
+                andnot_bits_eval(
+                    original_mask,
+                    Xf,
+                    original_right,
+                    ctx.n_words,
+                    ctx.tail_mask
+                );
+
+                ExactSparseReplacementStates_ left_states;
+                ExactSparseReplacementStates_ right_states;
+
+                make_exact_importance_child_sparse_states_(
+                    split_variable,
+                    Xf,
+                    original_mask,
+                    replacement_root_mask,
+                    states,
+                    ctx,
+                    left_states,
+                    right_states
+                );
+
+                ExactImportanceSemanticPath_ left_path;
+                ExactImportanceSemanticPath_ right_path;
+
+                make_exact_importance_child_semantic_paths_(
+                    split.feature,
+                    semantic_path,
+                    left_path,
+                    right_path
+                );
+
+                auto left_entry =
+                    collect_exact_global_divisive_frontiers_cached_(
+                        L,
+                        remaining_depth - 1,
+                        delta,
+                        original_left,
+                        replacement_root_mask,
+                        left_states,
+                        left_path,
+                        internal_to_variable,
+                        ctx,
+                        Y_eval_bits,
+                        BBwrong_eval,
+                        matched_group_of_row_by_variable_eval,
+                        matched_group_inv_size_by_variable_eval,
+                        matched_group_effectively_uniform_by_variable_eval,
+                        matched_scratch,
+                        cache
+                    );
+
+                auto right_entry =
+                    collect_exact_global_divisive_frontiers_cached_(
+                        R,
+                        remaining_depth - 1,
+                        delta,
+                        original_right,
+                        replacement_root_mask,
+                        right_states,
+                        right_path,
+                        internal_to_variable,
+                        ctx,
+                        Y_eval_bits,
+                        BBwrong_eval,
+                        matched_group_of_row_by_variable_eval,
+                        matched_group_inv_size_by_variable_eval,
+                        matched_group_effectively_uniform_by_variable_eval,
+                        matched_scratch,
+                        cache
+                    );
+
+                if (!left_entry || !right_entry) continue;
+
+                const auto& LF = left_entry->frontiers;
+                const auto& RF = right_entry->frontiers;
+                const int left_budget = L->budget - delta;
+                const int right_budget = R->budget - delta;
+
+                if (
+                    LF.min_feasible_obj == INF ||
+                    RF.min_feasible_obj == INF ||
+                    LF.min_feasible_obj > left_budget ||
+                    RF.min_feasible_obj > right_budget
+                ) {
+                    continue;
+                }
+
+                const int split_min_obj =
+                    LF.min_feasible_obj + RF.min_feasible_obj;
+                if (split_min_obj > budget) continue;
+
+                std::map<int, int> split_base_lower;
+                std::map<int, int> split_base_upper;
+
+                for (const auto& lp : LF.base_lower) {
+                    if (lp.obj > left_budget || lp.obj > budget) break;
+                    const int rem =
+                        std::min(budget - lp.obj, right_budget);
+                    for (const auto& rp : RF.base_lower) {
+                        if (rp.obj > rem) break;
+                        insert_exact_base_min_frontier_point_(
+                            split_base_lower,
+                            lp.obj + rp.obj,
+                            lp.original + rp.original
+                        );
+                    }
+                }
+
+                for (const auto& lp : LF.base_upper) {
+                    if (lp.obj > left_budget || lp.obj > budget) break;
+                    const int rem =
+                        std::min(budget - lp.obj, right_budget);
+                    for (const auto& rp : RF.base_upper) {
+                        if (rp.obj > rem) break;
+                        insert_exact_base_max_frontier_point_(
+                            split_base_upper,
+                            lp.obj + rp.obj,
+                            lp.original + rp.original
+                        );
+                    }
+                }
+
+                const std::vector<int> split_variables =
+                    exact_sparse_divisive_feature_union_(LF, RF);
+
+                for (auto& [variable, acc] : feature_acc) {
+                    if (
+                        !std::binary_search(
+                            split_variables.begin(),
+                            split_variables.end(),
+                            variable
+                        )
+                    ) {
+                        insert_exact_divisive_neutral_from_base_maps_(
+                            acc,
+                            split_base_lower,
+                            split_base_upper
+                        );
+                    }
+                }
+
+                for (int variable : split_variables) {
+                    const auto* left_feature =
+                        find_exact_sparse_divisive_feature_frontiers_(
+                            LF,
+                            variable
+                        );
+                    const auto* right_feature =
+                        find_exact_sparse_divisive_feature_frontiers_(
+                            RF,
+                            variable
+                        );
+
+                    auto [it, inserted] =
+                        feature_acc.try_emplace(variable);
+
+                    if (inserted && prior_min_feasible_obj != INF) {
+                        insert_exact_divisive_neutral_from_base_maps_(
+                            it->second,
+                            base_lower_acc,
+                            base_upper_acc
+                        );
+                    }
+
+                    auto& parent_feature = it->second;
+
+                    if (left_feature && right_feature) {
+                        for (const auto& lp : left_feature->lower) {
+                            if (lp.obj > left_budget || lp.obj > budget) break;
+                            const int rem =
+                                std::min(budget - lp.obj, right_budget);
+                            for (const auto& rp : right_feature->lower) {
+                                if (rp.obj > rem) break;
+                                insert_exact_divisive_min_frontier_point_(
+                                    parent_feature.lower,
+                                    lp.obj + rp.obj,
+                                    lp.original + rp.original,
+                                    lp.replacement + rp.replacement
+                                );
+                            }
+                        }
+
+                        for (const auto& lp : left_feature->upper) {
+                            if (lp.obj > left_budget || lp.obj > budget) break;
+                            const int rem =
+                                std::min(budget - lp.obj, right_budget);
+                            for (const auto& rp : right_feature->upper) {
+                                if (rp.obj > rem) break;
+                                insert_exact_divisive_max_frontier_point_(
+                                    parent_feature.upper,
+                                    lp.obj + rp.obj,
+                                    lp.original + rp.original,
+                                    lp.replacement + rp.replacement
+                                );
+                            }
+                        }
+                    } else if (left_feature) {
+                        auto combine_min = [&](const ExactBaseLossFrontier_& base) {
+                            for (const auto& lp : left_feature->lower) {
+                                if (lp.obj > left_budget || lp.obj > budget) break;
+                                const int rem =
+                                    std::min(budget - lp.obj, right_budget);
+                                for (const auto& rp : base) {
+                                    if (rp.obj > rem) break;
+                                    insert_exact_divisive_min_frontier_point_(
+                                        parent_feature.lower,
+                                        lp.obj + rp.obj,
+                                        lp.original + rp.original,
+                                        lp.replacement +
+                                            static_cast<double>(rp.original)
+                                    );
+                                }
+                            }
+                        };
+                        combine_min(RF.base_lower);
+                        combine_min(RF.base_upper);
+
+                        auto combine_max = [&](const ExactBaseLossFrontier_& base) {
+                            for (const auto& lp : left_feature->upper) {
+                                if (lp.obj > left_budget || lp.obj > budget) break;
+                                const int rem =
+                                    std::min(budget - lp.obj, right_budget);
+                                for (const auto& rp : base) {
+                                    if (rp.obj > rem) break;
+                                    insert_exact_divisive_max_frontier_point_(
+                                        parent_feature.upper,
+                                        lp.obj + rp.obj,
+                                        lp.original + rp.original,
+                                        lp.replacement +
+                                            static_cast<double>(rp.original)
+                                    );
+                                }
+                            }
+                        };
+                        combine_max(RF.base_lower);
+                        combine_max(RF.base_upper);
+                    } else if (right_feature) {
+                        auto combine_min = [&](const ExactBaseLossFrontier_& base) {
+                            for (const auto& rp : right_feature->lower) {
+                                if (rp.obj > right_budget || rp.obj > budget) break;
+                                const int rem =
+                                    std::min(budget - rp.obj, left_budget);
+                                for (const auto& lp : base) {
+                                    if (lp.obj > rem) break;
+                                    insert_exact_divisive_min_frontier_point_(
+                                        parent_feature.lower,
+                                        lp.obj + rp.obj,
+                                        lp.original + rp.original,
+                                        static_cast<double>(lp.original) +
+                                            rp.replacement
+                                    );
+                                }
+                            }
+                        };
+                        combine_min(LF.base_lower);
+                        combine_min(LF.base_upper);
+
+                        auto combine_max = [&](const ExactBaseLossFrontier_& base) {
+                            for (const auto& rp : right_feature->upper) {
+                                if (rp.obj > right_budget || rp.obj > budget) break;
+                                const int rem =
+                                    std::min(budget - rp.obj, left_budget);
+                                for (const auto& lp : base) {
+                                    if (lp.obj > rem) break;
+                                    insert_exact_divisive_max_frontier_point_(
+                                        parent_feature.upper,
+                                        lp.obj + rp.obj,
+                                        lp.original + rp.original,
+                                        static_cast<double>(lp.original) +
+                                            rp.replacement
+                                    );
+                                }
+                            }
+                        };
+                        combine_max(LF.base_lower);
+                        combine_max(LF.base_upper);
+                    }
+                }
+
+                for (const auto& [obj, original] : split_base_lower) {
+                    insert_exact_base_min_frontier_point_(
+                        base_lower_acc,
+                        obj,
+                        original
+                    );
+                }
+                for (const auto& [obj, original] : split_base_upper) {
+                    insert_exact_base_max_frontier_point_(
+                        base_upper_acc,
+                        obj,
+                        original
+                    );
+                }
+
+                prior_min_feasible_obj =
+                    std::min(prior_min_feasible_obj, split_min_obj);
+                saw_solution = true;
+            }
+        }
+
+        if (!saw_solution) return nullptr;
+
+        auto entry =
+            std::make_shared<ExactGlobalDivisiveFrontierCacheEntry_>();
+
+        entry->solved_budget = budget;
+        entry->frontiers.min_feasible_obj = prior_min_feasible_obj;
+        entry->frontiers.base_lower =
+            exact_base_frontier_map_to_vector_(base_lower_acc);
+        entry->frontiers.base_upper =
+            exact_base_frontier_map_to_vector_(base_upper_acc);
+        entry->frontiers.features.reserve(feature_acc.size());
+
+        for (auto& [variable, acc] : feature_acc) {
+            if (acc.lower.empty() || acc.upper.empty()) {
+                throw std::runtime_error(
+                    "Sparse cached divisive importance created an empty "
+                    "feature frontier."
+                );
+            }
+
+            ExactSparseFeatureDivisiveFrontiers_ feature;
+            feature.variable = variable;
+            feature.lower = std::move(acc.lower);
+            feature.upper = std::move(acc.upper);
+            entry->frontiers.features.push_back(std::move(feature));
+        }
+
+        cache[cache_key] = entry;
+        return entry;
+    }
+
+
+
 public:
 
     uint8_t reachable_prediction_mask_for_training_sample(int sample_idx) const {
@@ -22281,6 +23129,177 @@ public:
         return out;
     }
 
+
+
+    std::vector<ExactImportanceInterval>
+    get_exact_replacement_divisive_importance_intervals_cached_frontier_packed_trie(
+        const std::vector<std::vector<uint8_t>>& X_row_major,
+        const std::vector<int>& y_eval,
+        int budget_override = -1,
+        const std::vector<std::vector<int>>& variable_columns_in = {},
+        const std::vector<int>& bb_pred_eval = {},
+        const std::vector<std::vector<int>>&
+            matched_group_of_row_by_variable_eval = {},
+        const std::vector<std::vector<int>>&
+            matched_group_size_by_variable_eval = {}
+    ) const {
+        auto setup =
+            prepare_exact_replacement_interval_eval_(
+                X_row_major,
+                y_eval,
+                budget_override,
+                variable_columns_in,
+                bb_pred_eval,
+                matched_group_of_row_by_variable_eval,
+                matched_group_size_by_variable_eval
+            );
+
+        if (setup.ctx.n_eval <= 0) return {};
+
+        require_exact_importance_eval_is_training_(setup, y_eval);
+
+        if (!result) {
+            throw std::runtime_error(
+                "No Rashomon trie has been constructed. Call fit() first."
+            );
+        }
+
+        if (setup.budget > result->budget) {
+            throw std::runtime_error(
+                "Cached divisive importance can only query a budget no larger "
+                "than the fitted root graph budget."
+            );
+        }
+
+        const int delta = result->budget - setup.budget;
+        const int number_of_variables =
+            static_cast<int>(setup.variable_columns.size());
+
+        const Packed* BBwrong_eval_ptr =
+            setup.has_bb_wrong ? &setup.bb_wrong : nullptr;
+
+        const std::vector<std::vector<int>>*
+            matched_group_of_row_by_variable_eval_ptr =
+                setup.use_matched_groups
+                    ? &matched_group_of_row_by_variable_eval
+                    : nullptr;
+
+        const std::vector<std::vector<double>>*
+            matched_group_inv_size_by_variable_eval_ptr =
+                setup.use_matched_groups
+                    ? &setup.matched_group_inv_sizes
+                    : nullptr;
+
+        const std::vector<uint8_t>*
+            matched_group_effectively_uniform_by_variable_eval_ptr =
+                setup.use_matched_groups
+                    ? &setup.matched_group_effectively_uniform
+                    : nullptr;
+
+        ExactMatchedScratch_ matched_scratch;
+        ExactMatchedScratch_* matched_scratch_ptr =
+            setup.use_matched_groups ? &matched_scratch : nullptr;
+
+        ExactSparseReplacementStates_ root_states;
+        ExactImportanceSemanticPath_ root_path;
+
+        ExactGlobalDivisiveFrontierCache_ cache;
+        cache.reserve(1024);
+
+        auto root_entry =
+            collect_exact_global_divisive_frontiers_cached_(
+                result.get(),
+                static_cast<int>(trained_depth_budget),
+                delta,
+                setup.root_mask,
+                setup.root_mask,
+                root_states,
+                root_path,
+                setup.internal_to_variable,
+                setup.ctx,
+                setup.y_bits,
+                BBwrong_eval_ptr,
+                matched_group_of_row_by_variable_eval_ptr,
+                matched_group_inv_size_by_variable_eval_ptr,
+                matched_group_effectively_uniform_by_variable_eval_ptr,
+                matched_scratch_ptr,
+                cache
+            );
+
+        if (!root_entry) return {};
+
+        const auto& root_frontiers = root_entry->frontiers;
+
+        if (
+            root_frontiers.min_feasible_obj ==
+                std::numeric_limits<int>::max() ||
+            root_frontiers.min_feasible_obj > setup.budget
+        ) {
+            return {};
+        }
+
+        int min_original = std::numeric_limits<int>::max();
+        for (const auto& p : root_frontiers.base_lower) {
+            if (p.obj > setup.budget) break;
+            min_original = p.original;
+        }
+
+        if (min_original == 0) {
+            throw std::runtime_error(
+                "Divisive model reliance is undefined because a feasible tree "
+                "has zero original evaluation loss."
+            );
+        }
+
+        std::vector<ExactImportanceInterval> out(
+            static_cast<std::size_t>(number_of_variables),
+            {1.0, 1.0}
+        );
+
+        for (int variable = 0;
+             variable < number_of_variables;
+             ++variable) {
+
+            const auto* feature =
+                find_exact_sparse_divisive_feature_frontiers_(
+                    root_frontiers,
+                    variable
+                );
+
+            if (!feature) continue;
+
+            double lower = std::numeric_limits<double>::infinity();
+            double upper = -std::numeric_limits<double>::infinity();
+
+            for (const auto& p : feature->lower) {
+                if (p.obj > setup.budget) break;
+                if (p.original <= 0) continue;
+                lower = std::min(
+                    lower,
+                    p.replacement / static_cast<double>(p.original)
+                );
+            }
+
+            for (const auto& p : feature->upper) {
+                if (p.obj > setup.budget) break;
+                if (p.original <= 0) continue;
+                upper = std::max(
+                    upper,
+                    p.replacement / static_cast<double>(p.original)
+                );
+            }
+
+            if (!std::isfinite(lower) || !std::isfinite(upper)) {
+                throw std::runtime_error(
+                    "No positive-denominator divisive frontier point is feasible."
+                );
+            }
+
+            out[static_cast<std::size_t>(variable)] = {lower, upper};
+        }
+
+        return out;
+    }
 
     std::vector<ExactImportanceInterval>
     get_exact_replacement_importance_intervals_cached_frontier_packed_trie(
