@@ -50,9 +50,9 @@ X = df
 
 ## Standard enumeration
 
-We recommend keeping all of these parameters for a high-quality approximation. Only change `lambda_reg`, `depth_budget`, and `rashomon_mult` depending on the Rashomon set you want.
+We recommend keeping all of these parameters for a high-quality approximation. If you are compute-constrained, set `max_number_thresholds_per_feature` to a value such as 64 to make enumeration more feasible. Change `lambda_reg`, `depth_budget`, and `rashomon_mult` depending on the Rashomon set you want.
 
-For an exact Rashomon set, use `proxy_mode="continuous"` and `lookahead_k=depth_budget - 1`.
+For an exact Rashomon set (no approximations), use `proxy_mode="continuous"` and `lookahead_k=depth_budget - 1`.
 
 ```python
 standard_model = ArborEnum()
