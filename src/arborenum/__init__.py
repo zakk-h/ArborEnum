@@ -13,6 +13,7 @@ from ._threshold_guessing import ThresholdGuessBinarizer
 import json
 from pathlib import Path
 from importlib.resources import files
+from statistics import NormalDist
 
 DEFER_PREDICTION = -1
 
@@ -2399,6 +2400,552 @@ class ArborEnum:
             intervals[active_features] = active_intervals
 
         return intervals
+
+
+    def get_wald_divisive_model_reliance_intervals(
+        self,
+        X_eval,
+        y_eval,
+        alpha_prime=0.05,
+        seed=0,
+        budget_override=None,
+    ):
+        if self.n_features_in_ is None:
+            raise RuntimeError("Fit the model first.")
+
+        X_internal = np.ascontiguousarray(
+            self.transform(X_eval),
+            dtype=np.uint8,
+        )
+
+        y_eval = np.ascontiguousarray(
+            np.asarray(y_eval, dtype=np.int32)
+        )
+
+        if y_eval.ndim != 1:
+            raise ValueError("y_eval must be 1D.")
+
+        if y_eval.shape[0] != X_internal.shape[0]:
+            raise ValueError(
+                "y_eval must have the same number of rows as X_eval."
+            )
+
+        if X_internal.shape[0] < 4:
+            raise ValueError(
+                "At least four evaluation rows are required."
+            )
+
+        if X_internal.shape[0] % 2 != 0:
+            raise ValueError(
+                "An even number of evaluation rows is required."
+            )
+
+        alpha_prime = float(alpha_prime)
+
+        if not np.isfinite(alpha_prime) or not 0.0 < alpha_prime < 1.0:
+            raise ValueError(
+                "alpha_prime must be strictly between 0 and 1."
+            )
+
+        variable_columns = [
+            [] for _ in range(self.n_features_in_)
+        ]
+
+        for internal_feature, spec in enumerate(
+            self.binary_feature_specs_
+        ):
+            original_feature = int(spec["original_feature"])
+            variable_columns[original_feature].append(
+                int(internal_feature)
+            )
+
+        starts = self.get_continuous_starts()
+
+        for group, original_feature in enumerate(
+            self.continuous_feature_indices_
+        ):
+            original_feature = int(original_feature)
+            start = int(starts[group])
+            end = int(self.get_continuous_group_end(group))
+            variable_columns[original_feature].extend(
+                range(start, end)
+            )
+
+        active_features = [
+            j
+            for j, cols in enumerate(variable_columns)
+            if cols
+        ]
+
+        active_variable_columns = [
+            variable_columns[j]
+            for j in active_features
+        ]
+
+        budget = (
+            -1
+            if budget_override is None
+            else int(budget_override)
+        )
+
+        z_value = NormalDist().inv_cdf(
+            1.0 - alpha_prime / 4.0
+        )
+
+        active_intervals = np.asarray(
+            self._model.get_wald_divisive_model_reliance_intervals_graph(
+                X_internal,
+                y_eval,
+                active_variable_columns,
+                float(z_value),
+                int(seed),
+                budget,
+            ),
+            dtype=float,
+        )
+
+        intervals = np.ones(
+            (self.n_features_in_, 2),
+            dtype=float,
+        )
+
+        if active_features:
+            intervals[active_features] = active_intervals
+
+        return intervals
+
+    
+    def get_divisive_wald_marginal_bounds(
+        self,
+        X_eval,
+        y_eval,
+        alpha_prime=0.05,
+        seed=0,
+        budget_override=None,
+    ):
+        if self.n_features_in_ is None:
+            raise RuntimeError("Fit the model first.")
+
+        X_internal = np.ascontiguousarray(
+            self.transform(X_eval), dtype=np.uint8
+        )
+        y_eval = np.ascontiguousarray(
+            np.asarray(y_eval, dtype=np.int32)
+        )
+
+        if y_eval.ndim != 1:
+            raise ValueError("y_eval must be 1D.")
+
+        n = X_internal.shape[0]
+
+        if y_eval.shape[0] != n:
+            raise ValueError(
+                "y_eval must match the number of rows in X_eval."
+            )
+
+        if n < 4 or n % 2 != 0:
+            raise ValueError(
+                "X_eval must have an even number of rows >= 4."
+            )
+
+        alpha_prime = float(alpha_prime)
+        if not np.isfinite(alpha_prime) or not 0 < alpha_prime < 1:
+            raise ValueError("alpha_prime must be in (0, 1).")
+
+        seed = int(seed)
+        if seed < 0:
+            raise ValueError("seed must be nonnegative.")
+
+        # split evaluation rows into recipients and donors
+        permutation = np.random.default_rng(
+            np.random.SeedSequence([seed, 62001])
+        ).permutation(n)
+
+        m = n // 2
+        recipient_idx = permutation[:m]
+        donor_idx = permutation[m:]
+
+        X_recipient = np.ascontiguousarray(
+            X_internal[recipient_idx], dtype=np.uint8
+        )
+        X_donor = np.ascontiguousarray(
+            X_internal[donor_idx], dtype=np.uint8
+        )
+        y_recipient = np.ascontiguousarray(
+            y_eval[recipient_idx], dtype=np.int32
+        )
+
+        # map original features to internal threshold columns
+        variable_columns = [
+            [] for _ in range(self.n_features_in_)
+        ]
+
+        for internal_feature, spec in enumerate(
+            self.binary_feature_specs_
+        ):
+            original_feature = int(spec["original_feature"])
+            variable_columns[original_feature].append(
+                int(internal_feature)
+            )
+
+        starts = self.get_continuous_starts()
+
+        for group, original_feature in enumerate(
+            self.continuous_feature_indices_
+        ):
+            start = int(starts[group])
+            end = int(self.get_continuous_group_end(group))
+            variable_columns[int(original_feature)].extend(
+                range(start, end)
+            )
+
+        active_features = [
+            j for j, cols in enumerate(variable_columns)
+            if cols
+        ]
+
+        active_groups = [
+            variable_columns[j] for j in active_features
+        ]
+
+        intervals = np.ones(
+            (self.n_features_in_, 2), dtype=float
+        )
+
+        if not active_features:
+            return intervals
+
+        budget = (
+            -1 if budget_override is None
+            else int(budget_override)
+        )
+
+        if budget < -1:
+            raise ValueError(
+                "budget_override must be nonnegative or None."
+            )
+
+        z_value = NormalDist().inv_cdf(
+            1.0 - alpha_prime / 4.0
+        )
+
+        active_intervals = np.asarray(
+            self._model.get_divisive_wald_marginal_bounds(
+                X_recipient,
+                X_donor,
+                y_recipient,
+                float(z_value),
+                budget,
+                active_groups,
+            ),
+            dtype=float,
+        )
+
+        if active_intervals.shape != (len(active_features), 2):
+            raise RuntimeError(
+                "Unexpected shape returned by C++ Wald bounds: "
+                f"{active_intervals.shape}"
+            )
+
+        intervals[active_features] = active_intervals
+
+        return intervals
+
+    def _get_divisive_wald_structural_bounds(
+        self,
+        X_eval,
+        y_eval,
+        alpha_prime,
+        seed,
+        budget_override,
+        cpp_method,
+    ):
+        if self.n_features_in_ is None:
+            raise RuntimeError("Fit the model first.")
+
+        X_internal = np.ascontiguousarray(
+            self.transform(X_eval), dtype=np.uint8
+        )
+        y_eval = np.ascontiguousarray(
+            np.asarray(y_eval, dtype=np.int32)
+        )
+
+        if y_eval.ndim != 1:
+            raise ValueError("y_eval must be 1D.")
+
+        n = X_internal.shape[0]
+
+        if y_eval.shape[0] != n:
+            raise ValueError(
+                "y_eval must match the number of rows in X_eval."
+            )
+
+        if n < 4 or n % 2 != 0:
+            raise ValueError(
+                "X_eval must have an even number of rows >= 4."
+            )
+
+        alpha_prime = float(alpha_prime)
+
+        if not np.isfinite(alpha_prime) or not 0 < alpha_prime < 1:
+            raise ValueError("alpha_prime must be in (0, 1).")
+
+        seed = int(seed)
+
+        if seed < 0:
+            raise ValueError("seed must be nonnegative.")
+
+        permutation = np.random.default_rng(
+            np.random.SeedSequence([seed, 62001])
+        ).permutation(n)
+
+        m = n // 2
+        recipient_idx = permutation[:m]
+        donor_idx = permutation[m:]
+
+        X_recipient = np.ascontiguousarray(
+            X_internal[recipient_idx], dtype=np.uint8
+        )
+        X_donor = np.ascontiguousarray(
+            X_internal[donor_idx], dtype=np.uint8
+        )
+        y_recipient = np.ascontiguousarray(
+            y_eval[recipient_idx], dtype=np.int32
+        )
+
+        variable_columns = [
+            [] for _ in range(self.n_features_in_)
+        ]
+
+        for internal_feature, spec in enumerate(
+            self.binary_feature_specs_
+        ):
+            original_feature = int(spec["original_feature"])
+            variable_columns[original_feature].append(
+                int(internal_feature)
+            )
+
+        starts = self.get_continuous_starts()
+
+        for group, original_feature in enumerate(
+            self.continuous_feature_indices_
+        ):
+            start = int(starts[group])
+            end = int(self.get_continuous_group_end(group))
+
+            variable_columns[int(original_feature)].extend(
+                range(start, end)
+            )
+
+        active_features = [
+            j for j, cols in enumerate(variable_columns)
+            if cols
+        ]
+
+        active_groups = [
+            variable_columns[j] for j in active_features
+        ]
+
+        intervals = np.ones(
+            (self.n_features_in_, 2), dtype=float
+        )
+
+        if not active_features:
+            return intervals
+
+        budget = (
+            -1 if budget_override is None
+            else int(budget_override)
+        )
+
+        if budget < -1:
+            raise ValueError(
+                "budget_override must be nonnegative or None."
+            )
+
+        z_value = NormalDist().inv_cdf(
+            1.0 - alpha_prime / 4.0
+        )
+
+        active_intervals = np.asarray(
+            getattr(self._model, cpp_method)(
+                X_recipient,
+                X_donor,
+                y_recipient,
+                float(z_value),
+                budget,
+                active_groups,
+            ),
+            dtype=float,
+        )
+
+        if active_intervals.shape != (len(active_features), 2):
+            raise RuntimeError(
+                f"Unexpected shape returned by {cpp_method}: "
+                f"{active_intervals.shape}"
+            )
+
+        intervals[active_features] = active_intervals
+
+        return intervals
+
+
+    def get_majority_divisive_wald_3state_bounds(
+        self, X, y, X_eval, y_eval, *,
+        num_subsamples=100, majority_threshold=0.8,
+        subsample_fraction=0.8, seed=0, alpha_prime=0.05,
+        vi_seed=None, **rashomon_kwargs,
+    ):
+        import inspect
+
+        num_subsamples = int(num_subsamples)
+        seed = int(seed)
+        if num_subsamples <= 0 or seed < 0 or seed >= 2**64:
+            raise ValueError("num_subsamples must be positive and seed uint64.")
+        if not 0.0 < float(majority_threshold) <= 1.0:
+            raise ValueError("majority_threshold must lie in (0,1].")
+        if not 0.0 < float(subsample_fraction) <= 1.0:
+            raise ValueError("subsample_fraction must lie in (0,1].")
+
+        sig = inspect.signature(self.fit)
+        options = sig.bind(X, y, **rashomon_kwargs)
+        options.apply_defaults()
+        f = options.arguments
+        unsupported = {
+            "second_rashomon_mult", "multiplier_step_size",
+            "proxy_refinement", "refinement_width",
+            "max_refinement_rounds", "use_deferral", "eta_defer",
+            "bb_pred", "runtime_limit_seconds", "memory_limit_mb",
+        }
+        for name in unsupported:
+            if name in rashomon_kwargs:
+                default = sig.parameters[name].default
+                if f[name] != default:
+                    raise ValueError(
+                        f"Nondefault {name} is not supported by majority "
+                        "three-state fitting.")
+        if f["early_stopping"] or not f["rashomon_mode"]:
+            raise ValueError("Majority bounds require deterministic Rashomon mode.")
+        if f["guarantee_rule_list_recovery"]:
+            raise ValueError("Rule-list recovery is not supported.")
+        if parse_greedy_continuous_mode(f["greedy_continuous_mode"]) != "binary":
+            raise ValueError("Only greedy_continuous_mode='binary' is supported.")
+
+        if hasattr(X, "columns"):
+            self.feature_names_in_ = list(X.columns)
+        else:
+            self.feature_names_in_ = [f"f{j}" for j in range(np.asarray(X).shape[1])]
+
+        (X_original, X_bin, X_num, self.binary_feature_specs_,
+         self.continuous_feature_indices_) = _split_binary_and_continuous(
+            X, binary_unique_threshold=f["binary_unique_threshold"])
+        y = np.asarray(y, dtype=np.int32)
+        if y.ndim != 1 or y.size != X_original.shape[0]:
+            raise ValueError("y must have one label per training row.")
+        if np.any(y < 0):
+            raise ValueError("Nonnegative integer labels are required.")
+
+        proxy_settings = _proxy_mode_settings(f["proxy_mode"])
+        X_proxy = _resolve_proxy_matrix(
+            X_original=X_original, y=y, X_proxy=f["X_proxy"],
+            proxy_settings=proxy_settings,
+            proxy_features_n_estimators=f["proxy_features_n_estimators"],
+            proxy_features_max_depth=f["proxy_features_max_depth"],
+            proxy_features_random_state=f["proxy_features_random_state"],
+            proxy_features_column_elimination=f[
+                "proxy_features_column_elimination"],
+        )
+        X_initial = (
+            np.empty((len(y), 0), dtype=np.uint8)
+            if f["X_initial"] is None
+            else _optional_binary_matrix(f["X_initial"], len(y), "X_initial")
+        )
+
+        self.root_n_ = len(y)
+        self.n_features_in_ = X_original.shape[1]
+        self.lambda_reg_ = float(f["lambda_reg"])
+        self.depth_budget_ = int(f["depth_budget"])
+        self.rashomon_mult_ = float(f["rashomon_mult"])
+        self.lookahead_k_ = int(f["lookahead_k"])
+        self.multiplicative_slack_ = float(f["multiplicative_slack"])
+        self.gamma_ = int(round(float(f["lambda_reg"]) *
+                                round(float(subsample_fraction) * len(y))))
+        self.eta_defer_ = 0.0
+        self._model.set_additive(bool(f["additive"]))
+        self.prepare_continuous_data(
+            X_num=X_num, y=y, X_bin=X_bin,
+            X_initial_active=X_initial, X_proxy_active=X_proxy,
+            max_number_thresholds_per_feature=f[
+                "max_number_thresholds_per_feature"],
+        )
+
+        self._model.fit_prepared_majority_graph(
+            lambda_reg=float(f["lambda_reg"]),
+            depth_budget=int(f["depth_budget"]),
+            rashomon_mult=float(f["rashomon_mult"]),
+            lookahead_k=int(f["lookahead_k"]),
+            root_budget=_resolve_rid_root_budget(f["root_budget"]),
+            use_multipass=bool(f["use_budget_refinement"]),
+            rule_list_mode=False,
+            oracle_style=int(parse_proxy_style(f["proxy_style"])),
+            majority_leaf_only=bool(f["majority_leaf_only"]),
+            cache_cheap_subproblems=bool(f["cache_early_exits"]),
+            proxy_caching=bool(f["proxy_caching"]),
+            restrict_proxy_in_lickety=bool(proxy_settings["restrict_lickety"]),
+            restrict_proxy_in_depthd_exact=bool(proxy_settings["restrict_depthd"]),
+            restrict_proxy_in_greedy=bool(proxy_settings["restrict_greedy"]),
+            subsample_fraction=float(subsample_fraction),
+            num_subsamples=num_subsamples,
+            majority_threshold=float(majority_threshold),
+            seed=seed,
+            stronger_rollout=bool(f["stronger_rollout"]),
+            multiplicative_slack=float(f["multiplicative_slack"]),
+            key_mode=parse_key_mode(f["key_mode"]),
+            trie_cache_enabled=bool(f["trie_cache_enabled"]),
+            greedy_split_mode=int(parse_heuristic_for_greedy(
+                f["heuristic_for_greedy"])),
+            greedy_continuous_mode="binary",
+        )
+        return self.get_divisive_wald_3state_bounds(
+            X_eval, y_eval, alpha_prime=float(alpha_prime),
+            seed=seed if vi_seed is None else int(vi_seed),
+        )
+
+    def get_divisive_wald_3state_bounds(
+        self,
+        X_eval,
+        y_eval,
+        alpha_prime=0.05,
+        seed=0,
+        budget_override=None,
+    ):
+        return self._get_divisive_wald_structural_bounds(
+            X_eval,
+            y_eval,
+            alpha_prime,
+            seed,
+            budget_override,
+            "get_divisive_wald_3state_bounds",
+        )
+
+
+    def get_divisive_wald_4state_bounds(
+        self,
+        X_eval,
+        y_eval,
+        alpha_prime=0.05,
+        seed=0,
+        budget_override=None,
+    ):
+        return self._get_divisive_wald_structural_bounds(
+            X_eval,
+            y_eval,
+            alpha_prime,
+            seed,
+            budget_override,
+            "get_divisive_wald_4state_bounds",
+        )
+
 
     def get_exact_replacement_divisive_importance_intervals(
         self,

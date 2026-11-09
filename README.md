@@ -68,22 +68,22 @@ standard_model.fit(
     # We recommend "hybrid" for strong approximation quality and speed.
     proxy_mode="hybrid",
 
-    # Accuracy-interpretability trade-off.
+    # Accuracy-interpretability trade-off. A smaller lambda encourages trees to have more leaves.
     lambda_reg=0.005,
 
     # Maximum allowed tree depth.
     depth_budget=5,
 
-    # Rashomon multiplier.
+    # Rashomon multiplier. Find trees with a loss of no more than 1.01 times a reference solution (here, the proxy algorithm, which is the optimal solution if the proxy is optimal)
     rashomon_mult=0.01,
 
-    # Proxy lookahead.
+    # Proxy lookahead. Lookahead 1 corresponds to a form of LicketySPLIT/LicketySNIP; lookahead depth_budget-1 is an optimal decision tree algorithm.
     lookahead_k=1,
 
-    # None considers every available cutpoint.
+    # None considers every available cutpoint. This can be set to a smaller value to only consider that many thresholds per continuous feature.
     max_number_thresholds_per_feature=None,
 
-    # "hash" is memory-efficient; "exact" uses exact bit-vector caching.
+    # How subproblems are cached. "hash" is the recommended memory-efficient fingerprint of the bitvector representation; "exact" uses exact bitvector caching.
     key_mode="hash",
 )
 
@@ -116,7 +116,7 @@ anytime_model.fit(
     X,
     y,
 
-    early_stopping=True,
+    early_stopping=True, # anytime mode
 
     proxy_mode="hybrid",
     lambda_reg=0.005,
@@ -126,7 +126,7 @@ anytime_model.fit(
     max_number_thresholds_per_feature=None,
     key_mode="hash",
 
-    # "on" continually refines the proxy.
+    # "on" continually refines the proxy until it is becomes optimal, even if the lookahead was initially low.
     # "auto" decides whether further refinement is worthwhile.
     proxy_refinement="auto",
 
@@ -153,7 +153,7 @@ print(
 )
 ```
 
-Set `second_rashomon_mult=None` when no multiplier expansion is desired.
+Set `second_rashomon_mult=None` when no multiplier expansion is desired (or remove `second_rashomon_mult` and `multiplier_step_size`).
 
 ## Inspecting and plotting trees
 
@@ -225,8 +225,14 @@ rid_result = rid_model.compute_rid(
     X,
     y,
 
-    # Use False for standard RID construction.
+    # These do not need to be passed, but the Rashomon set on each bootstrap can be done via the anytime algorithm (with resource limits on each bootstrap, run sequentially)
     early_stopping=True,
+    proxy_refinement="auto",
+    second_rashomon_mult=0.03,
+    multiplier_step_size=0.0025,
+    runtime_limit_seconds=600,
+    memory_limit_mb=10000,
+
 
     proxy_mode="hybrid",
     lambda_reg=0.005,
@@ -235,21 +241,11 @@ rid_result = rid_model.compute_rid(
     lookahead_k=1,
     max_number_thresholds_per_feature=None,
 
-    proxy_refinement="auto",
 
-    second_rashomon_mult=0.03,
-    multiplier_step_size=0.0025,
-
-    runtime_limit_seconds=600,
-    memory_limit_mb=10000,
-
-    # Number of bootstrap repetitions.
+    # Number of bootstraps to solve on.
     n_boot=3,
 
-    # Number of feature permutations evaluated per feature.
-    n_scramble_evals=5,
-
-    # Required for pairwise RID plots.
+    # More memory intensive but required to plot joint (usually pairwise) dependencies between variables.
     return_joint_samples=True,
 )
 
@@ -335,7 +331,7 @@ model.fit(
 )
 ```
 
-Using `"hybrid"` or `"binarized"`, a smaller `lookahead_k`, or a threshold cap gives an approximate variant. Hash-based keys are designed to be memory-efficient with virtually no risk of collisions; use `key_mode="exact"` when exact subproblem identity is required.
+Using `"hybrid"` or `"binarized"`, a smaller `lookahead_k`, or a threshold cap gives an approximate variant that runs much faster. Hash-based keys are designed to be memory-efficient with virtually no risk of collisions; use `key_mode="exact"` when exact subproblem identity is required.
 
 ## More Examples
 

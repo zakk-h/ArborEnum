@@ -18,6 +18,8 @@
 #include <tuple>
 #include <utility>
 #include <random>
+#include <functional>
+#include <numeric>
 
 #include <fstream>
 
@@ -2199,8 +2201,264 @@ public:
         return out;
     }
 
-    
 
+    void fit_prepared_majority_graph(
+        double lambda, int8_t depth_budget, double rashomon_mult,
+        int8_t lookahead_k, int root_budget,
+        bool use_multipass_flag, bool rule_list_mode_flag,
+        int proxy_style_in, bool majority_leaf_only_flag,
+        bool cache_cheap_subproblems_flag, bool proxy_caching_flag,
+        bool restrict_proxy_in_lickety_in,
+        bool restrict_proxy_in_depthd_exact_in,
+        bool restrict_proxy_in_greedy_in,
+        double subsample_fraction, int num_subsamples,
+        double vote_fraction, uint64_t seed,
+        bool stronger_rollout_flag = false
+    ) {
+        if (!has_prepared_data) {
+            throw std::runtime_error(
+                "Call prepare_continuous_data before fit_prepared_majority_graph.");
+        }
+        if (use_deferral || rule_list_mode_flag) {
+            throw std::runtime_error(
+                "Majority three-state bounds support ordinary, non-deferring trees only.");
+        }
+        if (greedy_continuous_mode != GreedyContinuousMode::BINARY) {
+            throw std::runtime_error(
+                "Majority graph currently requires greedy_continuous_mode='binary'.");
+        }
+        if (!(subsample_fraction > 0.0 && subsample_fraction <= 1.0) ||
+            !(vote_fraction > 0.0 && vote_fraction <= 1.0) ||
+            num_subsamples <= 0 || depth_budget < 0) {
+            throw std::runtime_error("Invalid majority subsample/vote/depth parameters.");
+        }
+        if (root_budget < -1) {
+            throw std::runtime_error("root_budget must be >= -1.");
+        }
+        const int n = static_cast<int>(prepared_y.size());
+        const int F = static_cast<int>(prepared_X_col_major.size());
+        if (n < 2 || F <= 0) {
+            throw std::runtime_error("Majority graph needs at least two rows and a feature.");
+        }
+        const int sample_n = std::max(1, std::min(n,
+            static_cast<int>(std::llround(subsample_fraction * n))));
+        const int required = std::max(1, static_cast<int>(std::ceil(
+            vote_fraction * num_subsamples - 1e-12)));
+
+        clear_fit_state_();
+        n_samples = n;
+        n_features = F;
+        n_words = (n + 63) / 64;
+        tail_mask = (n % 64) ? ((1ULL << (n % 64)) - 1ULL) : ~0ULL;
+        gamma = static_cast<int>(std::llround(lambda * sample_n));
+        trained_depth_budget = depth_budget;
+        continuous_starts = prepared_continuous_starts;
+        y_train = prepared_y;
+        for (int label : prepared_y) {
+            if (label < 0) throw std::runtime_error("Negative label.");
+            num_classes = std::max(num_classes, label + 1);
+        }
+        X_bits.assign(static_cast<size_t>(F), Packed(static_cast<size_t>(n_words)));
+        for (int f = 0; f < F; ++f) {
+            if (static_cast<int>(prepared_X_col_major[f].size()) != n)
+                throw std::runtime_error("Prepared training columns are inconsistent.");
+            for (int row = 0; row < n; ++row) {
+                if (prepared_X_col_major[f][row]) {
+                    X_bits[f].w[static_cast<size_t>(row >> 6)] |=
+                        1ULL << (row & 63);
+                }
+            }
+        }
+        const Packed full = [&]() {
+            Packed mask(static_cast<size_t>(n_words));
+            std::fill(mask.w.begin(), mask.w.end(), ~0ULL);
+            mask.w.back() &= tail_mask;
+            return mask;
+        }();
+
+        struct NodeKey {
+            uint64_t hash;
+            int depth;
+            bool operator==(const NodeKey& o) const noexcept {
+                return hash == o.hash && depth == o.depth;
+            }
+        };
+        struct NodeKeyHash {
+            size_t operator()(const NodeKey& k) const noexcept {
+                return static_cast<size_t>(mix64(k.hash ^ mix64(
+                    static_cast<uint64_t>(k.depth))));
+            }
+        };
+        struct LeafVote {
+            int count = 0, last_seen = -1;
+            int min_loss = std::numeric_limits<int>::max();
+            bool dead = false;
+        };
+        struct SplitVote {
+            int count = 0, last_seen = -1;
+            int left = -1, right = -1;
+            bool dead = false;
+        };
+        struct MergeNode {
+            std::unordered_map<int, LeafVote> leaves;
+            std::unordered_map<int, SplitVote> splits;
+        };
+        std::vector<MergeNode> merged;
+        std::unordered_map<NodeKey, int, NodeKeyHash> ids;
+        auto intern = [&](const Packed& mask, int depth) -> int {
+            const NodeKey key{hash_mask64(
+                mask.w.data(), n_words, tail_mask), depth};
+            auto it = ids.find(key);
+            if (it != ids.end()) return it->second;
+            const int id = static_cast<int>(merged.size());
+            ids.emplace(key, id);
+            merged.emplace_back();
+            return id;
+        };
+        const int root_id = intern(full, depth_budget);
+        std::vector<int> order(static_cast<size_t>(n));
+        std::iota(order.begin(), order.end(), 0);
+        std::mt19937_64 rng(seed);
+        int common_budget = root_budget;
+
+        struct VisitKey {
+            const TreeTrieNode* src;
+            int dst;
+            bool operator==(const VisitKey& o) const noexcept {
+                return src == o.src && dst == o.dst;
+            }
+        };
+        struct VisitHash {
+            size_t operator()(const VisitKey& k) const noexcept {
+                return static_cast<size_t>(mix64(
+                    static_cast<uint64_t>(reinterpret_cast<uintptr_t>(k.src)) ^
+                    mix64(static_cast<uint64_t>(k.dst))));
+            }
+        };
+
+        for (int rep = 0; rep < num_subsamples; ++rep) {
+            std::shuffle(order.begin(), order.end(), rng);
+            std::vector<int> selected(order.begin(), order.begin() + sample_n);
+            std::sort(selected.begin(), selected.end());
+            std::vector<std::vector<bool>> compact_X(
+                static_cast<size_t>(F), std::vector<bool>(static_cast<size_t>(sample_n)));
+            std::vector<int> compact_y(static_cast<size_t>(sample_n));
+            for (int j = 0; j < sample_n; ++j) {
+                const int row = selected[j];
+                compact_y[j] = prepared_y[row];
+                for (int f = 0; f < F; ++f)
+                    compact_X[f][j] = prepared_X_col_major[f][row];
+            }
+
+            ArborEnum sample;
+            sample.set_key_mode(key_mode);
+            sample.set_trie_cache_enabled(trie_cache_enabled);
+            sample.set_multiplicative_slack(multiplicative_slack);
+            sample.set_additive(additive);
+            sample.set_greedy_split_mode(greedy_split_mode);
+            sample.set_proxy_caching_enabled(proxy_caching_flag);
+            sample.set_stronger_rollout(stronger_rollout_flag);
+            sample.fit(
+                compact_X, compact_y, lambda, depth_budget,
+                rashomon_mult, lookahead_k, common_budget,
+                use_multipass_flag, rule_list_mode_flag, proxy_style_in,
+                majority_leaf_only_flag, cache_cheap_subproblems_flag,
+                proxy_caching_flag, prepared_allowed_proxy_features,
+                restrict_proxy_in_lickety_in,
+                restrict_proxy_in_depthd_exact_in,
+                restrict_proxy_in_greedy_in, true,
+                prepared_continuous_starts, stronger_rollout_flag);
+            if (!sample.result) {
+                throw std::runtime_error("A subsample fit returned no Rashomon graph.");
+            }
+            if (common_budget < 0) common_budget = sample.result->budget;
+
+            std::unordered_set<VisitKey, VisitHash> seen;
+            auto visit = [&](auto&& self, const TreeTrieNode* src,
+                             const Packed& full_mask, int depth) -> void {
+                if (!src) return;
+                const int dst = intern(full_mask, depth);
+                if (!seen.insert(VisitKey{src, dst}).second) return;
+                for (const LeafNode& leaf : src->leaves) {
+                    auto& a = merged[dst].leaves[leaf.prediction];
+                    if (a.dead) continue;
+                    if (a.last_seen != rep) {
+                        a.last_seen = rep;
+                        ++a.count;
+                    }
+                    a.min_loss = std::min(a.min_loss, leaf.loss);
+                }
+                if (depth == 0) return;
+                for (const SplitNode& split : src->splits) {
+                    if (!split.left || !split.right) continue;
+                    const int f = split.feature;
+                    if (f < 0 || f >= F) throw std::runtime_error("Bad split column.");
+                    Packed left(static_cast<size_t>(n_words));
+                    Packed right(static_cast<size_t>(n_words));
+                    and_words(full_mask.w.data(), X_bits[f].w.data(),
+                        left.w.data(), n_words, tail_mask);
+                    andnot_words(full_mask.w.data(), X_bits[f].w.data(),
+                        right.w.data(), n_words, tail_mask);
+                    const int l = intern(left, depth - 1);
+                    const int r = intern(right, depth - 1);
+                    auto& a = merged[dst].splits[f];
+                    if (a.dead) continue;
+                    if (a.count != 0 && (a.left != l || a.right != r))
+                        throw std::runtime_error("Inconsistent canonical split children.");
+                    a.left = l;
+                    a.right = r;
+                    if (a.last_seen != rep) {
+                        a.last_seen = rep;
+                        ++a.count;
+                    }
+                    self(self, split.left.get(), left, depth - 1);
+                    self(self, split.right.get(), right, depth - 1);
+                }
+            };
+            visit(visit, sample.result.get(), full, depth_budget);
+
+            const int remaining = num_subsamples - rep - 1;
+            for (auto& node : merged) {
+                for (auto& [pred, a] : node.leaves)
+                    if (a.count + remaining < required) a.dead = true;
+                for (auto& [feature, a] : node.splits)
+                    if (a.count + remaining < required) a.dead = true;
+            }
+        }
+
+        const int INF = std::numeric_limits<int>::max();
+        std::vector<std::shared_ptr<TreeTrieNode>> memo(merged.size());
+        std::vector<uint8_t> built(merged.size(), uint8_t{0});
+        auto materialize = [&](auto&& self, int id) -> std::shared_ptr<TreeTrieNode> {
+            if (built[id]) return memo[id];
+            built[id] = 1;
+            auto out = std::make_shared<TreeTrieNode>();
+            out->budget = common_budget;
+            out->min_objective = INF;
+            for (const auto& [pred, a] : merged[id].leaves) {
+                if (a.dead || a.count < required) continue;
+                out->leaves.push_back(LeafNode{pred, a.min_loss});
+                out->min_objective = std::min(out->min_objective, a.min_loss);
+            }
+            for (const auto& [feature, a] : merged[id].splits) {
+                if (a.dead || a.count < required) continue;
+                auto l = self(self, a.left);
+                auto r = self(self, a.right);
+                if (!l || !r) continue;
+                const int64_t cost = static_cast<int64_t>(l->min_objective) +
+                    static_cast<int64_t>(r->min_objective);
+                out->splits.push_back(SplitNode{feature, std::move(l), std::move(r), 0});
+                if (cost < out->min_objective)
+                    out->min_objective = static_cast<int>(cost);
+            }
+            if (out->min_objective == INF) return memo[id] = nullptr;
+            return memo[id] = std::move(out);
+        };
+        result = materialize(materialize, root_id);
+        if (!result) throw std::runtime_error(
+            "No tree survives the majority graph's local voting rules.");
+        obj_bound = common_budget;
+    }
 
     // return the internal feature index at which each continuous group begins
     std::vector<int> get_continuous_starts() const {
@@ -22782,9 +23040,452 @@ private:
         return entry;
     }
 
+    // conservative paired Wald bounds for divisive model reliance across the
+    // entire stored Rashomon graph, without enumerating individual trees.
+    // we use Fmax = min(A+B, 2*m-A-B).
+    // the endpoints returned for each variable are extrema of
+    //   B/A +/- z * sqrt(m/(m-1) * B*Fmax/A^3).
+    // this is a the tighest possible bound without further assumptions (i.e., actually having the covariance)
+    // DP stores one entry (A,B) -> minimum training objective
+    // pruning conditions are weaker than we would like
+    std::vector<ExactImportanceInterval>
+    get_divisive_wald_marginal_bounds_packed_trie(
+        const std::vector<std::vector<uint8_t>>& X_recipient,
+        const std::vector<std::vector<uint8_t>>& X_donor,
+        const std::vector<int>& y_recipient,
+        double z_value,
+        int budget_override = -1,
+        const std::vector<std::vector<int>>& variable_columns_in = {}
+    ) const {
+        if (!result) {
+            throw std::runtime_error("Fit a Rashomon graph before computing Wald bounds.");
+        }
+        if (use_deferral) {
+            throw std::runtime_error("This Wald method currently supports non-deferring trees only.");
+        }
+        if (!std::isfinite(z_value) || z_value < 0.0) {
+            throw std::runtime_error("z_value must be finite and nonnegative.");
+        }
 
+        const EvalCtx original = build_eval_ctx_(X_recipient, n_features);
+        const EvalCtx donor = build_eval_ctx_(X_donor, n_features);
+        const int m = original.n_eval;
+        if (m < 2 || donor.n_eval != m || static_cast<int>(y_recipient.size()) != m) {
+            throw std::runtime_error("Recipient X, donor X, and recipient y must align, with m >= 2.");
+        }
+        const int Q = budget_override >= 0 ? budget_override : result->budget;
+        if (Q > result->budget) {
+            throw std::runtime_error("Requested budget exceeds the fitted graph's root budget.");
+        }
+
+        // binary columns first, then each group of thresholds for a continuous feature
+        std::vector<std::vector<int>> groups = variable_columns_in;
+        if (groups.empty()) {
+            const int first_cont = first_continuous_feature_();
+            for (int f = 0; f < first_cont; ++f) groups.push_back({f});
+            for (int g = 0; g < static_cast<int>(continuous_starts.size()); ++g) {
+                std::vector<int> cols;
+                for (int f = continuous_starts[static_cast<size_t>(g)];
+                     f < continuous_group_end_(g); ++f) cols.push_back(f);
+                groups.push_back(std::move(cols));
+            }
+        }
+        std::vector<int> used(static_cast<size_t>(n_features), 0);
+        for (const auto& group : groups) {
+            if (group.empty()) throw std::runtime_error("Empty variable group.");
+            for (int col : group) {
+                if (col < 0 || col >= n_features || ++used[static_cast<size_t>(col)] != 1) {
+                    throw std::runtime_error("Variable groups must be disjoint and in range.");
+                }
+            }
+        }
+        for (int count : used) {
+            if (count != 1) throw std::runtime_error("Variable groups must cover every internal feature.");
+        }
+
+        const auto labels = build_eval_y_bits_(
+            y_recipient, num_classes, original.n_words, original.tail_mask);
+        const Packed full = eval_root_mask_(original.n_words, original.tail_mask);
+        const uint64_t stride = static_cast<uint64_t>(m) + 1ULL;
+        using Table = std::unordered_map<uint64_t, int>;  // (A,B) -> min objective
+
+        auto pack_counts = [stride](int A, int B) -> uint64_t {
+            return static_cast<uint64_t>(A) * stride + static_cast<uint64_t>(B);
+        };
+        auto insert_min = [&](Table& table, int A, int B, int q) {
+            if (q > Q) return;
+            const uint64_t key = pack_counts(A, B);
+            auto it = table.find(key);
+            if (it == table.end()) table.emplace(key, q);
+            else if (q < it->second) it->second = q;
+        };
+
+        auto solve = [&](auto&& self,
+                         const TreeTrieNode* node,
+                         const Packed& maskA,
+                         const Packed& maskB,
+                         const EvalCtx& changed) -> Table {
+            Table out;
+            if (!node || node->min_objective > Q) return out;
+
+            for (const auto& leaf : node->leaves) {
+                if (leaf.loss > Q) continue;
+                const int pred = leaf.prediction;
+                if (pred < 0 || pred >= num_classes) {
+                    throw std::runtime_error("Leaf has an invalid class prediction.");
+                }
+                const int A = count_eval_mask_(maskA, original.n_words)
+                    - popcount_and_eval_(maskA, labels[static_cast<size_t>(pred)], original.n_words);
+                const int B = count_eval_mask_(maskB, original.n_words)
+                    - popcount_and_eval_(maskB, labels[static_cast<size_t>(pred)], original.n_words);
+                insert_min(out, A, B, leaf.loss);
+            }
+
+            for (const auto& split : node->splits) {
+                const TreeTrieNode* left = split.left.get();
+                const TreeTrieNode* right = split.right.get();
+                if (!left || !right) continue;
+                if (left->min_objective == std::numeric_limits<int>::max() ||
+                    right->min_objective == std::numeric_limits<int>::max() ||
+                    static_cast<int64_t>(left->min_objective) + right->min_objective > Q) continue;
+                const int col = split.feature;
+                if (col < 0 || col >= n_features) throw std::runtime_error("Invalid graph split.");
+
+                Packed aL(static_cast<size_t>(original.n_words));
+                Packed aR(static_cast<size_t>(original.n_words));
+                Packed bL(static_cast<size_t>(original.n_words));
+                Packed bR(static_cast<size_t>(original.n_words));
+                and_bits_eval(maskA, original.X_bits_eval[static_cast<size_t>(col)],
+                              aL, original.n_words, original.tail_mask);
+                andnot_bits_eval(maskA, original.X_bits_eval[static_cast<size_t>(col)],
+                                 aR, original.n_words, original.tail_mask);
+                and_bits_eval(maskB, changed.X_bits_eval[static_cast<size_t>(col)],
+                              bL, original.n_words, original.tail_mask);
+                andnot_bits_eval(maskB, changed.X_bits_eval[static_cast<size_t>(col)],
+                                 bR, original.n_words, original.tail_mask);
+
+                Table LT = self(self, left, aL, bL, changed);
+                Table RT = self(self, right, aR, bR, changed);
+                for (const auto& [keyL, qL] : LT) {
+                    const int AL = static_cast<int>(keyL / stride);
+                    const int BL = static_cast<int>(keyL % stride);
+                    for (const auto& [keyR, qR] : RT) {
+                        const int q = qL + qR;
+                        if (q > Q) continue;
+                        const int AR = static_cast<int>(keyR / stride);
+                        const int BR = static_cast<int>(keyR % stride);
+                        insert_min(out, AL + AR, BL + BR, q);
+                    }
+                }
+            }
+            return out;
+        };
+
+        std::vector<ExactImportanceInterval> bounds;
+        bounds.reserve(groups.size());
+        const double prefactor = z_value * std::sqrt(static_cast<double>(m) / (m - 1));
+        for (const auto& group : groups) {
+            EvalCtx changed = original; // copy packed columns, no O(m * p) row matrix
+            for (int col : group) {
+                changed.X_bits_eval[static_cast<size_t>(col)] =
+                    donor.X_bits_eval[static_cast<size_t>(col)];
+            }
+            const Table root = solve(solve, result.get(), full, full, changed);
+            if (root.empty()) throw std::runtime_error("No feasible Rashomon trees at this budget.");
+            double lower = std::numeric_limits<double>::infinity();
+            double upper = -std::numeric_limits<double>::infinity();
+            for (const auto& [key, q] : root) {
+                if (q > Q) continue;
+                const int A = static_cast<int>(key / stride);
+                const int B = static_cast<int>(key % stride);
+                if (A == 0) {
+                    throw std::runtime_error(
+                        "A feasible tree has zero recipient errors: divisive Wald is undefined.");
+                }
+                const int Fmax = std::min(A + B, 2 * m - A - B);
+                const double ratio = static_cast<double>(B) / A;
+                const double halfwidth = prefactor * std::sqrt(
+                    static_cast<double>(B) * Fmax /
+                    (static_cast<double>(A) * A * A));
+                lower = std::min(lower, ratio - halfwidth);
+                upper = std::max(upper, ratio + halfwidth);
+            }
+            bounds.emplace_back(lower, upper);
+        }
+        return bounds;
+    }
+
+    std::vector<ExactImportanceInterval>
+    get_divisive_wald_structural_bounds_packed_trie_(
+        const std::vector<std::vector<uint8_t>>& X_recipient,
+        const std::vector<std::vector<uint8_t>>& X_donor,
+        const std::vector<int>& y_recipient,
+        double z_value,
+        bool track_Q,
+        int budget_override = -1,
+        const std::vector<std::vector<int>>& variable_columns_in = {}
+    ) const {
+        if (!result) {
+            throw std::runtime_error("Fit a Rashomon graph before computing Wald bounds.");
+        }
+        if (use_deferral) {
+            throw std::runtime_error("Structural Wald bounds support non-deferring trees only.");
+        }
+        if (!std::isfinite(z_value) || z_value < 0.0) {
+            throw std::runtime_error("z_value must be finite and nonnegative.");
+        }
+
+        const EvalCtx original = build_eval_ctx_(X_recipient, n_features);
+        const EvalCtx donor    = build_eval_ctx_(X_donor, n_features);
+        const int m = original.n_eval;
+        if (m < 2 || donor.n_eval != m ||
+            static_cast<int>(y_recipient.size()) != m) {
+            throw std::runtime_error("Recipient and donor rows/labels must align (m >= 2).");
+        }
+        if (budget_override < -1) {
+            throw std::runtime_error("budget_override must be >= -1.");
+        }
+        const int budget = budget_override < 0 ? result->budget : budget_override;
+        if (budget > result->budget) {
+            throw std::runtime_error("Requested budget exceeds the fitted graph budget.");
+        }
+
+        std::vector<std::vector<int>> groups = variable_columns_in;
+        if (groups.empty()) {
+            const int first_cont = first_continuous_feature_();
+            for (int f = 0; f < first_cont; ++f) groups.push_back({f});
+            for (int g = 0; g < static_cast<int>(continuous_starts.size()); ++g) {
+                std::vector<int> cols;
+                for (int f = continuous_starts[static_cast<size_t>(g)];
+                    f < continuous_group_end_(g); ++f) {
+                    cols.push_back(f);
+                }
+                groups.push_back(std::move(cols));
+            }
+        }
+        std::vector<int> used(static_cast<size_t>(n_features), 0);
+        for (const auto& group : groups) {
+            if (group.empty()) throw std::runtime_error("Empty variable group.");
+            for (int col : group) {
+                if (col < 0 || col >= n_features ||
+                    ++used[static_cast<size_t>(col)] != 1) {
+                    throw std::runtime_error("Variable groups must be disjoint and in range.");
+                }
+            }
+        }
+        for (int count : used) {
+            if (count != 1) {
+                throw std::runtime_error("Variable groups must cover every internal feature.");
+            }
+        }
+
+        const auto labels = build_eval_y_bits_(
+            y_recipient, num_classes, original.n_words, original.tail_mask);
+        const Packed full = eval_root_mask_(original.n_words, original.tail_mask);
+
+        struct State {
+            int A, B, E, Q;
+            bool operator==(const State& o) const noexcept {
+                return A == o.A && B == o.B && E == o.E && Q == o.Q;
+            }
+        };
+        struct StateHash {
+            size_t operator()(const State& s) const noexcept {
+                uint64_t h = mix64(static_cast<uint64_t>(s.A));
+                h ^= mix64(static_cast<uint64_t>(s.B) + 0x9e3779b97f4a7c15ULL);
+                h ^= mix64(static_cast<uint64_t>(s.E) + 0xbf58476d1ce4e5b9ULL);
+                h ^= mix64(static_cast<uint64_t>(s.Q) + 0x94d049bb133111ebULL);
+                return static_cast<size_t>(h);
+            }
+        };
+        using Table = std::unordered_map<State, int, StateHash>;
+
+        auto insert_min = [budget](Table& dst, State s, int obj) {
+            if (obj > budget) return;
+            auto [it, inserted] = dst.emplace(s, obj);
+            if (!inserted && obj < it->second) it->second = obj;
+        };
+
+        // each subtree is evaluated on its own original and perturbed masks.
+        // a leaf adds original errors (A), perturbed errors (B), same-leaf
+        // jointly-wrong pairs (E), and optionally same-leaf pairs (Q).
+        auto solve = [&](auto&& self, const TreeTrieNode* node,
+                        const Packed& maskA, const Packed& maskB,
+                        const EvalCtx& changed) -> Table {
+            Table out;
+            if (!node || node->min_objective > budget) return out;
+
+            for (const auto& leaf : node->leaves) {
+                if (leaf.loss > budget) continue;
+                const int pred = leaf.prediction;
+                if (pred < 0 || pred >= num_classes) {
+                    throw std::runtime_error("Invalid graph leaf prediction.");
+                }
+                const auto& correct = labels[static_cast<size_t>(pred)].w;
+                State s{0, 0, 0, 0};
+                for (int w = 0; w < original.n_words; ++w) {
+                    const uint64_t a = maskA.w[static_cast<size_t>(w)];
+                    const uint64_t b = maskB.w[static_cast<size_t>(w)];
+                    const uint64_t c = correct[static_cast<size_t>(w)];
+                    const uint64_t both = a & b;
+                    s.A += popcnt64(a & ~c);
+                    s.B += popcnt64(b & ~c);
+                    s.E += popcnt64(both & ~c);
+                    if (track_Q) s.Q += popcnt64(both);
+                }
+                insert_min(out, s, leaf.loss);
+            }
+
+            for (const auto& split : node->splits) {
+                const TreeTrieNode* left = split.left.get();
+                const TreeTrieNode* right = split.right.get();
+                if (!left || !right ||
+                    left->min_objective == std::numeric_limits<int>::max() ||
+                    right->min_objective == std::numeric_limits<int>::max() ||
+                    static_cast<int64_t>(left->min_objective) +
+                        right->min_objective > budget) {
+                    continue;
+                }
+                const int col = split.feature;
+                if (col < 0 || col >= n_features) {
+                    throw std::runtime_error("Invalid graph split feature.");
+                }
+
+                Packed aL(static_cast<size_t>(original.n_words));
+                Packed aR(static_cast<size_t>(original.n_words));
+                Packed bL(static_cast<size_t>(original.n_words));
+                Packed bR(static_cast<size_t>(original.n_words));
+                and_bits_eval(maskA, original.X_bits_eval[static_cast<size_t>(col)],
+                            aL, original.n_words, original.tail_mask);
+                andnot_bits_eval(maskA, original.X_bits_eval[static_cast<size_t>(col)],
+                                aR, original.n_words, original.tail_mask);
+                and_bits_eval(maskB, changed.X_bits_eval[static_cast<size_t>(col)],
+                            bL, original.n_words, original.tail_mask);
+                andnot_bits_eval(maskB, changed.X_bits_eval[static_cast<size_t>(col)],
+                                bR, original.n_words, original.tail_mask);
+
+                Table LT = self(self, left, aL, bL, changed);
+                Table RT = self(self, right, aR, bR, changed);
+                for (const auto& [sl, ql] : LT) {
+                    for (const auto& [sr, qr] : RT) {
+                        const int64_t sum_obj = static_cast<int64_t>(ql) + qr;
+                        if (sum_obj > budget) continue;
+                        insert_min(out,
+                            State{sl.A + sr.A, sl.B + sr.B,
+                                sl.E + sr.E, sl.Q + sr.Q},
+                            static_cast<int>(sum_obj));
+                    }
+                }
+            }
+            return out;
+        };
+
+        const double prefactor = z_value *
+            std::sqrt(static_cast<double>(m) / static_cast<double>(m - 1));
+        std::vector<ExactImportanceInterval> bounds;
+        bounds.reserve(groups.size());
+
+        for (const auto& group : groups) {
+            EvalCtx changed = original;
+            for (int col : group) {
+                changed.X_bits_eval[static_cast<size_t>(col)] =
+                    donor.X_bits_eval[static_cast<size_t>(col)];
+            }
+
+            // H: # recipient/donor pairs for which at least one of this
+            // variable's threshold bits differs. Computed once per feature.
+            int H = 0;
+            for (int w = 0; w < original.n_words; ++w) {
+                uint64_t diff = 0;
+                for (int col : group) {
+                    diff |= original.X_bits_eval[static_cast<size_t>(col)]
+                                .w[static_cast<size_t>(w)] ^
+                            donor.X_bits_eval[static_cast<size_t>(col)]
+                                .w[static_cast<size_t>(w)];
+                }
+                if (w == original.n_words - 1) diff &= original.tail_mask;
+                H += popcnt64(diff);
+            }
+
+            const Table root = solve(solve, result.get(), full, full, changed);
+            if (root.empty()) {
+                throw std::runtime_error("No feasible Rashomon trees at this budget.");
+            }
+            double lower = std::numeric_limits<double>::infinity();
+            double upper = -std::numeric_limits<double>::infinity();
+            for (const auto& [s, obj] : root) {
+                if (obj > budget) continue;
+                if (s.A == 0) {
+                    throw std::runtime_error(
+                        "A feasible tree has zero recipient errors: divisive Wald undefined.");
+                }
+                const int Fmax = std::min(s.A + s.B, 2 * m - s.A - s.B);
+                const int F_errors = s.A + s.B - 2 * s.E;
+                const int F_correct =
+                    2 * (track_Q ? (m - s.Q) : H) - s.A - s.B + 2 * s.E;
+                const int Fbound = std::min({Fmax, H, F_errors, F_correct});
+                if (Fbound < 0) {
+                    throw std::runtime_error("Inconsistent structural Wald state.");
+                }
+                const double ratio = static_cast<double>(s.B) / s.A;
+                const double halfwidth = prefactor * std::sqrt(
+                    static_cast<double>(s.B) * Fbound /
+                    (static_cast<double>(s.A) * s.A * s.A));
+                lower = std::min(lower, ratio - halfwidth);
+                upper = std::max(upper, ratio + halfwidth);
+            }
+            bounds.emplace_back(lower, upper);
+        }
+        return bounds;
+    }
 
 public:
+    std::vector<ExactImportanceInterval>
+    get_divisive_wald_3state_bounds(
+        const std::vector<std::vector<uint8_t>>& X_recipient,
+        const std::vector<std::vector<uint8_t>>& X_donor,
+        const std::vector<int>& y_recipient,
+        double z_value,
+        int budget_override = -1,
+        const std::vector<std::vector<int>>& variable_columns = {}
+    ) const {
+        return get_divisive_wald_structural_bounds_packed_trie_(
+            X_recipient, X_donor, y_recipient, z_value,
+            false, budget_override, variable_columns);
+    }
+
+    std::vector<ExactImportanceInterval>
+    get_divisive_wald_4state_bounds(
+        const std::vector<std::vector<uint8_t>>& X_recipient,
+        const std::vector<std::vector<uint8_t>>& X_donor,
+        const std::vector<int>& y_recipient,
+        double z_value,
+        int budget_override = -1,
+        const std::vector<std::vector<int>>& variable_columns = {}
+    ) const {
+        return get_divisive_wald_structural_bounds_packed_trie_(
+            X_recipient, X_donor, y_recipient, z_value,
+            true, budget_override, variable_columns);
+    }
+
+    std::vector<ExactImportanceInterval>
+    get_divisive_wald_marginal_bounds(
+        const std::vector<std::vector<uint8_t>>& X_recipient,
+        const std::vector<std::vector<uint8_t>>& X_donor,
+        const std::vector<int>& y_recipient,
+        double z_value,
+        int budget_override = -1,
+        const std::vector<std::vector<int>>& variable_columns = {}
+    ) const {
+        return get_divisive_wald_marginal_bounds_packed_trie(
+            X_recipient,
+            X_donor,
+            y_recipient,
+            z_value,
+            budget_override,
+            variable_columns
+        );
+    }
 
     uint8_t reachable_prediction_mask_for_training_sample(int sample_idx) const {
         if (!result) {
@@ -23156,7 +23857,7 @@ public:
 
         if (setup.ctx.n_eval <= 0) return {};
 
-        require_exact_importance_eval_is_training_(setup, y_eval);
+        // require_exact_importance_eval_is_training_(setup, y_eval);
 
         if (!result) {
             throw std::runtime_error(
@@ -24290,5 +24991,681 @@ public:
         return out;
     }
 
+
+
+    std::vector<std::pair<double, double>>
+    get_wald_divisive_model_reliance_intervals_graph(
+        const std::vector<std::vector<uint8_t>>& X_row_major,
+        const std::vector<int>& y,
+        const std::vector<std::vector<int>>& variable_columns,
+        double z_value,
+        std::uint64_t seed,
+        int budget_override = -1
+    ) const {
+        struct State {
+            int obj = 0;
+            std::vector<uint64_t> original_errors;
+            std::vector<uint64_t> perturbed_errors;
+        };
+
+        struct CacheKey {
+            const TreeTrieNode* node = nullptr;
+            int budget = 0;
+            std::vector<uint64_t> original_mask;
+            std::vector<uint64_t> perturbed_mask;
+
+            bool operator==(const CacheKey& other) const {
+                return node == other.node &&
+                    budget == other.budget &&
+                    original_mask == other.original_mask &&
+                    perturbed_mask == other.perturbed_mask;
+            }
+        };
+
+        struct CacheKeyHash {
+            std::size_t operator()(const CacheKey& key) const noexcept {
+                std::size_t h = reinterpret_cast<std::size_t>(key.node);
+                h ^= static_cast<std::size_t>(key.budget) +
+                    0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+
+                for (uint64_t x : key.original_mask) {
+                    h ^= static_cast<std::size_t>(mix64(x)) +
+                        0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+                }
+
+                h ^= 0xbf58476d1ce4e5b9ULL + (h << 6) + (h >> 2);
+
+                for (uint64_t x : key.perturbed_mask) {
+                    h ^= static_cast<std::size_t>(mix64(x)) +
+                        0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+                }
+
+                return h;
+            }
+        };
+
+        struct ErrorPairKey {
+            std::vector<uint64_t> original_errors;
+            std::vector<uint64_t> perturbed_errors;
+
+            bool operator==(const ErrorPairKey& other) const {
+                return original_errors == other.original_errors &&
+                    perturbed_errors == other.perturbed_errors;
+            }
+        };
+
+        struct ErrorPairKeyHash {
+            std::size_t operator()(const ErrorPairKey& key) const noexcept {
+                std::size_t h = 0x9e3779b97f4a7c15ULL;
+
+                for (uint64_t x : key.original_errors) {
+                    h ^= static_cast<std::size_t>(mix64(x)) +
+                        0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+                }
+
+                h ^= 0xbf58476d1ce4e5b9ULL + (h << 6) + (h >> 2);
+
+                for (uint64_t x : key.perturbed_errors) {
+                    h ^= static_cast<std::size_t>(mix64(x)) +
+                        0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+                }
+
+                return h;
+            }
+        };
+
+        if (!result) {
+            throw std::runtime_error(
+                "Fit ArborEnum before computing Wald model-reliance intervals."
+            );
+        }
+
+        if (!std::isfinite(z_value) || z_value <= 0.0) {
+            throw std::runtime_error(
+                "z_value must be finite and positive."
+            );
+        }
+
+        const int n = static_cast<int>(X_row_major.size());
+
+        if (n < 4) {
+            throw std::runtime_error(
+                "Wald model-reliance intervals require at least four evaluation rows."
+            );
+        }
+
+        if ((n & 1) != 0) {
+            throw std::runtime_error(
+                "Wald model-reliance intervals require an even number of evaluation rows."
+            );
+        }
+
+        if (static_cast<int>(y.size()) != n) {
+            throw std::runtime_error(
+                "y must have the same number of rows as X."
+            );
+        }
+
+        const int d = static_cast<int>(X_row_major[0].size());
+
+        if (d != this->n_features) {
+            throw std::runtime_error(
+                "X must have the same number of internal features used during fit."
+            );
+        }
+
+        for (const auto& row : X_row_major) {
+            if (static_cast<int>(row.size()) != d) {
+                throw std::runtime_error("X must be rectangular.");
+            }
+        }
+
+        std::vector<int> internal_to_variable(
+            static_cast<std::size_t>(d),
+            -1
+        );
+
+        for (
+            int variable = 0;
+            variable < static_cast<int>(variable_columns.size());
+            ++variable
+        ) {
+            if (variable_columns[static_cast<std::size_t>(variable)].empty()) {
+                throw std::runtime_error(
+                    "variable_columns contains an empty variable block."
+                );
+            }
+
+            for (
+                int feature :
+                variable_columns[static_cast<std::size_t>(variable)]
+            ) {
+                if (feature < 0 || feature >= d) {
+                    throw std::runtime_error(
+                        "variable_columns contains an out-of-range internal feature."
+                    );
+                }
+
+                if (
+                    internal_to_variable[static_cast<std::size_t>(feature)] !=
+                    -1
+                ) {
+                    throw std::runtime_error(
+                        "An internal feature appears in more than one variable block."
+                    );
+                }
+
+                internal_to_variable[static_cast<std::size_t>(feature)] =
+                    variable;
+            }
+        }
+
+        std::vector<int> permutation(static_cast<std::size_t>(n));
+        std::iota(permutation.begin(), permutation.end(), 0);
+
+        std::mt19937_64 rng(seed);
+        std::shuffle(permutation.begin(), permutation.end(), rng);
+
+        const int m = n / 2;
+        const int n_words = (m + 63) / 64;
+        const int tail_bits = m & 63;
+        const uint64_t local_tail_mask =
+            tail_bits == 0
+                ? ~0ULL
+                : ((1ULL << tail_bits) - 1ULL);
+
+        std::vector<std::vector<uint64_t>> original_feature_bits(
+            static_cast<std::size_t>(d),
+            std::vector<uint64_t>(
+                static_cast<std::size_t>(n_words),
+                0ULL
+            )
+        );
+
+        std::vector<std::vector<uint64_t>> donor_feature_bits(
+            static_cast<std::size_t>(d),
+            std::vector<uint64_t>(
+                static_cast<std::size_t>(n_words),
+                0ULL
+            )
+        );
+
+        int max_class = -1;
+
+        for (int yi : y) {
+            if (yi < 0) {
+                throw std::runtime_error(
+                    "y must contain nonnegative class labels."
+                );
+            }
+
+            max_class = std::max(max_class, yi);
+        }
+
+        for (int i = 0; i < m; ++i) {
+            const int recipient =
+                permutation[static_cast<std::size_t>(i)];
+            const int donor =
+                permutation[static_cast<std::size_t>(i + m)];
+            const std::size_t word =
+                static_cast<std::size_t>(i >> 6);
+            const uint64_t bit = 1ULL << (i & 63);
+
+            for (int feature = 0; feature < d; ++feature) {
+                if (
+                    X_row_major[static_cast<std::size_t>(recipient)]
+                               [static_cast<std::size_t>(feature)] != 0
+                ) {
+                    original_feature_bits[
+                        static_cast<std::size_t>(feature)
+                    ][word] |= bit;
+                }
+
+                if (
+                    X_row_major[static_cast<std::size_t>(donor)]
+                               [static_cast<std::size_t>(feature)] != 0
+                ) {
+                    donor_feature_bits[
+                        static_cast<std::size_t>(feature)
+                    ][word] |= bit;
+                }
+            }
+        }
+
+        if (max_class < 0) {
+            throw std::runtime_error(
+                "y contains no valid class labels."
+            );
+        }
+
+        std::vector<std::vector<uint64_t>> wrong_bits(
+            static_cast<std::size_t>(max_class + 1),
+            std::vector<uint64_t>(
+                static_cast<std::size_t>(n_words),
+                0ULL
+            )
+        );
+
+        for (int i = 0; i < m; ++i) {
+            const int recipient =
+                permutation[static_cast<std::size_t>(i)];
+            const int yi = y[static_cast<std::size_t>(recipient)];
+            const std::size_t word =
+                static_cast<std::size_t>(i >> 6);
+            const uint64_t bit = 1ULL << (i & 63);
+
+            for (int c = 0; c <= max_class; ++c) {
+                if (c != yi) {
+                    wrong_bits[static_cast<std::size_t>(c)][word] |= bit;
+                }
+            }
+        }
+
+        std::vector<uint64_t> root_mask(
+            static_cast<std::size_t>(n_words),
+            ~0ULL
+        );
+        root_mask.back() &= local_tail_mask;
+
+        const int root_budget =
+            budget_override >= 0
+                ? budget_override
+                : result->budget;
+
+        if (root_budget > result->budget) {
+            throw std::runtime_error(
+                "budget_override cannot exceed the fitted Rashomon graph budget."
+            );
+        }
+
+        if (root_budget < result->min_objective) {
+            return {};
+        }
+
+        auto popcount = [](const std::vector<uint64_t>& bits) {
+            int total = 0;
+
+            for (uint64_t x : bits) {
+                total += popcnt64(x);
+            }
+
+            return total;
+        };
+
+        auto xor_popcount = [](
+            const std::vector<uint64_t>& a,
+            const std::vector<uint64_t>& b
+        ) {
+            int total = 0;
+
+            for (std::size_t i = 0; i < a.size(); ++i) {
+                total += popcnt64(a[i] ^ b[i]);
+            }
+
+            return total;
+        };
+
+        auto bit_and = [](
+            const std::vector<uint64_t>& a,
+            const std::vector<uint64_t>& b
+        ) {
+            std::vector<uint64_t> out(a.size(), 0ULL);
+
+            for (std::size_t i = 0; i < a.size(); ++i) {
+                out[i] = a[i] & b[i];
+            }
+
+            return out;
+        };
+
+        auto bit_andnot = [local_tail_mask](
+            const std::vector<uint64_t>& a,
+            const std::vector<uint64_t>& b
+        ) {
+            std::vector<uint64_t> out(a.size(), 0ULL);
+
+            for (std::size_t i = 0; i < a.size(); ++i) {
+                out[i] = a[i] & ~b[i];
+            }
+
+            if (!out.empty()) {
+                out.back() &= local_tail_mask;
+            }
+
+            return out;
+        };
+
+        auto bit_or = [](
+            const std::vector<uint64_t>& a,
+            const std::vector<uint64_t>& b
+        ) {
+            std::vector<uint64_t> out(a.size(), 0ULL);
+
+            for (std::size_t i = 0; i < a.size(); ++i) {
+                out[i] = a[i] | b[i];
+            }
+
+            return out;
+        };
+
+        auto insert_state = [](
+            std::unordered_map<ErrorPairKey, int, ErrorPairKeyHash>& states,
+            State state
+        ) {
+            ErrorPairKey key{
+                std::move(state.original_errors),
+                std::move(state.perturbed_errors)
+            };
+
+            auto it = states.find(key);
+
+            if (it == states.end()) {
+                states.emplace(std::move(key), state.obj);
+            } else if (state.obj < it->second) {
+                it->second = state.obj;
+            }
+        };
+
+        std::vector<std::pair<double, double>> out(
+            variable_columns.size(),
+            {1.0, 1.0}
+        );
+
+        for (
+            int variable = 0;
+            variable < static_cast<int>(variable_columns.size());
+            ++variable
+        ) {
+            using StateVector = std::vector<State>;
+            // using Cache = std::unordered_map<
+            //     CacheKey,
+            //     std::shared_ptr<StateVector>,
+            //     CacheKeyHash
+            // >;
+
+            // Cache cache;
+            // cache.reserve(1024);
+
+            std::function<std::shared_ptr<StateVector>(
+                const TreeTrieNode*,
+                int,
+                const std::vector<uint64_t>&,
+                const std::vector<uint64_t>&
+            )> solve;
+
+            solve = [
+                &
+            ](
+                const TreeTrieNode* node,
+                int budget,
+                const std::vector<uint64_t>& original_mask,
+                const std::vector<uint64_t>& perturbed_mask
+            ) -> std::shared_ptr<StateVector> {
+                if (
+                    !node ||
+                    budget < 0 ||
+                    node->min_objective > budget
+                ) {
+                    return std::make_shared<StateVector>();
+                }
+
+                const int effective_budget =
+                    std::min(budget, node->budget);
+
+                // CacheKey cache_key{
+                //     node,
+                //     effective_budget,
+                //     original_mask,
+                //     perturbed_mask
+                // };
+
+                // auto cached = cache.find(cache_key);
+
+                // if (cached != cache.end()) {
+                //     return cached->second;
+                // }
+
+                std::unordered_map<ErrorPairKey, int, ErrorPairKeyHash> unique_states;
+
+                for (const auto& leaf : node->leaves) {
+                    if (leaf.loss > effective_budget) {
+                        continue;
+                    }
+
+                    if (leaf.prediction < 0) {
+                        throw std::runtime_error(
+                            "Wald model-reliance intervals do not support deferred leaf predictions."
+                        );
+                    }
+
+                    const std::vector<uint64_t>* wrong = nullptr;
+
+                    if (leaf.prediction <= max_class) {
+                        wrong = &wrong_bits[
+                            static_cast<std::size_t>(leaf.prediction)
+                        ];
+                    } else {
+                        wrong = &root_mask;
+                    }
+
+                    State state;
+                    state.obj = leaf.loss;
+                    state.original_errors = bit_and(
+                        original_mask,
+                        *wrong
+                    );
+                    state.perturbed_errors = bit_and(
+                        perturbed_mask,
+                        *wrong
+                    );
+
+                    insert_state(
+                        unique_states,
+                        std::move(state)
+                    );
+                }
+
+                for (const auto& split : node->splits) {
+                    if (!split.left || !split.right) {
+                        continue;
+                    }
+
+                    const int feature = split.feature;
+
+                    if (feature < 0 || feature >= d) {
+                        throw std::runtime_error(
+                            "Rashomon graph contains an out-of-range split feature."
+                        );
+                    }
+
+                    const auto& original_split_bits =
+                        original_feature_bits[
+                            static_cast<std::size_t>(feature)
+                        ];
+
+                    const auto& perturbed_split_bits =
+                        internal_to_variable[
+                            static_cast<std::size_t>(feature)
+                        ] == variable
+                            ? donor_feature_bits[
+                                static_cast<std::size_t>(feature)
+                            ]
+                            : original_split_bits;
+
+                    auto original_left = bit_and(
+                        original_mask,
+                        original_split_bits
+                    );
+
+                    auto original_right = bit_andnot(
+                        original_mask,
+                        original_split_bits
+                    );
+
+                    auto perturbed_left = bit_and(
+                        perturbed_mask,
+                        perturbed_split_bits
+                    );
+
+                    auto perturbed_right = bit_andnot(
+                        perturbed_mask,
+                        perturbed_split_bits
+                    );
+
+                    const int left_budget = std::min(
+                        split.left->budget,
+                        effective_budget - split.right->min_objective
+                    );
+
+                    const int right_budget = std::min(
+                        split.right->budget,
+                        effective_budget - split.left->min_objective
+                    );
+
+                    if (
+                        left_budget < split.left->min_objective ||
+                        right_budget < split.right->min_objective
+                    ) {
+                        continue;
+                    }
+
+                    auto left_states = solve(
+                        split.left.get(),
+                        left_budget,
+                        original_left,
+                        perturbed_left
+                    );
+
+                    auto right_states = solve(
+                        split.right.get(),
+                        right_budget,
+                        original_right,
+                        perturbed_right
+                    );
+
+                    for (const auto& left_state : *left_states) {
+                        if (left_state.obj > effective_budget) {
+                            continue;
+                        }
+
+                        for (const auto& right_state : *right_states) {
+                            const int obj =
+                                left_state.obj + right_state.obj;
+
+                            if (obj > effective_budget) {
+                                continue;
+                            }
+
+                            State state;
+                            state.obj = obj;
+                            state.original_errors = bit_or(
+                                left_state.original_errors,
+                                right_state.original_errors
+                            );
+                            state.perturbed_errors = bit_or(
+                                left_state.perturbed_errors,
+                                right_state.perturbed_errors
+                            );
+
+                            insert_state(
+                                unique_states,
+                                std::move(state)
+                            );
+                        }
+                    }
+                }
+
+                auto solved = std::make_shared<StateVector>();
+                solved->reserve(unique_states.size());
+
+                while (!unique_states.empty()) {
+                    auto node = unique_states.extract(unique_states.begin());
+
+                    if (node.mapped() <= effective_budget) {
+                        State state;
+                        state.obj = node.mapped();
+
+                        state.original_errors =
+                            std::move(node.key().original_errors);
+
+                        state.perturbed_errors =
+                            std::move(node.key().perturbed_errors);
+
+                        solved->push_back(std::move(state));
+                    }
+                }
+
+                // cache.emplace(std::move(cache_key), solved);
+                return solved;
+            };
+
+            auto root_states = solve(
+                result.get(),
+                root_budget,
+                root_mask,
+                root_mask
+            );
+
+            if (root_states->empty()) {
+                throw std::runtime_error(
+                    "No feasible Rashomon trees remain at the requested budget."
+                );
+            }
+
+            double min_lower =
+                std::numeric_limits<double>::infinity();
+            double max_upper =
+                -std::numeric_limits<double>::infinity();
+
+            for (const auto& state : *root_states) {
+                const int A = popcount(state.original_errors);
+
+                if (A == 0) {
+                    throw std::runtime_error(
+                        "Divisive Wald model reliance is undefined because a feasible tree has zero original evaluation loss."
+                    );
+                }
+
+                const int B = popcount(state.perturbed_errors);
+                const int F = xor_popcount(
+                    state.original_errors,
+                    state.perturbed_errors
+                );
+
+                const double mean_mr =
+                    static_cast<double>(B) /
+                    static_cast<double>(A);
+
+                const double variance =
+                    (static_cast<double>(m) /
+                     static_cast<double>(m - 1)) *
+                    (static_cast<double>(B) *
+                     static_cast<double>(F)) /
+                    (static_cast<double>(A) *
+                     static_cast<double>(A) *
+                     static_cast<double>(A));
+
+                const double half_width =
+                    z_value * std::sqrt(variance);
+
+                min_lower = std::min(
+                    min_lower,
+                    mean_mr - half_width
+                );
+
+                max_upper = std::max(
+                    max_upper,
+                    mean_mr + half_width
+                );
+            }
+
+            out[static_cast<std::size_t>(variable)] = {
+                min_lower,
+                max_upper
+            };
+        }
+
+        return out;
+    }
 
 };

@@ -2171,6 +2171,254 @@ PYBIND11_MODULE(_core, m) {
         )
 
         .def(
+            "get_divisive_wald_marginal_bounds",
+            [](const ArborEnum& self,
+            py::array_t<
+                uint8_t,
+                py::array::c_style | py::array::forcecast
+            > X_recipient,
+            py::array_t<
+                uint8_t,
+                py::array::c_style | py::array::forcecast
+            > X_donor,
+            py::array_t<
+                int,
+                py::array::c_style | py::array::forcecast
+            > y_recipient,
+            double z_value,
+            int budget_override,
+            const std::vector<std::vector<int>>& variable_columns) {
+
+                auto recipient_vec =
+                    numpy_uint8_2d_to_row_major(
+                        X_recipient, "X_recipient");
+
+                auto donor_vec =
+                    numpy_uint8_2d_to_row_major(
+                        X_donor, "X_donor");
+
+                auto y_vec =
+                    numpy_int_1d_to_vector(
+                        y_recipient, "y_recipient");
+
+                return self.get_divisive_wald_marginal_bounds(
+                    recipient_vec,
+                    donor_vec,
+                    y_vec,
+                    z_value,
+                    budget_override,
+                    variable_columns
+                );
+            },
+            py::arg("X_recipient"),
+            py::arg("X_donor"),
+            py::arg("y_recipient"),
+            py::arg("z_value"),
+            py::arg("budget_override") = -1,
+            py::arg("variable_columns") =
+                std::vector<std::vector<int>>{}
+        )
+
+        .def(
+            "fit_prepared_majority_graph",
+            [](ArborEnum& self,
+               double lambda_reg, int depth_budget, double rashomon_mult,
+               int lookahead_k, int root_budget,
+               bool use_multipass, bool rule_list_mode, int oracle_style,
+               bool majority_leaf_only, bool cache_cheap_subproblems,
+               bool proxy_caching, bool restrict_proxy_in_lickety,
+               bool restrict_proxy_in_depthd_exact,
+               bool restrict_proxy_in_greedy,
+               double subsample_fraction, int num_subsamples,
+               double majority_threshold, uint64_t seed,
+               bool stronger_rollout,
+               double multiplicative_slack, std::string key_mode_str,
+               bool trie_cache_enabled, int greedy_split_mode,
+               std::string greedy_continuous_mode) {
+                self.set_multiplicative_slack(multiplicative_slack);
+                self.set_key_mode(parse_key_mode(key_mode_str));
+                self.set_trie_cache_enabled(trie_cache_enabled);
+                self.set_greedy_split_mode(greedy_split_mode);
+                self.set_greedy_continuous_mode(
+                    parse_greedy_continuous_mode(greedy_continuous_mode));
+                self.fit_prepared_majority_graph(
+                    lambda_reg, static_cast<int8_t>(depth_budget),
+                    rashomon_mult, static_cast<int8_t>(lookahead_k),
+                    root_budget, use_multipass, rule_list_mode,
+                    oracle_style, majority_leaf_only,
+                    cache_cheap_subproblems, proxy_caching,
+                    restrict_proxy_in_lickety,
+                    restrict_proxy_in_depthd_exact,
+                    restrict_proxy_in_greedy,
+                    subsample_fraction, num_subsamples,
+                    majority_threshold, seed, stronger_rollout);
+            },
+            py::arg("lambda_reg") = 0.01,
+            py::arg("depth_budget") = 5,
+            py::arg("rashomon_mult") = 0.01,
+            py::arg("lookahead_k") = 1,
+            py::arg("root_budget") = -1,
+            py::arg("use_multipass") = true,
+            py::arg("rule_list_mode") = false,
+            py::arg("oracle_style") = 0,
+            py::arg("majority_leaf_only") = false,
+            py::arg("cache_cheap_subproblems") = false,
+            py::arg("proxy_caching") = true,
+            py::arg("restrict_proxy_in_lickety") = false,
+            py::arg("restrict_proxy_in_depthd_exact") = false,
+            py::arg("restrict_proxy_in_greedy") = false,
+            py::arg("subsample_fraction") = 0.8,
+            py::arg("num_subsamples") = 100,
+            py::arg("majority_threshold") = 0.8,
+            py::arg("seed") = uint64_t{0},
+            py::arg("stronger_rollout") = false,
+            py::arg("multiplicative_slack") = 0.0,
+            py::arg("key_mode") = "hash",
+            py::arg("trie_cache_enabled") = true,
+            py::arg("greedy_split_mode") = 1,
+            py::arg("greedy_continuous_mode") = "binary"
+        )
+
+        .def(
+            "get_divisive_wald_3state_bounds",
+            [](const ArborEnum& self,
+               py::array_t<
+                   uint8_t,
+                   py::array::c_style | py::array::forcecast
+               > X_recipient,
+               py::array_t<
+                   uint8_t,
+                   py::array::c_style | py::array::forcecast
+               > X_donor,
+               py::array_t<
+                   int,
+                   py::array::c_style | py::array::forcecast
+               > y_recipient,
+               double z_value,
+               int budget_override,
+               const std::vector<std::vector<int>>& variable_columns) {
+
+                auto recipient_vec =
+                    numpy_uint8_2d_to_row_major(
+                        X_recipient, "X_recipient");
+
+                auto donor_vec =
+                    numpy_uint8_2d_to_row_major(
+                        X_donor, "X_donor");
+
+                auto y_vec =
+                    numpy_int_1d_to_vector(
+                        y_recipient, "y_recipient");
+
+                return self.get_divisive_wald_3state_bounds(
+                    recipient_vec,
+                    donor_vec,
+                    y_vec,
+                    z_value,
+                    budget_override,
+                    variable_columns
+                );
+            },
+            py::arg("X_recipient"),
+            py::arg("X_donor"),
+            py::arg("y_recipient"),
+            py::arg("z_value"),
+            py::arg("budget_override") = -1,
+            py::arg("variable_columns") =
+                std::vector<std::vector<int>>{}
+        )
+
+        .def(
+            "get_divisive_wald_4state_bounds",
+            [](const ArborEnum& self,
+               py::array_t<
+                   uint8_t,
+                   py::array::c_style | py::array::forcecast
+               > X_recipient,
+               py::array_t<
+                   uint8_t,
+                   py::array::c_style | py::array::forcecast
+               > X_donor,
+               py::array_t<
+                   int,
+                   py::array::c_style | py::array::forcecast
+               > y_recipient,
+               double z_value,
+               int budget_override,
+               const std::vector<std::vector<int>>& variable_columns) {
+
+                auto recipient_vec =
+                    numpy_uint8_2d_to_row_major(
+                        X_recipient, "X_recipient");
+
+                auto donor_vec =
+                    numpy_uint8_2d_to_row_major(
+                        X_donor, "X_donor");
+
+                auto y_vec =
+                    numpy_int_1d_to_vector(
+                        y_recipient, "y_recipient");
+
+                return self.get_divisive_wald_4state_bounds(
+                    recipient_vec,
+                    donor_vec,
+                    y_vec,
+                    z_value,
+                    budget_override,
+                    variable_columns
+                );
+            },
+            py::arg("X_recipient"),
+            py::arg("X_donor"),
+            py::arg("y_recipient"),
+            py::arg("z_value"),
+            py::arg("budget_override") = -1,
+            py::arg("variable_columns") =
+                std::vector<std::vector<int>>{}
+        )
+
+
+        .def(
+            "get_wald_divisive_model_reliance_intervals_graph",
+            [](const ArborEnum& self,
+               py::array_t<
+                   uint8_t,
+                   py::array::c_style | py::array::forcecast
+               > X_eval,
+               py::array_t<
+                   int,
+                   py::array::c_style | py::array::forcecast
+               > y_eval,
+               const std::vector<std::vector<int>>& variable_columns,
+               double z_value,
+               std::uint64_t seed,
+               int budget_override) {
+
+                auto X_vec =
+                    numpy_uint8_2d_to_row_major(X_eval, "X_eval");
+
+                auto y_vec =
+                    numpy_int_1d_to_vector(y_eval, "y_eval");
+
+                return self
+                    .get_wald_divisive_model_reliance_intervals_graph(
+                        X_vec,
+                        y_vec,
+                        variable_columns,
+                        z_value,
+                        seed,
+                        budget_override
+                    );
+            },
+            py::arg("X_eval"),
+            py::arg("y_eval"),
+            py::arg("variable_columns"),
+            py::arg("z_value"),
+            py::arg("seed") = 0,
+            py::arg("budget_override") = -1
+        )
+
+        .def(
             "get_exact_replacement_divisive_importance_intervals_cached_frontier_packed_trie",
             [](const ArborEnum& self,
                py::array_t<
