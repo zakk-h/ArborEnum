@@ -5587,3 +5587,6 @@ def rid_plot_all_pairs(
         plt.show()
 
     return fig, axes
+
+from .single_tree import ArborEnumTree
+__all__.append("ArborEnumTree")
