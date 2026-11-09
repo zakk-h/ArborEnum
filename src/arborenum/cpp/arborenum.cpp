@@ -6234,6 +6234,122 @@ private:
         return out;
     }
 
+    int training_prediction_budget_(int sample_idx, int budget) const {
+        if (!result) {
+            throw std::runtime_error("No Rashomon trie has been constructed. Call fit() first.");
+        }
+        if (sample_idx < 0 || sample_idx >= n_samples) {
+            throw std::out_of_range("sample_idx is out of range.");
+        }
+        if (budget < -1 || budget > result->budget) {
+            throw std::invalid_argument("budget must be -1 or between 0 and the fitted Rashomon budget.");
+        }
+        return budget == -1 ? result->budget : budget;
+    }
+
+    template <typename Count>
+    using PredictionHistogram = std::map<std::pair<int, int>, Count>;
+
+    template <typename Count>
+    using PredictionHistogramCache = std::unordered_map<
+        const TreeTrieNode*, std::map<std::pair<int, bool>, PredictionHistogram<Count>>
+    >;
+
+    template <typename Count>
+    const PredictionHistogram<Count>& training_prediction_histogram_(
+        const TreeTrieNode* node,
+        int budget,
+        int sample_idx,
+        bool routed,
+        PredictionHistogramCache<Count>& cache
+    ) const {
+        budget = std::min(budget, node->budget);
+        auto [entry, inserted] = cache[node].try_emplace({budget, routed});
+        auto& hist = entry->second;
+        if (!inserted || node->min_objective > budget) {
+            return hist;
+        }
+
+        for (const auto& leaf : node->leaves) {
+            if (leaf.loss <= budget) {
+                auto& count = hist[{leaf.loss, routed ? leaf.prediction : DEFER_PREDICTION}];
+                count = count + Count(1);
+            }
+        }
+
+        for (const auto& split : node->splits) {
+            const auto* child = split.left.get();
+            const auto* sibling = split.right.get();
+            if (routed && !training_value_(sample_idx, split.feature)) {
+                std::swap(child, sibling);
+            }
+            if (!child || !sibling || child->min_objective > budget ||
+                sibling->min_objective > budget - child->min_objective) {
+                continue;
+            }
+
+            const auto& child_hist = training_prediction_histogram_(
+                child, budget - sibling->min_objective, sample_idx, routed, cache
+            );
+            const auto& sibling_hist = training_prediction_histogram_(
+                sibling, budget - child->min_objective, sample_idx, false, cache
+            );
+            for (const auto& [child_key, child_count] : child_hist) {
+                const auto [objective, prediction] = child_key;
+                for (const auto& [sibling_key, sibling_count] : sibling_hist) {
+                    const int sibling_objective = sibling_key.first;
+                    if (sibling_objective > budget - objective) {
+                        break;
+                    }
+                    auto& count = hist[{objective + sibling_objective, prediction}];
+                    count = count + child_count * sibling_count;
+                }
+            }
+        }
+        return hist;
+    }
+
+    bool training_has_disagreement_(
+        const TreeTrieNode* node,
+        int budget,
+        int sample_idx,
+        int& first_class,
+        std::unordered_map<const TreeTrieNode*, int>& visited
+    ) const {
+        budget = std::min(budget, node->budget);
+        if (node->min_objective > budget) {
+            return false;
+        }
+        auto [entry, inserted] = visited.try_emplace(node, budget);
+        if (!inserted && entry->second >= budget) {
+            return false;
+        }
+        entry->second = budget;
+
+        for (const auto& leaf : node->leaves) {
+            if (leaf.loss > budget || leaf.prediction == DEFER_PREDICTION) {
+                continue;
+            }
+            if (first_class != DEFER_PREDICTION && leaf.prediction != first_class) {
+                return true;
+            }
+            first_class = leaf.prediction;
+        }
+
+        for (const auto& split : node->splits) {
+            const bool go_left = training_value_(sample_idx, split.feature);
+            const auto* child = (go_left ? split.left : split.right).get();
+            const auto* sibling = (go_left ? split.right : split.left).get();
+            if (child && sibling && sibling->min_objective <= budget &&
+                training_has_disagreement_(
+                    child, budget - sibling->min_objective, sample_idx, first_class, visited
+                )) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     bool training_value_(int sample_idx, int feat) const {
         if (sample_idx < 0 || sample_idx >= n_samples) {
             throw std::runtime_error("training_value_ got out-of-range sample index.");
@@ -23527,6 +23643,29 @@ public:
             result,
             sample_idx
         );
+    }
+
+    template <typename Count>
+    std::vector<Count> prediction_counts(int sample_idx, int budget = -1) const {
+        budget = training_prediction_budget_(sample_idx, budget);
+        PredictionHistogramCache<Count> cache;
+        const auto& hist = training_prediction_histogram_(
+            result.get(), budget, sample_idx, true, cache
+        );
+        std::vector<Count> counts(static_cast<std::size_t>(num_classes) + 1);
+        for (const auto& [key, count] : hist) {
+            const int prediction = key.second;
+            const int index = prediction == DEFER_PREDICTION ? num_classes : prediction;
+            counts[index] = counts[index] + count;
+        }
+        return counts;
+    }
+
+    bool has_disagreement(int sample_idx, int budget = -1) const {
+        budget = training_prediction_budget_(sample_idx, budget);
+        int first_class = DEFER_PREDICTION;
+        std::unordered_map<const TreeTrieNode*, int> visited;
+        return training_has_disagreement_(result.get(), budget, sample_idx, first_class, visited);
     }
 
     bool training_sample_has_multiple_reachable_predictions(

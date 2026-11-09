@@ -2476,6 +2476,28 @@ PYBIND11_MODULE(_core, m) {
         )
 
         .def(
+            "prediction_counts",
+            [](const ArborEnum& self, int sample_idx, int budget) {
+                const auto counts = self.prediction_counts<py::int_>(sample_idx, budget);
+                py::dict out;
+                for (std::size_t c = 0; c + 1 < counts.size(); ++c) {
+                    out[py::int_(c)] = counts[c];
+                }
+                if (!counts.back().equal(py::int_(0))) {
+                    out[py::int_(DEFER_PREDICTION)] = counts.back();
+                }
+                return out;
+            },
+            py::arg("sample_idx"),
+            py::arg("budget") = -1
+        )
+        .def(
+            "has_disagreement",
+            &ArborEnum::has_disagreement,
+            py::arg("sample_idx"),
+            py::arg("budget") = -1
+        )
+        .def(
             "training_samples_with_multiple_reachable_predictions",
             [](const ArborEnum &self) {
                 return self.training_samples_with_multiple_reachable_predictions();
