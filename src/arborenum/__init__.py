@@ -2402,6 +2402,18 @@ class ArborEnum:
         return intervals
 
 
+    def permutation_importance_bounds(self, X_eval, y_eval, *, budget_override=None):
+        import pandas as pd
+
+        bounds = self.get_exact_replacement_importance_intervals(
+            X_eval, y_eval, budget_override=budget_override
+        )
+        return pd.DataFrame(
+            bounds,
+            index=pd.Index(self.feature_names_in_, name="feature", tupleize_cols=False),
+            columns=["min_importance", "max_importance"],
+        )
+
     def get_wald_divisive_model_reliance_intervals(
         self,
         X_eval,
@@ -3954,11 +3966,33 @@ class ArborEnum:
             )
         )
 
-    def prediction_counts(self, sample_idx, budget=None):
-        return self._model.prediction_counts(sample_idx, -1 if budget is None else budget)
+    def _prediction_query(self, training_query, eval_query, sample_idx, budget, X):
+        budget = -1 if budget is None else budget
+        if X is None:
+            if sample_idx is None:
+                raise TypeError("Pass sample_idx or X.")
+            return training_query(sample_idx, budget)
+        if sample_idx is not None:
+            raise TypeError("Pass either sample_idx or X, not both.")
 
-    def has_disagreement(self, sample_idx, budget=None):
-        return self._model.has_disagreement(sample_idx, -1 if budget is None else budget)
+        X = np.asarray(X)
+        single_row = X.ndim == 1
+        if single_row:
+            X = X[None, :]
+        results = eval_query(self.transform(X), budget)
+        return results[0] if single_row else results
+
+    def prediction_counts(self, sample_idx=None, budget=None, *, X=None):
+        return self._prediction_query(
+            self._model.prediction_counts, self._model.prediction_counts_for_rows,
+            sample_idx, budget, X
+        )
+
+    def has_disagreement(self, sample_idx=None, budget=None, *, X=None):
+        return self._prediction_query(
+            self._model.has_disagreement, self._model.has_disagreement_for_rows,
+            sample_idx, budget, X
+        )
 
     def training_sample_has_multiple_reachable_predictions(self, sample_idx: int):
         return self._model.training_sample_has_multiple_reachable_predictions(int(sample_idx))

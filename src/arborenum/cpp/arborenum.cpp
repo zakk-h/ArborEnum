@@ -6234,12 +6234,9 @@ private:
         return out;
     }
 
-    int training_prediction_budget_(int sample_idx, int budget) const {
+    int prediction_budget_(int budget) const {
         if (!result) {
             throw std::runtime_error("No Rashomon trie has been constructed. Call fit() first.");
-        }
-        if (sample_idx < 0 || sample_idx >= n_samples) {
-            throw std::out_of_range("sample_idx is out of range.");
         }
         if (budget < -1 || budget > result->budget) {
             throw std::invalid_argument("budget must be -1 or between 0 and the fitted Rashomon budget.");
@@ -6255,11 +6252,11 @@ private:
         const TreeTrieNode*, std::map<std::pair<int, bool>, PredictionHistogram<Count>>
     >;
 
-    template <typename Count>
-    const PredictionHistogram<Count>& training_prediction_histogram_(
+    template <typename Count, typename ValueAt>
+    const PredictionHistogram<Count>& prediction_histogram_(
         const TreeTrieNode* node,
         int budget,
-        int sample_idx,
+        const ValueAt& value_at,
         bool routed,
         PredictionHistogramCache<Count>& cache
     ) const {
@@ -6280,7 +6277,7 @@ private:
         for (const auto& split : node->splits) {
             const auto* child = split.left.get();
             const auto* sibling = split.right.get();
-            if (routed && !training_value_(sample_idx, split.feature)) {
+            if (routed && !value_at(split.feature)) {
                 std::swap(child, sibling);
             }
             if (!child || !sibling || child->min_objective > budget ||
@@ -6288,11 +6285,11 @@ private:
                 continue;
             }
 
-            const auto& child_hist = training_prediction_histogram_(
-                child, budget - sibling->min_objective, sample_idx, routed, cache
+            const auto& child_hist = prediction_histogram_(
+                child, budget - sibling->min_objective, value_at, routed, cache
             );
-            const auto& sibling_hist = training_prediction_histogram_(
-                sibling, budget - child->min_objective, sample_idx, false, cache
+            const auto& sibling_hist = prediction_histogram_(
+                sibling, budget - child->min_objective, value_at, false, cache
             );
             for (const auto& [child_key, child_count] : child_hist) {
                 const auto [objective, prediction] = child_key;
@@ -6309,10 +6306,11 @@ private:
         return hist;
     }
 
-    bool training_has_disagreement_(
+    template <typename ValueAt>
+    bool prediction_disagrees_(
         const TreeTrieNode* node,
         int budget,
-        int sample_idx,
+        const ValueAt& value_at,
         int& first_class,
         std::unordered_map<const TreeTrieNode*, int>& visited
     ) const {
@@ -6337,17 +6335,55 @@ private:
         }
 
         for (const auto& split : node->splits) {
-            const bool go_left = training_value_(sample_idx, split.feature);
+            const bool go_left = value_at(split.feature);
             const auto* child = (go_left ? split.left : split.right).get();
             const auto* sibling = (go_left ? split.right : split.left).get();
             if (child && sibling && sibling->min_objective <= budget &&
-                training_has_disagreement_(
-                    child, budget - sibling->min_objective, sample_idx, first_class, visited
+                prediction_disagrees_(
+                    child, budget - sibling->min_objective, value_at, first_class, visited
                 )) {
                 return true;
             }
         }
         return false;
+    }
+
+    template <typename Count, typename ValueAt>
+    std::vector<Count> prediction_counts_(int budget, const ValueAt& value_at) const {
+        PredictionHistogramCache<Count> cache;
+        const auto& hist = prediction_histogram_(
+            result.get(), budget, value_at, true, cache
+        );
+        std::vector<Count> counts(static_cast<std::size_t>(num_classes) + 1);
+        for (const auto& [key, count] : hist) {
+            const int prediction = key.second;
+            const int index = prediction == DEFER_PREDICTION ? num_classes : prediction;
+            counts[index] = counts[index] + count;
+        }
+        return counts;
+    }
+
+    template <typename ValueAt>
+    bool has_disagreement_(int budget, const ValueAt& value_at) const {
+        int first_class = DEFER_PREDICTION;
+        std::unordered_map<const TreeTrieNode*, int> visited;
+        return prediction_disagrees_(result.get(), budget, value_at, first_class, visited);
+    }
+
+    int training_prediction_budget_(int sample_idx, int budget) const {
+        budget = prediction_budget_(budget);
+        if (sample_idx < 0 || sample_idx >= n_samples) {
+            throw std::out_of_range("sample_idx is out of range.");
+        }
+        return budget;
+    }
+
+    int eval_prediction_budget_(std::size_t features, int budget) const {
+        budget = prediction_budget_(budget);
+        if (features != static_cast<std::size_t>(n_features)) {
+            throw std::invalid_argument("X has the wrong number of internal features.");
+        }
+        return budget;
     }
 
     bool training_value_(int sample_idx, int feat) const {
@@ -23648,24 +23684,45 @@ public:
     template <typename Count>
     std::vector<Count> prediction_counts(int sample_idx, int budget = -1) const {
         budget = training_prediction_budget_(sample_idx, budget);
-        PredictionHistogramCache<Count> cache;
-        const auto& hist = training_prediction_histogram_(
-            result.get(), budget, sample_idx, true, cache
-        );
-        std::vector<Count> counts(static_cast<std::size_t>(num_classes) + 1);
-        for (const auto& [key, count] : hist) {
-            const int prediction = key.second;
-            const int index = prediction == DEFER_PREDICTION ? num_classes : prediction;
-            counts[index] = counts[index] + count;
-        }
-        return counts;
+        return prediction_counts_<Count>(budget, [this, sample_idx](int feature) {
+            return training_value_(sample_idx, feature);
+        });
     }
 
     bool has_disagreement(int sample_idx, int budget = -1) const {
         budget = training_prediction_budget_(sample_idx, budget);
-        int first_class = DEFER_PREDICTION;
-        std::unordered_map<const TreeTrieNode*, int> visited;
-        return training_has_disagreement_(result.get(), budget, sample_idx, first_class, visited);
+        return has_disagreement_(budget, [this, sample_idx](int feature) {
+            return training_value_(sample_idx, feature);
+        });
+    }
+
+    template <typename Count>
+    std::vector<std::vector<Count>> prediction_counts_for_rows(
+        const uint8_t* rows, std::size_t samples, std::size_t features, int budget
+    ) const {
+        budget = eval_prediction_budget_(features, budget);
+        std::vector<std::vector<Count>> counts;
+        counts.reserve(samples);
+        for (std::size_t i = 0; i < samples; ++i) {
+            counts.push_back(prediction_counts_<Count>(budget, [rows, i, features](int feature) {
+                return rows[i * features + feature] != 0;
+            }));
+        }
+        return counts;
+    }
+
+    std::vector<bool> has_disagreement_for_rows(
+        const uint8_t* rows, std::size_t samples, std::size_t features, int budget
+    ) const {
+        budget = eval_prediction_budget_(features, budget);
+        std::vector<bool> disagreement;
+        disagreement.reserve(samples);
+        for (std::size_t i = 0; i < samples; ++i) {
+            disagreement.push_back(has_disagreement_(budget, [rows, i, features](int feature) {
+                return rows[i * features + feature] != 0;
+            }));
+        }
+        return disagreement;
     }
 
     bool training_sample_has_multiple_reachable_predictions(

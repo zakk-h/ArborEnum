@@ -8,6 +8,17 @@
 
 namespace py = pybind11;
 
+static py::dict prediction_counts_dict(const std::vector<py::int_>& counts) {
+    py::dict out;
+    for (std::size_t c = 0; c + 1 < counts.size(); ++c) {
+        out[py::int_(c)] = counts[c];
+    }
+    if (!counts.back().equal(py::int_(0))) {
+        out[py::int_(DEFER_PREDICTION)] = counts.back();
+    }
+    return out;
+}
+
 static std::vector<std::vector<double>>
 numpy_double_2d_to_row_major(
     py::array_t<double, py::array::c_style | py::array::forcecast> X,
@@ -2478,15 +2489,7 @@ PYBIND11_MODULE(_core, m) {
         .def(
             "prediction_counts",
             [](const ArborEnum& self, int sample_idx, int budget) {
-                const auto counts = self.prediction_counts<py::int_>(sample_idx, budget);
-                py::dict out;
-                for (std::size_t c = 0; c + 1 < counts.size(); ++c) {
-                    out[py::int_(c)] = counts[c];
-                }
-                if (!counts.back().equal(py::int_(0))) {
-                    out[py::int_(DEFER_PREDICTION)] = counts.back();
-                }
-                return out;
+                return prediction_counts_dict(self.prediction_counts<py::int_>(sample_idx, budget));
             },
             py::arg("sample_idx"),
             py::arg("budget") = -1
@@ -2495,6 +2498,37 @@ PYBIND11_MODULE(_core, m) {
             "has_disagreement",
             &ArborEnum::has_disagreement,
             py::arg("sample_idx"),
+            py::arg("budget") = -1
+        )
+        .def(
+            "prediction_counts_for_rows",
+            [](const ArborEnum& self,
+               py::array_t<uint8_t, py::array::c_style | py::array::forcecast> X,
+               int budget) {
+                if (X.ndim() != 2) {
+                    throw std::invalid_argument("X must be 2D.");
+                }
+                py::list out;
+                for (const auto& counts : self.prediction_counts_for_rows<py::int_>(
+                         X.data(), X.shape(0), X.shape(1), budget)) {
+                    out.append(prediction_counts_dict(counts));
+                }
+                return out;
+            },
+            py::arg("X"),
+            py::arg("budget") = -1
+        )
+        .def(
+            "has_disagreement_for_rows",
+            [](const ArborEnum& self,
+               py::array_t<uint8_t, py::array::c_style | py::array::forcecast> X,
+               int budget) {
+                if (X.ndim() != 2) {
+                    throw std::invalid_argument("X must be 2D.");
+                }
+                return self.has_disagreement_for_rows(X.data(), X.shape(0), X.shape(1), budget);
+            },
+            py::arg("X"),
             py::arg("budget") = -1
         )
         .def(
