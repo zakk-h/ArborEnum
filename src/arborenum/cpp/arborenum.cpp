@@ -23810,10 +23810,8 @@ public:
                 }
             }
 
-            while (done) {
-                const unsigned bit = static_cast<unsigned>(__builtin_ctzll(done));
-                disagreement[offset + bit] = true;
-                done &= done - 1;
+            for (std::size_t i = 0; i < width; ++i) {
+                disagreement[offset + i] = (done & (uint64_t(1) << i)) != 0;
             }
         }
         return disagreement;
