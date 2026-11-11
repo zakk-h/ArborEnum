@@ -23715,12 +23715,106 @@ public:
         const uint8_t* rows, std::size_t samples, std::size_t features, int budget
     ) const {
         budget = eval_prediction_budget_(features, budget);
-        std::vector<bool> disagreement;
-        disagreement.reserve(samples);
-        for (std::size_t i = 0; i < samples; ++i) {
-            disagreement.push_back(has_disagreement_(budget, [rows, i, features](int feature) {
-                return rows[i * features + feature] != 0;
-            }));
+        std::vector<bool> disagreement(samples, false);
+        if (samples == 0 || num_classes < 2 || !result || result->min_objective > budget) {
+            return disagreement;
+        }
+
+        struct DisagreementState {
+            const TreeTrieNode* node;
+            int budget;
+            uint64_t rows;
+        };
+
+        for (std::size_t offset = 0; offset < samples; offset += 64) {
+            const std::size_t width = std::min<std::size_t>(64, samples - offset);
+            const uint64_t valid = width == 64 ? ~uint64_t(0) : (uint64_t(1) << width) - 1;
+            std::vector<uint64_t> feature_masks(features, 0);
+            for (std::size_t i = 0; i < width; ++i) {
+                const uint8_t* row = rows + (offset + i) * features;
+                const uint64_t bit = uint64_t(1) << i;
+                for (std::size_t f = 0; f < features; ++f) {
+                    if (row[f]) {
+                        feature_masks[f] |= bit;
+                    }
+                }
+            }
+
+            std::vector<uint64_t> seen(static_cast<std::size_t>(num_classes), 0);
+            uint64_t done = 0;
+            std::vector<DisagreementState> stack;
+            stack.push_back({result.get(), budget, valid});
+            std::unordered_map<const TreeTrieNode*, std::vector<std::pair<int, uint64_t>>> visited;
+
+            while (!stack.empty() && done != valid) {
+                const DisagreementState state = stack.back();
+                stack.pop_back();
+                const TreeTrieNode* node = state.node;
+                const int remaining = std::min(state.budget, node->budget);
+                if (node->min_objective > remaining) {
+                    continue;
+                }
+
+                uint64_t active = state.rows & ~done;
+                if (!active) {
+                    continue;
+                }
+
+                auto& previous = visited[node];
+                for (const auto& entry : previous) {
+                    if (entry.first >= remaining) {
+                        active &= ~entry.second;
+                    }
+                }
+                if (!active) {
+                    continue;
+                }
+                previous.push_back({remaining, active});
+
+                for (const auto& leaf : node->leaves) {
+                    if (leaf.loss > remaining || leaf.prediction < 0 || leaf.prediction >= num_classes) {
+                        continue;
+                    }
+                    const std::size_t label = static_cast<std::size_t>(leaf.prediction);
+                    uint64_t others = 0;
+                    for (std::size_t c = 0; c < seen.size(); ++c) {
+                        if (c != label) {
+                            others |= seen[c];
+                        }
+                    }
+                    done |= active & others;
+                    seen[label] |= active;
+                    active &= ~done;
+                    if (!active) {
+                        break;
+                    }
+                }
+                if (!active) {
+                    continue;
+                }
+
+                for (const auto& split : node->splits) {
+                    const TreeTrieNode* left = split.left.get();
+                    const TreeTrieNode* right = split.right.get();
+                    if (!left || !right) {
+                        continue;
+                    }
+                    const uint64_t left_rows = active & feature_masks[static_cast<std::size_t>(split.feature)];
+                    const uint64_t right_rows = active & ~feature_masks[static_cast<std::size_t>(split.feature)];
+                    if (left_rows && right->min_objective <= remaining) {
+                        stack.push_back({left, remaining - right->min_objective, left_rows});
+                    }
+                    if (right_rows && left->min_objective <= remaining) {
+                        stack.push_back({right, remaining - left->min_objective, right_rows});
+                    }
+                }
+            }
+
+            while (done) {
+                const unsigned bit = static_cast<unsigned>(__builtin_ctzll(done));
+                disagreement[offset + bit] = true;
+                done &= done - 1;
+            }
         }
         return disagreement;
     }
