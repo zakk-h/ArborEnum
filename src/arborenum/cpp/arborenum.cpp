@@ -23720,99 +23720,176 @@ public:
             return disagreement;
         }
 
-        struct DisagreementState {
+        const std::size_t words = (samples + 63) / 64;
+        std::vector<uint64_t> feature_masks(features * words, 0);
+        for (std::size_t i = 0; i < samples; ++i) {
+            const uint8_t* row = rows + i * features;
+            const uint64_t bit = uint64_t(1) << (i & 63);
+            const std::size_t word = i >> 6;
+            for (std::size_t feature = 0; feature < features; ++feature) {
+                if (row[feature]) {
+                    feature_masks[feature * words + word] |= bit;
+                }
+            }
+        }
+
+        struct State {
             const TreeTrieNode* node;
             int budget;
-            uint64_t rows;
+            std::vector<uint64_t> rows;
         };
 
-        for (std::size_t offset = 0; offset < samples; offset += 64) {
-            const std::size_t width = std::min<std::size_t>(64, samples - offset);
-            const uint64_t valid = width == 64 ? ~uint64_t(0) : (uint64_t(1) << width) - 1;
-            std::vector<uint64_t> feature_masks(features, 0);
-            for (std::size_t i = 0; i < width; ++i) {
-                const uint8_t* row = rows + (offset + i) * features;
-                const uint64_t bit = uint64_t(1) << i;
-                for (std::size_t f = 0; f < features; ++f) {
-                    if (row[f]) {
-                        feature_masks[f] |= bit;
-                    }
+        std::vector<uint64_t> seen_any(words, 0);
+        std::vector<uint64_t> completed(words, 0);
+        std::vector<std::vector<uint64_t>> seen(
+            static_cast<std::size_t>(num_classes), std::vector<uint64_t>(words, 0)
+        );
+        std::unordered_map<
+            const TreeTrieNode*,
+            std::unordered_map<int, std::vector<uint64_t>>
+        > visited;
+
+        std::vector<uint64_t> initial(words, ~uint64_t(0));
+        if (samples & 63) {
+            initial.back() = (uint64_t(1) << (samples & 63)) - 1;
+        }
+        std::vector<State> stack;
+        stack.push_back({result.get(), budget, std::move(initial)});
+        std::size_t remaining_samples = samples;
+
+        while (!stack.empty() && remaining_samples != 0) {
+            State state = std::move(stack.back());
+            stack.pop_back();
+            const TreeTrieNode* node = state.node;
+            const int remaining = std::min(state.budget, node->budget);
+            if (node->min_objective > remaining) {
+                continue;
+            }
+
+            bool active = false;
+            for (std::size_t w = 0; w < words; ++w) {
+                state.rows[w] &= ~completed[w];
+                active |= state.rows[w] != 0;
+            }
+            if (!active) {
+                continue;
+            }
+
+            auto& budgets = visited[node];
+            for (const auto& entry : budgets) {
+                if (entry.first < remaining) {
+                    continue;
+                }
+                for (std::size_t w = 0; w < words; ++w) {
+                    state.rows[w] &= ~entry.second[w];
                 }
             }
 
-            std::vector<uint64_t> seen(static_cast<std::size_t>(num_classes), 0);
-            uint64_t done = 0;
-            std::vector<DisagreementState> stack;
-            stack.push_back({result.get(), budget, valid});
-            std::unordered_map<const TreeTrieNode*, std::vector<std::pair<int, uint64_t>>> visited;
+            active = false;
+            for (uint64_t mask : state.rows) {
+                active |= mask != 0;
+            }
+            if (!active) {
+                continue;
+            }
 
-            while (!stack.empty() && done != valid) {
-                const DisagreementState state = stack.back();
-                stack.pop_back();
-                const TreeTrieNode* node = state.node;
-                const int remaining = std::min(state.budget, node->budget);
-                if (node->min_objective > remaining) {
+            auto [it, inserted] = budgets.try_emplace(remaining, words, uint64_t(0));
+            for (std::size_t w = 0; w < words; ++w) {
+                it->second[w] |= state.rows[w];
+            }
+
+            for (const auto& leaf : node->leaves) {
+                const int label = leaf.prediction;
+                if (leaf.loss > remaining || label < 0 || label >= num_classes) {
                     continue;
                 }
-
-                uint64_t active = state.rows & ~done;
-                if (!active) {
-                    continue;
-                }
-
-                auto& previous = visited[node];
-                for (const auto& entry : previous) {
-                    if (entry.first >= remaining) {
-                        active &= ~entry.second;
-                    }
-                }
-                if (!active) {
-                    continue;
-                }
-                previous.push_back({remaining, active});
-
-                for (const auto& leaf : node->leaves) {
-                    if (leaf.loss > remaining || leaf.prediction < 0 || leaf.prediction >= num_classes) {
+                auto& class_seen = seen[static_cast<std::size_t>(label)];
+                for (std::size_t w = 0; w < words; ++w) {
+                    const uint64_t applicable = state.rows[w] & ~completed[w];
+                    if (!applicable) {
                         continue;
                     }
-                    const std::size_t label = static_cast<std::size_t>(leaf.prediction);
-                    uint64_t others = 0;
-                    for (std::size_t c = 0; c < seen.size(); ++c) {
-                        if (c != label) {
-                            others |= seen[c];
-                        }
-                    }
-                    done |= active & others;
-                    seen[label] |= active;
-                    active &= ~done;
-                    if (!active) {
-                        break;
-                    }
+                    const uint64_t newly_completed = applicable & seen_any[w] & ~class_seen[w];
+                    completed[w] |= newly_completed;
+                    remaining_samples -= static_cast<std::size_t>(popcnt64(newly_completed));
+                    seen_any[w] |= applicable;
+                    class_seen[w] |= applicable;
+                    state.rows[w] = applicable & ~newly_completed;
                 }
-                if (!active) {
+                if (remaining_samples == 0) {
+                    break;
+                }
+            }
+
+            if (remaining_samples == 0) {
+                break;
+            }
+
+            bool has_rows = false;
+            for (uint64_t mask : state.rows) {
+                has_rows |= mask != 0;
+            }
+            if (!has_rows) {
+                continue;
+            }
+
+            for (const auto& split : node->splits) {
+                const TreeTrieNode* left = split.left.get();
+                const TreeTrieNode* right = split.right.get();
+                if (!left || !right) {
                     continue;
                 }
 
-                for (const auto& split : node->splits) {
-                    const TreeTrieNode* left = split.left.get();
-                    const TreeTrieNode* right = split.right.get();
-                    if (!left || !right) {
-                        continue;
+                const bool left_feasible =
+                    right->min_objective <= remaining &&
+                    left->min_objective <= remaining - right->min_objective;
+                const bool right_feasible =
+                    left->min_objective <= remaining &&
+                    right->min_objective <= remaining - left->min_objective;
+                if (!left_feasible && !right_feasible) {
+                    continue;
+                }
+
+                const uint64_t* bits =
+                    feature_masks.data() + static_cast<std::size_t>(split.feature) * words;
+                std::vector<uint64_t> left_rows;
+                std::vector<uint64_t> right_rows;
+                if (left_feasible) {
+                    left_rows.resize(words);
+                }
+                if (right_feasible) {
+                    right_rows.resize(words);
+                }
+
+                bool any_left = false;
+                bool any_right = false;
+                for (std::size_t w = 0; w < words; ++w) {
+                    if (left_feasible) {
+                        const uint64_t mask = state.rows[w] & bits[w];
+                        left_rows[w] = mask;
+                        any_left |= mask != 0;
                     }
-                    const uint64_t left_rows = active & feature_masks[static_cast<std::size_t>(split.feature)];
-                    const uint64_t right_rows = active & ~feature_masks[static_cast<std::size_t>(split.feature)];
-                    if (left_rows && right->min_objective <= remaining) {
-                        stack.push_back({left, remaining - right->min_objective, left_rows});
-                    }
-                    if (right_rows && left->min_objective <= remaining) {
-                        stack.push_back({right, remaining - left->min_objective, right_rows});
+                    if (right_feasible) {
+                        const uint64_t mask = state.rows[w] & ~bits[w];
+                        right_rows[w] = mask;
+                        any_right |= mask != 0;
                     }
                 }
+                if (any_left) {
+                    stack.push_back({
+                        left, remaining - right->min_objective, std::move(left_rows)
+                    });
+                }
+                if (any_right) {
+                    stack.push_back({
+                        right, remaining - left->min_objective, std::move(right_rows)
+                    });
+                }
             }
+        }
 
-            for (std::size_t i = 0; i < width; ++i) {
-                disagreement[offset + i] = (done & (uint64_t(1) << i)) != 0;
-            }
+        for (std::size_t i = 0; i < samples; ++i) {
+            disagreement[i] = (completed[i >> 6] & (uint64_t(1) << (i & 63))) != 0;
         }
         return disagreement;
     }
