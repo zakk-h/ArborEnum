@@ -1,5 +1,7 @@
 # ArborEnum
 
+**Paper:** [ArborEnum: Decision Tree Rashomon Sets over Continuous Features](https://arxiv.org/abs/2608.04310)
+
 **Exact, approximate, and anytime enumeration of decision-tree Rashomon sets over continuous features.**
 
 ArborEnum finds collections of accurate, interpretable classification trees rather than returning only a single model. Unlike prior work, it directly supports continuous features as input. Its algorithms span approximate to optimal Rashomon sets, allow either coarse or fully exhaustive treatment of continuous features, and support runtime and memory limits through an anytime algorithm. ArborEnum also integrates the Rashomon Importance Distribution (RID) to provide stable variable-importance estimates across the set of all good models.
@@ -336,3 +338,17 @@ Using `"hybrid"` or `"binarized"`, a smaller `lookahead_k`, or a threshold cap g
 ## More Examples
 
 See the [example notebook](https://github.com/zakk-h/ArborEnum/blob/main/examples/example.ipynb) for a complete walkthrough.
+
+## Citation
+
+```bibtex
+@misc{heile2026arborenumdecisiontreerashomon,
+      title={ArborEnum: Decision Tree Rashomon Sets over Continuous Features}, 
+      author={Zakk Heile and Hayden McTavish and Margo Seltzer and Cynthia Rudin},
+      year={2026},
+      eprint={2608.04310},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2608.04310}, 
+}
+```
