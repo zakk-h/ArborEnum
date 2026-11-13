@@ -4,10 +4,11 @@
 
 **Exact, approximate, and anytime enumeration of decision-tree Rashomon sets over continuous features.**
 
-ArborEnum finds collections of accurate, interpretable classification trees rather than returning only a single model. Unlike prior work, it directly supports continuous features as input. Its algorithms span approximate to optimal Rashomon sets, allow either coarse or fully exhaustive treatment of continuous features, and support runtime and memory limits through an anytime algorithm. ArborEnum also integrates the Rashomon Importance Distribution (RID) to provide stable variable-importance estimates across the set of all good models. ArborEnum also includes algorithms for learning individual decision trees, with options for either globally optimal solutions or faster approximate solutions.
+ArborEnum not only finds high-quality individual decision trees, but also enumerates collections of accurate, interpretable trees. Unlike prior work, it directly supports continuous features as input. Its algorithms span approximate to optimal Rashomon sets, allow either coarse or fully exhaustive treatment of continuous features, and support runtime and memory limits through an anytime algorithm. ArborEnum also integrates the Rashomon Importance Distribution (RID) to provide stable variable-importance estimates across the set of all good models.
 
 ## Features
 
+- Learn high-quality individual decision trees, either with global optimality guarantees or using faster approximate algorithms.
 - Enumerate decision trees within a small multiplier beyond a reference objective (for instance, the optimal tree or a tree from a non-optimal proxy algorithm).
 - Work directly with numerical tabular data (continuous features).
 - Use exact, approximate, or anytime enumeration.
