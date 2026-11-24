@@ -365,6 +365,7 @@ PYBIND11_MODULE(ARBORENUM_NATIVE_MODULE, m) {
         );
 
     py::class_<ArborEnum>(m, "ArborEnum")
+        .def("set_proxy_delta", &ArborEnum::set_proxy_delta, py::arg("proxy_delta"))
         .def("set_regression_options", &ArborEnum::set_regression_options,
              py::arg("equivalent_points"), py::arg("continuous_kmeans"),
              py::arg("kmeans_min_remaining_depth") = 2)
@@ -2599,7 +2600,8 @@ PYBIND11_MODULE(ARBORENUM_NATIVE_MODULE, m) {
             bool continuous_kmeans_bound,
             int kmeans_min_remaining_depth,
             int movement_bound_mode,
-            std::size_t movement_cache_bytes
+            std::size_t movement_cache_bytes,
+            int proxy_delta
         ) {
             py::buffer_info xinfo = X.request();
             py::buffer_info yinfo = y.request();
@@ -2755,7 +2757,8 @@ PYBIND11_MODULE(ARBORENUM_NATIVE_MODULE, m) {
                     continuous_kmeans_bound,
                     kmeans_min_remaining_depth,
                     movement_bound_mode,
-                    movement_cache_bytes
+                    movement_cache_bytes,
+                    proxy_delta
                 );
 
             py::dict out;
@@ -2804,7 +2807,8 @@ PYBIND11_MODULE(ARBORENUM_NATIVE_MODULE, m) {
         py::arg("continuous_kmeans_bound") = false,
         py::arg("kmeans_min_remaining_depth") = 2,
         py::arg("movement_bound_mode") = 1,
-        py::arg("movement_cache_bytes") = 128ULL * 1024 * 1024
+        py::arg("movement_cache_bytes") = 128ULL * 1024 * 1024,
+        py::arg("proxy_delta") = 0
         
     );
 
@@ -2885,7 +2889,8 @@ PYBIND11_MODULE(ARBORENUM_NATIVE_MODULE, m) {
             bool continuous_kmeans_bound,
             int kmeans_min_remaining_depth,
             int movement_bound_mode,
-            std::size_t movement_cache_bytes
+            std::size_t movement_cache_bytes,
+            int proxy_delta
         ) {
             py::buffer_info num_info =
                 X_num.request();
@@ -3492,7 +3497,8 @@ PYBIND11_MODULE(ARBORENUM_NATIVE_MODULE, m) {
                     continuous_kmeans_bound,
                     kmeans_min_remaining_depth,
                     movement_bound_mode,
-                    movement_cache_bytes
+                    movement_cache_bytes,
+                    proxy_delta
                 );
 
             py::dict out;
@@ -3581,7 +3587,8 @@ PYBIND11_MODULE(ARBORENUM_NATIVE_MODULE, m) {
         py::arg("continuous_kmeans_bound") = false,
         py::arg("kmeans_min_remaining_depth") = 2,
         py::arg("movement_bound_mode") = 1,
-        py::arg("movement_cache_bytes") = 128ULL * 1024 * 1024
+        py::arg("movement_cache_bytes") = 128ULL * 1024 * 1024,
+        py::arg("proxy_delta") = 0
     );
 
     

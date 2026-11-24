@@ -350,7 +350,8 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
     bool continuous_kmeans_bound = false,
     int kmeans_min_remaining_depth = 2,
     int movement_bound_mode = 1,
-    std::size_t movement_cache_bytes = 128ULL * 1024 * 1024
+    std::size_t movement_cache_bytes = 128ULL * 1024 * 1024,
+    int proxy_delta = 0
 ) {
     (void)memory_efficient;
 
@@ -806,6 +807,7 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
         rowmajor_to_colmajor_bool(X_bootstrap, X_col_major);
 
         ArborEnum model;
+        if (proxy_delta > 0) model.set_proxy_delta(proxy_delta);
         if constexpr (regression_objective) {
             model.set_regression_options(equivalent_points, continuous_kmeans_bound, kmeans_min_remaining_depth);
             model.set_regression_movement_options(movement_bound_mode, movement_cache_bytes);

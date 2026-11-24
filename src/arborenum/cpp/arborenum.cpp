@@ -725,6 +725,7 @@ struct TreeTrieNode {
     vector<LeafNode> leaves; // (prediction,loss) for as many [<=2 in binary classification] if within budget
     vector<SplitNode> splits; // stores splitnodes which have the feature they split on and left and right trienodes
     vector<HistEntry> hist; // sorted ascending by obj; counts aggregated (obj, count) are elements
+    bool proxy_pending = false;
     bool hist_built = false; // wait until the end to build the histograms because we don't know if they'll be used in the final trie because of multipass
 
     uint64_t count_trees() const {
@@ -936,6 +937,19 @@ public:
         BINARY = 0,
         NUMERICAL = 1
     };
+
+    int proxy_delta_ = 0;
+
+    void set_proxy_delta(int value) {
+        if (value < 0 || value > 127) throw std::invalid_argument("proxy_delta must be an integer between 0 and 127.");
+        proxy_delta_ = value;
+    }
+
+    int8_t proxy_total_depth_(int8_t depth) const {
+        if (depth < 0 || static_cast<int>(depth) + proxy_delta_ > 127)
+            throw std::invalid_argument("depth_budget + proxy_delta must be between 0 and 127.");
+        return static_cast<int8_t>(depth + proxy_delta_);
+    }
 
     void set_regression_options(bool equivalent_points, bool continuous_kmeans, int kmeans_min_remaining_depth = 2) {
 #if defined(ARBORENUM_REGRESSION)
@@ -1740,6 +1754,7 @@ private:
     }
 
     void shift_proxy_strength_down_one_() {
+        if (proxy_delta_ > 0) remember_proxy_trace_values_();
         if (true) {
             // snapshot positive-lookahead entries before mutating the map.
             std::vector<std::pair<KLA, Objective>> source_entries;
@@ -3630,6 +3645,7 @@ public:
     ) {
         // start both benchmark cases from a completely clean object
         clear_fit_state_();
+        if (proxy_delta_ > 0) depth_budget = proxy_total_depth_(depth_budget);
 
         if (X_col_major.empty() && !regression_objective) {
             throw std::runtime_error("X_col_major is empty.");
@@ -3730,9 +3746,9 @@ public:
         rule_list_mode = rule_list_mode_flag;
         majority_leaf_only = majority_leaf_only_flag;
         cache_cheap_subproblems =
-            cache_cheap_subproblems_flag;
+            cache_cheap_subproblems_flag || proxy_delta_ > 0;
         proxy_style = proxy_style_in;
-        proxy_caching_enabled = proxy_caching_flag;
+        proxy_caching_enabled = proxy_caching_flag || proxy_delta_ > 0;
         stronger_rollout = stronger_rollout_flag;
 
         restrict_proxy_in_lickety =
@@ -4074,6 +4090,7 @@ public:
                     root_cpath,
                     &B_active_all
                 );
+            if (proxy_delta_ > 0) expand_proxy_frontiers_(result, root, depth_budget);
 
             const double run_seconds =
                 std::chrono::duration<double>(
@@ -4307,6 +4324,7 @@ public:
             ) {
 
         clear_fit_state_();
+        if (proxy_delta_ > 0) depth_budget = proxy_total_depth_(depth_budget);
 
         if (X_col_major.empty() && !regression_objective) {
             throw std::runtime_error("X_col_major is empty.");
@@ -4356,9 +4374,9 @@ public:
         use_multipass = use_multipass_flag;
         rule_list_mode = rule_list_mode_flag;
         majority_leaf_only = majority_leaf_only_flag;
-        cache_cheap_subproblems = cache_cheap_subproblems_flag;
+        cache_cheap_subproblems = cache_cheap_subproblems_flag || proxy_delta_ > 0;
         proxy_style = proxy_style_in;
-        proxy_caching_enabled = proxy_caching_flag;
+        proxy_caching_enabled = proxy_caching_flag || proxy_delta_ > 0;
         stronger_rollout = stronger_rollout_flag;
         if (!rashomon_mode) { // force proxy caching on in single-tree mode - required for this codebase
             proxy_caching_enabled = true;
@@ -4528,6 +4546,7 @@ public:
 
         std::vector<int> B_active_all = all_feature_indices_();
         result = construct_trie(root, depth_budget, obj_bound, root_pk, root_cpath, &B_active_all);
+        if (proxy_delta_ > 0) expand_proxy_frontiers_(result, root, depth_budget);
 
         if (!result) {
             cout << "Minimum objective: NONE (empty Rashomon set)\n";
@@ -4637,6 +4656,8 @@ public:
             eta_defer_in,
             bb_pred
         );
+
+        depth_budget = trained_depth_budget;
 
         if (!result) {
             throw std::runtime_error(
@@ -4875,6 +4896,7 @@ public:
         }
         
 
+        if (proxy_delta_ > 0) expand_proxy_frontiers_(result, root, depth_budget);
         obj_bound = current_budget;
         end_resource_tracking_();
 
@@ -4970,6 +4992,7 @@ public:
         const std::vector<Prediction>& bb_pred = {}
     ) {
         clear_fit_state_();
+        if (proxy_delta_ > 0) depth_budget = proxy_total_depth_(depth_budget);
 
         if (X_col_major.empty() && !regression_objective) {
             throw std::runtime_error("X_col_major is empty.");
@@ -5065,9 +5088,9 @@ public:
         use_multipass = use_multipass_flag;
         rule_list_mode = rule_list_mode_flag;
         majority_leaf_only = majority_leaf_only_flag;
-        cache_cheap_subproblems = cache_cheap_subproblems_flag;
+        cache_cheap_subproblems = cache_cheap_subproblems_flag || proxy_delta_ > 0;
         proxy_style = proxy_style_in;
-        proxy_caching_enabled = proxy_caching_flag;
+        proxy_caching_enabled = proxy_caching_flag || proxy_delta_ > 0;
 
         if (!proxy_caching_enabled) { // we need this
             proxy_caching_enabled = true;
@@ -5998,6 +6021,8 @@ public:
                     }
                 }
 
+                if (proxy_delta_ > 0) expand_proxy_frontiers_(G_min, root, depth_budget);
+
                 lookahead_init = (int8_t)next_k;
 
                 if (proxy_style == 2) {
@@ -6054,6 +6079,8 @@ public:
                     << "Moving continuous Lickety proxy objectives "
                     << "down one lookahead level.\n";
 
+                if (proxy_delta_ > 0) expand_proxy_frontiers_(G_min, root, depth_budget);
+
                 shift_proxy_strength_down_one_();
 
                 // same two cache clears as before
@@ -6103,6 +6130,11 @@ public:
         restrict_proxy_in_depthd_exact = old_restrict_depthd;
         restrict_proxy_in_greedy = old_restrict_greedy;
         anytime_mode_active_ = false;
+
+        if (proxy_delta_ > 0) {
+            expand_proxy_frontiers_(G_min, root, depth_budget);
+            decltype(proxy_trace_values_)().swap(proxy_trace_values_);
+        }
 
         result = G_min;
         obj_bound = current_budget;
@@ -7183,6 +7215,7 @@ private:
     }
 
     void clear_fit_state_() {
+        if (!proxy_trace_values_.empty()) proxy_trace_values_.clear();
 #if defined(ARBORENUM_REGRESSION)
         regression_lower_bounds_.clear();
         regression_moments_cache_.clear();
@@ -8423,6 +8456,11 @@ private:
 
         const Objective budget = G->budget;
 
+        if (proxy_delta_ > 0 && depth == proxy_delta_) {
+            G = proxy_frontier_(G, mask, depth, budget, pk, cpath);
+            return;
+        }
+
         if (depth <= 0 || budget < 2 * gamma) {
             return;
         }
@@ -9574,6 +9612,10 @@ private:
             return node_has_solution_(node) // note that if node is null we preserve that, we don't make an empty node. this ensures solve siblings knows if there is a valid solution or not
                 ? node
                 : nullptr;
+        }
+
+        if (proxy_delta_ > 0 && depth == proxy_delta_) {
+            return proxy_frontier_(node, mask, depth, budget, pk, cpath);
         }
 
         if constexpr (regression_objective) {
@@ -15994,6 +16036,8 @@ private:
 
         return true;
     }
+
+#include "proxy_delta.hpp"
 
     // not used by ArborEnum Rashomon mode, to support giving single decision tree algorithm results in package.
     shared_ptr<PredNode> build_best_tree_from_caches(const Packed& mask, int8_t depth_budget, const PathKey& pk) const {

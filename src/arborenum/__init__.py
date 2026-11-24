@@ -722,6 +722,17 @@ class ArborEnum:
         self.continuous_feature_indices_ = None
         self.n_features_in_ = None
 
+    def _set_proxy_delta(self, value, depth_budget):
+        if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)) or value < 0:
+            raise ValueError("proxy_delta must be a nonnegative integer.")
+        value = int(value)
+        if int(depth_budget) < 0 or int(depth_budget) + value > 127:
+            raise ValueError("depth_budget + proxy_delta must be between 0 and 127.")
+        if value != getattr(self, "_proxy_delta_value", 0):
+            self._model.set_proxy_delta(value)
+            self._proxy_delta_value = value
+        return value
+
     def _prepare_bb_pred(self, *args, **kwargs):
         return _prepare_bb_pred(*args, regression=self._regression, **kwargs)
 
@@ -782,7 +793,9 @@ class ArborEnum:
         eta_defer=0.0,
         bb_pred=None,
         additive=False,
+        proxy_delta=0,
     ):
+        proxy_delta = self._set_proxy_delta(proxy_delta, depth_budget)
         # fit directly from a mixed numerical matrix.
         # columns with at most binary_unique_threshold unique values are
         # threshold-binarized and treated as ordinary binary features. columns
@@ -918,6 +931,7 @@ class ArborEnum:
                 use_deferral=use_deferral,
                 eta_defer=eta_defer,
                 additive=additive,         
+                proxy_delta=proxy_delta,
             )
 
         return self.fit_prepared(
@@ -950,6 +964,7 @@ class ArborEnum:
             stronger_rollout=stronger_rollout,
             use_deferral=use_deferral,
             eta_defer=eta_defer,
+            proxy_delta=proxy_delta,
         )
 
     
@@ -984,7 +999,9 @@ class ArborEnum:
         use_deferral=False,
         eta_defer=0.0,
         bb_pred=None,
+        proxy_delta=0,
     ):
+        proxy_delta = self._set_proxy_delta(proxy_delta, depth_budget)
         binary_names = list(X.columns) if hasattr(X, "columns") else None
         X = np.asarray(X, dtype=np.uint8)
         y = np.asarray(y, dtype=self._target_dtype)
@@ -1127,7 +1144,9 @@ class ArborEnum:
         num_subsamples=50,
         seed=0,
         reuse_caches_between_subsamples=False,
+        proxy_delta=0,
     ):
+        proxy_delta = self._set_proxy_delta(proxy_delta, depth_budget)
         X = np.asarray(X, dtype=np.uint8)
         y = np.asarray(y, dtype=self._target_dtype)
 
@@ -1326,7 +1345,9 @@ class ArborEnum:
         eta_defer=0.0,
         bb_pred=None,
         additive=False,
+        proxy_delta=0,
     ):
+        proxy_delta = self._set_proxy_delta(proxy_delta, depth_budget)
         X = np.asarray(X, dtype=np.uint8)
         y = np.asarray(y, dtype=self._target_dtype)
 
@@ -1508,7 +1529,9 @@ class ArborEnum:
         eta_defer=0.0,
         bb_pred=None,
         additive=False,
+        proxy_delta=0,
     ):
+        proxy_delta = self._set_proxy_delta(proxy_delta, depth_budget)
         X = np.asarray(X, dtype=np.uint8)
         y = np.asarray(y, dtype=self._target_dtype)
 
@@ -1815,7 +1838,9 @@ class ArborEnum:
         stronger_rollout=False,
         use_deferral=False,
         eta_defer=0.0,
+        proxy_delta=0,
     ):
+        proxy_delta = self._set_proxy_delta(proxy_delta, depth_budget)
         proxy_style_int = parse_proxy_style(proxy_style)
         greedy_heur_int = parse_heuristic_for_greedy(heuristic_for_greedy)
         greedy_cont_mode = parse_greedy_continuous_mode(greedy_continuous_mode)
@@ -1892,7 +1917,9 @@ class ArborEnum:
         num_subsamples=50,
         seed=0,
         reuse_caches_between_subsamples=False,
+        proxy_delta=0,
     ):
+        proxy_delta = self._set_proxy_delta(proxy_delta, depth_budget)
         subsample_fraction = float(subsample_fraction)
 
         if (
@@ -2005,7 +2032,9 @@ class ArborEnum:
         use_deferral=False,
         eta_defer=0.0,
         additive=False,
+        proxy_delta=0,
     ):
+        proxy_delta = self._set_proxy_delta(proxy_delta, depth_budget)
         first_rashomon_mult = float(first_rashomon_mult)
         second_rashomon_mult = float(second_rashomon_mult)
 
@@ -2109,7 +2138,9 @@ class ArborEnum:
         use_deferral=False,
         eta_defer=0.0,
         additive=False,
+        proxy_delta=0,
     ):
+        proxy_delta = self._set_proxy_delta(proxy_delta, depth_budget)
         rashomon_mult = float(rashomon_mult)
 
         if second_rashomon_mult is None:
@@ -2922,7 +2953,7 @@ class ArborEnum:
             "second_rashomon_mult", "multiplier_step_size",
             "proxy_refinement", "refinement_width",
             "max_refinement_rounds", "use_deferral", "eta_defer",
-            "bb_pred", "runtime_limit_seconds", "memory_limit_mb",
+            "bb_pred", "runtime_limit_seconds", "memory_limit_mb", "proxy_delta",
         }
         for name in unsupported:
             if name in rashomon_kwargs:
@@ -4242,7 +4273,9 @@ class ArborEnum:
         importance_interval_mode=0,
         subsample=-1,
         model_reliance="subtractive",
+        proxy_delta=0,
     ):
+        proxy_delta = self._set_proxy_delta(proxy_delta, depth_budget)
 
         if hasattr(X, "columns"):
             original_feature_names = list(X.columns)
@@ -4532,6 +4565,7 @@ class ArborEnum:
             int(subsample),
             self._objective_cast(root_budget_int),
             bool(divisive_model_reliance),
+            **({"proxy_delta": proxy_delta} if proxy_delta else {}),
         )
 
         if (
@@ -4581,7 +4615,9 @@ class ArborEnum:
         importance_interval_mode=0,
         subsample=-1,
         model_reliance="subtractive",
+        proxy_delta=0,
     ):
+        proxy_delta = self._set_proxy_delta(proxy_delta, depth_budget)
         input_names = list(X.columns) if hasattr(X, "columns") else None
         X = np.asarray(X, dtype=np.uint8)
         y = np.asarray(y, dtype=self._target_dtype)
@@ -4714,6 +4750,7 @@ class ArborEnum:
             int(subsample),
             self._objective_cast(root_budget_int),
             bool(divisive_model_reliance),
+            **({"proxy_delta": proxy_delta} if proxy_delta else {}),
         )
 
         if (
@@ -4785,7 +4822,9 @@ class ArborEnum:
         importance_interval_mode=0,
         subsample=-1,
         model_reliance="subtractive",
+        proxy_delta=0,
     ):
+        proxy_delta = self._set_proxy_delta(proxy_delta, depth_budget)
         X_num = np.asarray(X_num, dtype=np.float64)
         y = np.asarray(y, dtype=self._target_dtype)
 
@@ -5057,6 +5096,7 @@ class ArborEnum:
             int(subsample),
             self._objective_cast(root_budget_int),
             bool(divisive_model_reliance),
+            **({"proxy_delta": proxy_delta} if proxy_delta else {}),
         )
 
         if "bootstrap_importance_intervals" in self._rid_out:
