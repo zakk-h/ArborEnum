@@ -52,7 +52,7 @@ jobs:
           CIBW_TEST_ENVIRONMENT: "PYTHONUNBUFFERED=1"
 
           CIBW_TEST_COMMAND: >-
-            python -u -X faulthandler {project}/tests/wheel_smoke_test.py
+            python -u -X faulthandler -c "from arborenum import ArborEnum, ArborEnumRegressor; ArborEnum(); ArborEnumRegressor()"
 
         run: python -m cibuildwheel --output-dir wheelhouse
 

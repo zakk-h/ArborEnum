@@ -121,10 +121,10 @@ static inline void bootstrap_indices(
 
 static inline void make_bootstrap_dataset(
     const std::vector<std::vector<uint8_t>>& X,
-    const std::vector<int>& y,
+    const std::vector<Prediction>& y,
     const std::vector<int>& idx,
     std::vector<std::vector<uint8_t>>& Xb,
-    std::vector<int>& yb
+    std::vector<Prediction>& yb
 ) {
     const int n = (int)idx.size();
     const int d = (int)X[0].size();
@@ -139,10 +139,11 @@ static inline void make_bootstrap_dataset(
     }
 }
 
+template <typename Value>
 static inline void make_bootstrap_vector_int(
-    const std::vector<int>& values,
+    const std::vector<Value>& values,
     const std::vector<int>& idx,
-    std::vector<int>& bootstrapped_values
+    std::vector<Value>& bootstrapped_values
 ) {
     const int n = (int)idx.size();
     bootstrapped_values.assign((std::size_t)n, 0);
@@ -280,8 +281,8 @@ static inline void restore_block_inplace(
 // therefore cancels in scrambled minus original loss. With deferral enabled,
 // the remaining evaluation objective is:
 // misclassifications + round(eta_defer * number_of_deferrals).
-static inline int rid_eval_objective_from_mis_def(
-    int misclassifications,
+static inline Objective rid_eval_objective_from_mis_def(
+    Objective misclassifications,
     int deferrals,
     bool use_deferral,
     double eta_defer
@@ -291,12 +292,12 @@ static inline int rid_eval_objective_from_mis_def(
     }
 
     return misclassifications
-        + (int)std::llround(eta_defer * (double)deferrals);
+        + rounded_objective(eta_defer * (double)deferrals);
 }
 
 RIDResult compute_rid_subtractive_mr_bootstrap(
     const std::vector<std::vector<uint8_t>>& X_row_major,
-    const std::vector<int>& y,
+    const std::vector<Prediction>& y,
     int n_bootstraps,
     int n_scramble_evals,
     double lambda,
@@ -332,7 +333,7 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
     double memory_limit_mb = -1.0,
     bool use_deferral = false,
     double eta_defer = 0.0,
-    const std::vector<int>& bb_pred = {},
+    const std::vector<Prediction>& bb_pred = {},
     bool return_joint_samples = false,
     bool lossless = false,
     const std::vector<std::vector<std::vector<int>>>&
@@ -343,8 +344,13 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
     // 2 = interval only: sum of per-sample min/max local importances
     int importance_interval_mode = 0,
     int subsample = -1,
-    int root_budget = -1,
-    bool divisive_model_reliance = false
+    Objective root_budget = -1,
+    bool divisive_model_reliance = false,
+    bool equivalent_points = false,
+    bool continuous_kmeans_bound = false,
+    int kmeans_min_remaining_depth = 2,
+    int movement_bound_mode = 1,
+    std::size_t movement_cache_bytes = 128ULL * 1024 * 1024
 ) {
     (void)memory_efficient;
 
@@ -667,7 +673,7 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
         );
 
         std::vector<std::vector<uint8_t>> X_bootstrap;
-        std::vector<int> y_bootstrap;
+        std::vector<Prediction> y_bootstrap;
 
         make_bootstrap_dataset(
             X_row_major,
@@ -677,7 +683,7 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
             y_bootstrap
         );
 
-        std::vector<int> bb_pred_bootstrap;
+        std::vector<Prediction> bb_pred_bootstrap;
         if (use_deferral) {
             make_bootstrap_vector_int(
                 bb_pred,
@@ -800,6 +806,10 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
         rowmajor_to_colmajor_bool(X_bootstrap, X_col_major);
 
         ArborEnum model;
+        if constexpr (regression_objective) {
+            model.set_regression_options(equivalent_points, continuous_kmeans_bound, kmeans_min_remaining_depth);
+            model.set_regression_movement_options(movement_bound_mode, movement_cache_bytes);
+        }
         model.set_key_mode(key_mode);
         model.set_trie_cache_enabled(trie_cache_enabled);
         model.set_greedy_split_mode(greedy_split_mode);
@@ -922,7 +932,7 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
             << ": Rashomon training peak memory = "
             << training_peak_mb << " MB\n";
 
-                int budget_override;
+                Objective budget_override;
 
         if (root_budget >= 0) {
             // absolute integer user-specified budget.
@@ -930,21 +940,21 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
             budget_override = root_budget;
         } else {
             // standard RID behavior
-            const int requested_budget =
+            const Objective requested_budget =
                 additive
-                    ? static_cast<int>(std::llround(
+                    ? rounded_objective(
                         static_cast<double>(
                             model.result->min_objective
                         )
                         + rashomon_mult *
                             static_cast<double>(n)
-                    ))
-                    : static_cast<int>(std::llround(
+                    )
+                    : rounded_objective(
                         (1.0 + rashomon_mult) *
                         static_cast<double>(
                             model.result->min_objective
                         )
-                    ));
+                    );
 
             budget_override = std::min(
                 model.result->budget,
@@ -1318,7 +1328,7 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
         }
 
         // legacy Monte Carlo RID path.
-        std::vector<int> original_misclassifications;
+        std::vector<Objective> original_misclassifications;
 
         if (use_deferral) {
             original_misclassifications =
@@ -1370,7 +1380,7 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
              << number_of_trees
              << " trees\n";
 
-        std::vector<int> original_eval_objectives(
+        std::vector<Objective> original_eval_objectives(
             (std::size_t)number_of_trees,
             0
         );
@@ -1427,7 +1437,7 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
                     variable_columns[(std::size_t)variable];
 
                 // O(number_of_trees) memory, independent of n_scramble_evals.
-                std::vector<int64_t> summed_objective_differences(
+                std::vector<std::conditional_t<regression_objective, double, int64_t>> summed_objective_differences(
                     (std::size_t)number_of_trees,
                     0
                 );
@@ -1460,7 +1470,7 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
                         saved_columns
                     );
 
-                    std::vector<int> scrambled_misclassifications;
+                    std::vector<Objective> scrambled_misclassifications;
 
                     if (use_deferral) {
                         scrambled_misclassifications =
@@ -1514,7 +1524,7 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
                             ? scrambled_deferrals[(std::size_t)tree]
                             : 0;
 
-                        const int scrambled_eval_objective =
+                        const Objective scrambled_eval_objective =
                             rid_eval_objective_from_mis_def(
                                 scrambled_misclassifications[(std::size_t)tree],
                                 deferrals,
@@ -1523,9 +1533,9 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
                             );
 
                         summed_objective_differences[(std::size_t)tree] +=
-                            (int64_t)scrambled_eval_objective
-                            - (int64_t)original_eval_objectives
-                                [(std::size_t)tree];
+                            static_cast<std::conditional_t<regression_objective, double, int64_t>>(scrambled_eval_objective)
+                            - static_cast<std::conditional_t<regression_objective, double, int64_t>>(original_eval_objectives
+                                [(std::size_t)tree]);
                     }
 
                     restore_block_inplace(

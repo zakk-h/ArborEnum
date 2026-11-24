@@ -140,11 +140,19 @@ ext_modules = [
         sources=[
             "src/arborenum/_core.cpp",
         ],
+        depends=["src/arborenum/cpp/arborenum.cpp", "src/arborenum/cpp/rid.cpp", "src/arborenum/cpp/objective.hpp", "src/arborenum/cpp/native_headers.hpp", "src/arborenum/cpp/regression_objective.hpp", "src/arborenum/cpp/regression_threshold.hpp"],
         include_dirs=[
             pybind11.get_include(),
             "src/arborenum",
             "src/arborenum/cpp",
         ],
+        language="c++",
+    ),
+    Extension(
+        "arborenum._regression_core",
+        sources=["src/arborenum/_regression_core.cpp"],
+        depends=["src/arborenum/_core.cpp", "src/arborenum/cpp/arborenum.cpp", "src/arborenum/cpp/rid.cpp", "src/arborenum/cpp/objective.hpp", "src/arborenum/cpp/native_headers.hpp", "src/arborenum/cpp/regression_objective.hpp", "src/arborenum/cpp/regression_threshold.hpp"],
+        include_dirs=[pybind11.get_include(), "src/arborenum", "src/arborenum/cpp"],
         language="c++",
     ),
 ]
@@ -153,6 +161,7 @@ ext_modules = [
 setup(
     packages=find_packages(where="src"),
     package_dir={"": "src"},
+    package_data={"arborenum": ["builder_static/*.html"]},
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExt},
 )

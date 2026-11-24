@@ -3,6 +3,12 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include "cpp/native_headers.hpp"
+
+#if defined(ARBORENUM_REGRESSION)
+namespace arborenum_regression {
+#endif
+
 #include "cpp/arborenum.cpp"
 #include "cpp/rid.cpp"
 
@@ -14,8 +20,14 @@ static py::dict prediction_counts_dict(const std::vector<py::int_>& counts) {
         out[py::int_(c)] = counts[c];
     }
     if (!counts.back().equal(py::int_(0))) {
-        out[py::int_(DEFER_PREDICTION)] = counts.back();
+        out[py::cast(DEFER_PREDICTION)] = counts.back();
     }
+    return out;
+}
+
+static py::dict prediction_counts_dict(const std::map<Prediction, py::int_>& counts) {
+    py::dict out;
+    for (const auto& [value, count] : counts) out[py::cast(value)] = count;
     return out;
 }
 
@@ -83,9 +95,9 @@ numpy_uint8_2d_to_row_major(
     return out;
 }
 
-static std::vector<int>
-numpy_int_1d_to_vector(
-    py::array_t<int, py::array::c_style | py::array::forcecast> y,
+static std::vector<Prediction>
+numpy_prediction_1d_to_vector(
+    py::array_t<Prediction, py::array::c_style | py::array::forcecast> y,
     const std::string& name
 ) {
     py::buffer_info info = y.request();
@@ -95,9 +107,9 @@ numpy_int_1d_to_vector(
     }
 
     const int n = static_cast<int>(info.shape[0]);
-    auto *ptr = static_cast<int*>(info.ptr);
+    auto *ptr = static_cast<Prediction*>(info.ptr);
 
-    return std::vector<int>(ptr, ptr + n);
+    return std::vector<Prediction>(ptr, ptr + n);
 }
 
 static int
@@ -256,7 +268,11 @@ parse_greedy_continuous_mode(const std::string& mode_str) {
     );
 }
 
-PYBIND11_MODULE(_core, m) {
+#ifndef ARBORENUM_NATIVE_MODULE
+#define ARBORENUM_NATIVE_MODULE _core
+#endif
+
+PYBIND11_MODULE(ARBORENUM_NATIVE_MODULE, m) {
     m.doc() = "ArborEnum C++ core bindings";
 
     py::class_<ExportLeafNode>(m, "ExportLeafNode")
@@ -349,13 +365,18 @@ PYBIND11_MODULE(_core, m) {
         );
 
     py::class_<ArborEnum>(m, "ArborEnum")
+        .def("set_regression_options", &ArborEnum::set_regression_options,
+             py::arg("equivalent_points"), py::arg("continuous_kmeans"),
+             py::arg("kmeans_min_remaining_depth") = 2)
+        .def("set_regression_movement_options", &ArborEnum::set_regression_movement_options)
+        .def("get_regression_movement_stats", &ArborEnum::get_regression_movement_stats)
         .def(py::init<>())
 
         .def(
             "fit",
             [](ArborEnum &self,
                py::array_t<uint8_t, py::array::c_style | py::array::forcecast> X,
-               py::array_t<int,     py::array::c_style | py::array::forcecast> y,
+               py::array_t<Prediction,     py::array::c_style | py::array::forcecast> y,
                double lambda_reg,
                int depth_budget,
                double rashomon_mult,
@@ -363,7 +384,7 @@ PYBIND11_MODULE(_core, m) {
                std::string key_mode_str,
                bool trie_cache_enabled,
                int lookahead_k,
-               int root_budget,
+               Objective root_budget,
                bool use_multipass,
                bool rule_list_mode,
                int oracle_style,
@@ -382,7 +403,7 @@ PYBIND11_MODULE(_core, m) {
                bool use_deferral,
                double eta_defer,
                py::array_t<
-                   int,
+                   Prediction,
                    py::array::c_style | py::array::forcecast
                > bb_pred
             ) {
@@ -398,7 +419,7 @@ PYBIND11_MODULE(_core, m) {
                 int n_features = static_cast<int>(xinfo.shape[1]);
 
                 auto *x_ptr = static_cast<uint8_t*>(xinfo.ptr);
-                auto *y_ptr = static_cast<int*>(yinfo.ptr);
+                auto *y_ptr = static_cast<Prediction*>(yinfo.ptr);
 
                 std::vector<std::vector<bool>> X_col_major(
                     n_features,
@@ -412,10 +433,10 @@ PYBIND11_MODULE(_core, m) {
                     }
                 }
 
-                std::vector<int> y_vec(y_ptr, y_ptr + n_samples);
+                std::vector<Prediction> y_vec(y_ptr, y_ptr + n_samples);
 
                 auto bb_pred_vec =
-                    numpy_int_1d_to_vector(bb_pred, "bb_pred");
+                    numpy_prediction_1d_to_vector(bb_pred, "bb_pred");
 
                 // ArborEnum::KeyMode km;
                 // if (key_mode_str == "exact" || key_mode_str == "bitvector") {
@@ -493,7 +514,7 @@ PYBIND11_MODULE(_core, m) {
             py::arg("stronger_rollout") = false,
             py::arg("use_deferral") = false,
             py::arg("eta_defer") = 0.0,
-            py::arg("bb_pred") = py::array_t<int>(0)
+            py::arg("bb_pred") = py::array_t<Prediction>(0)
         )
 
         .def(
@@ -504,7 +525,7 @@ PYBIND11_MODULE(_core, m) {
                     py::array::c_style | py::array::forcecast
                 > X,
                 py::array_t<
-                    int,
+                    Prediction,
                     py::array::c_style | py::array::forcecast
                 > y,
                 double lambda_reg,
@@ -535,7 +556,7 @@ PYBIND11_MODULE(_core, m) {
                 bool use_deferral,
                 double eta_defer,
                 py::array_t<
-                    int,
+                    Prediction,
                     py::array::c_style | py::array::forcecast
                 > bb_pred
             ) {
@@ -573,7 +594,7 @@ PYBIND11_MODULE(_core, m) {
                     static_cast<uint8_t*>(xinfo.ptr);
 
                 auto *y_ptr =
-                    static_cast<int*>(yinfo.ptr);
+                    static_cast<Prediction*>(yinfo.ptr);
 
                 std::vector<std::vector<bool>>
                     X_col_major(
@@ -600,13 +621,13 @@ PYBIND11_MODULE(_core, m) {
                     }
                 }
 
-                std::vector<int> y_vec(
+                std::vector<Prediction> y_vec(
                     y_ptr,
                     y_ptr + n_samples
                 );
 
                 auto bb_pred_vec =
-                    numpy_int_1d_to_vector(
+                    numpy_prediction_1d_to_vector(
                         bb_pred,
                         "bb_pred"
                     );
@@ -725,7 +746,7 @@ PYBIND11_MODULE(_core, m) {
             py::arg("stronger_rollout") = false,
             py::arg("use_deferral") = false,
             py::arg("eta_defer") = 0.0,
-            py::arg("bb_pred") = py::array_t<int>(0)
+            py::arg("bb_pred") = py::array_t<Prediction>(0)
         )
 
 
@@ -737,7 +758,7 @@ PYBIND11_MODULE(_core, m) {
                    py::array::c_style | py::array::forcecast
                > X,
                py::array_t<
-                   int,
+                   Prediction,
                    py::array::c_style | py::array::forcecast
                > y,
                double lambda_reg,
@@ -768,7 +789,7 @@ PYBIND11_MODULE(_core, m) {
                bool use_deferral,
                double eta_defer,
                py::array_t<
-                   int,
+                   Prediction,
                    py::array::c_style | py::array::forcecast
                > bb_pred
             ) {
@@ -806,7 +827,7 @@ PYBIND11_MODULE(_core, m) {
                     static_cast<uint8_t*>(xinfo.ptr);
 
                 auto *y_ptr =
-                    static_cast<int*>(yinfo.ptr);
+                    static_cast<Prediction*>(yinfo.ptr);
 
                 std::vector<std::vector<bool>>
                     X_col_major(
@@ -839,13 +860,13 @@ PYBIND11_MODULE(_core, m) {
                     }
                 }
 
-                std::vector<int> y_vec(
+                std::vector<Prediction> y_vec(
                     y_ptr,
                     y_ptr + n_samples
                 );
 
                 auto bb_pred_vec =
-                    numpy_int_1d_to_vector(bb_pred, "bb_pred");
+                    numpy_prediction_1d_to_vector(bb_pred, "bb_pred");
 
                 self.set_key_mode(
                     parse_key_mode(key_mode_str)
@@ -956,14 +977,14 @@ PYBIND11_MODULE(_core, m) {
             py::arg("memory_limit_mb") = -1.0,
             py::arg("use_deferral") = false,
             py::arg("eta_defer") = 0.0,
-            py::arg("bb_pred") = py::array_t<int>(0)
+            py::arg("bb_pred") = py::array_t<Prediction>(0)
         )
 
         .def(
             "fit_anytime",
             [](ArborEnum &self,
             py::array_t<uint8_t, py::array::c_style | py::array::forcecast> X,
-            py::array_t<int,     py::array::c_style | py::array::forcecast> y,
+            py::array_t<Prediction,     py::array::c_style | py::array::forcecast> y,
             double lambda_reg,
             int depth_budget,
             double rashomon_mult,
@@ -995,7 +1016,7 @@ PYBIND11_MODULE(_core, m) {
             bool use_deferral,
             double eta_defer,
             py::array_t<
-                int,
+                Prediction,
                 py::array::c_style | py::array::forcecast
             > bb_pred
             ) {
@@ -1018,7 +1039,7 @@ PYBIND11_MODULE(_core, m) {
                 }
 
                 auto *x_ptr = static_cast<uint8_t*>(xinfo.ptr);
-                auto *y_ptr = static_cast<int*>(yinfo.ptr);
+                auto *y_ptr = static_cast<Prediction*>(yinfo.ptr);
 
                 std::vector<std::vector<bool>> X_col_major(
                     n_features,
@@ -1035,10 +1056,10 @@ PYBIND11_MODULE(_core, m) {
                     }
                 }
 
-                std::vector<int> y_vec(y_ptr, y_ptr + n_samples);
+                std::vector<Prediction> y_vec(y_ptr, y_ptr + n_samples);
 
                 auto bb_pred_vec =
-                    numpy_int_1d_to_vector(bb_pred, "bb_pred");
+                    numpy_prediction_1d_to_vector(bb_pred, "bb_pred");
 
                 ArborEnum::KeyMode km = parse_key_mode(key_mode_str);
 
@@ -1118,7 +1139,7 @@ PYBIND11_MODULE(_core, m) {
             py::arg("memory_limit_mb") = -1.0,
             py::arg("use_deferral") = false,
             py::arg("eta_defer") = 0.0,
-            py::arg("bb_pred") = py::array_t<int>(0)
+            py::arg("bb_pred") = py::array_t<Prediction>(0)
         )
 
         .def(
@@ -1126,14 +1147,14 @@ PYBIND11_MODULE(_core, m) {
             [](ArborEnum &self,
             py::array_t<double, py::array::c_style | py::array::forcecast> X_num,
             py::array_t<uint8_t, py::array::c_style | py::array::forcecast> X_bin,
-            py::array_t<int, py::array::c_style | py::array::forcecast> y,
+            py::array_t<Prediction, py::array::c_style | py::array::forcecast> y,
             py::array_t<uint8_t, py::array::c_style | py::array::forcecast>
                 X_initial_active,
             py::array_t<uint8_t, py::array::c_style | py::array::forcecast>
                 X_proxy_active,
             int max_number_thresholds_per_feature,
             py::array_t<
-                int,
+                Prediction,
                 py::array::c_style | py::array::forcecast
             > bb_pred
             ) {
@@ -1144,7 +1165,7 @@ PYBIND11_MODULE(_core, m) {
                     numpy_uint8_2d_to_row_major(X_bin, "X_bin");
 
                 auto y_vec =
-                    numpy_int_1d_to_vector(y, "y");
+                    numpy_prediction_1d_to_vector(y, "y");
 
                 auto X_initial_active_vec =
                     numpy_uint8_2d_to_row_major(
@@ -1159,7 +1180,7 @@ PYBIND11_MODULE(_core, m) {
                     );
 
                 auto bb_pred_vec =
-                    numpy_int_1d_to_vector(bb_pred, "bb_pred");
+                    numpy_prediction_1d_to_vector(bb_pred, "bb_pred");
 
                 self.prepare_continuous_data(
                     X_num_vec,
@@ -1177,7 +1198,7 @@ PYBIND11_MODULE(_core, m) {
             py::arg("X_initial_active"),
             py::arg("X_proxy_active"),
             py::arg("max_number_thresholds_per_feature") = -1,
-            py::arg("bb_pred") = py::array_t<int>(0)
+            py::arg("bb_pred") = py::array_t<Prediction>(0)
         )
 
         .def(
@@ -1422,7 +1443,7 @@ PYBIND11_MODULE(_core, m) {
                std::string key_mode_str,
                bool trie_cache_enabled,
                int lookahead_k,
-               int root_budget,
+               Objective root_budget,
                bool use_multipass,
                bool rule_list_mode,
                int oracle_style,
@@ -1647,17 +1668,17 @@ PYBIND11_MODULE(_core, m) {
              [](ArborEnum &self) {
                  return self.result
                         ? self.result->min_objective
-                        : std::numeric_limits<int>::max();
+                        : std::numeric_limits<Objective>::max();
              })
 
         .def("get_root_histogram",
              [](ArborEnum &self) {
                  if (!self.result) {
-                     return std::vector<std::pair<int, std::uint64_t>>{};
+                     return std::vector<std::pair<Objective, std::uint64_t>>{};
                  }
                  self.result->ensure_hist_built();
                  const auto &hist = self.result->hist;
-                 std::vector<std::pair<int, std::uint64_t>> out;
+                 std::vector<std::pair<Objective, std::uint64_t>> out;
                  out.reserve(hist.size());
                  for (const auto &e : hist) {
                      out.emplace_back(e.obj, e.cnt);
@@ -1674,10 +1695,10 @@ PYBIND11_MODULE(_core, m) {
                    py::array::c_style | py::array::forcecast
                > X,
                py::array_t<
-                   int,
+                   Prediction,
                    py::array::c_style | py::array::forcecast
                > bb_pred,
-               int defer_placeholder) {
+               Prediction defer_placeholder) {
                 py::buffer_info xinfo = X.request();
 
                 if (xinfo.ndim != 2) {
@@ -1716,7 +1737,7 @@ PYBIND11_MODULE(_core, m) {
                 }
 
                 auto bb_pred_vec =
-                    numpy_int_1d_to_vector(
+                    numpy_prediction_1d_to_vector(
                         bb_pred,
                         "bb_pred"
                     );
@@ -1729,24 +1750,24 @@ PYBIND11_MODULE(_core, m) {
                         defer_placeholder
                     );
 
-                py::array_t<uint8_t> out(n_samples);
+                py::array_t<OutputPrediction> out(n_samples);
                 auto out_info = out.request();
 
                 auto *out_ptr =
-                    static_cast<uint8_t*>(out_info.ptr);
+                    static_cast<OutputPrediction*>(out_info.ptr);
 
                 std::memcpy(
                     out_ptr,
                     preds.data(),
                     static_cast<std::size_t>(n_samples) *
-                        sizeof(uint8_t)
+                        sizeof(OutputPrediction)
                 );
 
                 return out;
             },
             py::arg("tree_index"),
             py::arg("X"),
-            py::arg("bb_pred") = py::array_t<int>(0),
+            py::arg("bb_pred") = py::array_t<Prediction>(0),
             py::arg("defer_placeholder") = 99
         )
 
@@ -1781,10 +1802,10 @@ PYBIND11_MODULE(_core, m) {
                    py::array::c_style | py::array::forcecast
                > X,
                py::array_t<
-                   int,
+                   Prediction,
                    py::array::c_style | py::array::forcecast
                > bb_pred,
-               int defer_placeholder,
+               Prediction defer_placeholder,
                bool stack) {
                 py::buffer_info xinfo = X.request();
 
@@ -1824,7 +1845,7 @@ PYBIND11_MODULE(_core, m) {
                 }
 
                 auto bb_pred_vec =
-                    numpy_int_1d_to_vector(
+                    numpy_prediction_1d_to_vector(
                         bb_pred,
                         "bb_pred"
                     );
@@ -1847,14 +1868,14 @@ PYBIND11_MODULE(_core, m) {
                         t < total;
                         ++t
                     ) {
-                        py::array_t<uint8_t> arr(
+                        py::array_t<OutputPrediction> arr(
                             n_samples
                         );
 
                         auto info = arr.request();
 
                         auto *ptr =
-                            static_cast<uint8_t*>(
+                            static_cast<OutputPrediction*>(
                                 info.ptr
                             );
 
@@ -1865,7 +1886,7 @@ PYBIND11_MODULE(_core, m) {
                             ].data(),
                             static_cast<std::size_t>(
                                 n_samples
-                            ) * sizeof(uint8_t)
+                            ) * sizeof(OutputPrediction)
                         );
 
                         lst.append(arr);
@@ -1874,7 +1895,7 @@ PYBIND11_MODULE(_core, m) {
                     return py::object(lst);
                 }
 
-                py::array_t<uint8_t> out(
+                py::array_t<OutputPrediction> out(
                     {
                         static_cast<py::ssize_t>(total),
                         static_cast<py::ssize_t>(
@@ -1886,7 +1907,7 @@ PYBIND11_MODULE(_core, m) {
                 auto out_info = out.request();
 
                 auto *out_ptr =
-                    static_cast<uint8_t*>(
+                    static_cast<OutputPrediction*>(
                         out_info.ptr
                     );
 
@@ -1906,14 +1927,14 @@ PYBIND11_MODULE(_core, m) {
                         ].data(),
                         static_cast<std::size_t>(
                             n_samples
-                        ) * sizeof(uint8_t)
+                        ) * sizeof(OutputPrediction)
                     );
                 }
 
                 return py::object(out);
             },
             py::arg("X"),
-            py::arg("bb_pred") = py::array_t<int>(0),
+            py::arg("bb_pred") = py::array_t<Prediction>(0),
             py::arg("defer_placeholder") = 99,
             py::arg("stack") = false
         )
@@ -1962,9 +1983,9 @@ PYBIND11_MODULE(_core, m) {
                     py_paths.append(py_path);
                 }
 
-                py::array_t<int> py_preds(preds.size());
+                py::array_t<Prediction> py_preds(preds.size());
                 auto info = py_preds.request();
-                auto *ptr = static_cast<int*>(info.ptr);
+                auto *ptr = static_cast<Prediction*>(info.ptr);
                 for (std::size_t i = 0; i < preds.size(); ++i) {
                     ptr[i] = preds[i];
                 }
@@ -2079,13 +2100,13 @@ PYBIND11_MODULE(_core, m) {
                    py::array::c_style | py::array::forcecast
                > X_eval,
                py::array_t<
-                   int,
+                   Prediction,
                    py::array::c_style | py::array::forcecast
                > y_eval,
-               int budget_override,
+               Objective budget_override,
                const std::vector<std::vector<int>>& variable_columns,
                py::array_t<
-                   int,
+                   Prediction,
                    py::array::c_style | py::array::forcecast
                > bb_pred_eval,
                bool sum_samplewise_extrema) {
@@ -2094,10 +2115,10 @@ PYBIND11_MODULE(_core, m) {
                     numpy_uint8_2d_to_row_major(X_eval, "X_eval");
 
                 auto y_vec =
-                    numpy_int_1d_to_vector(y_eval, "y_eval");
+                    numpy_prediction_1d_to_vector(y_eval, "y_eval");
 
                 auto bb_vec =
-                    numpy_int_1d_to_vector(
+                    numpy_prediction_1d_to_vector(
                         bb_pred_eval,
                         "bb_pred_eval"
                     );
@@ -2119,7 +2140,7 @@ PYBIND11_MODULE(_core, m) {
             py::arg("budget_override") = -1,
             py::arg("variable_columns") =
                 std::vector<std::vector<int>>{},
-            py::arg("bb_pred_eval") = py::array_t<int>(0),
+            py::arg("bb_pred_eval") = py::array_t<Prediction>(0),
             py::arg("sum_samplewise_extrema") = false
         )
 
@@ -2132,13 +2153,13 @@ PYBIND11_MODULE(_core, m) {
                    py::array::c_style | py::array::forcecast
                > X_eval,
                py::array_t<
-                   int,
+                   Prediction,
                    py::array::c_style | py::array::forcecast
                > y_eval,
-               int budget_override,
+               Objective budget_override,
                const std::vector<std::vector<int>>& variable_columns,
                py::array_t<
-                   int,
+                   Prediction,
                    py::array::c_style | py::array::forcecast
                > bb_pred_eval,
                const std::vector<std::vector<int>>&
@@ -2150,10 +2171,10 @@ PYBIND11_MODULE(_core, m) {
                     numpy_uint8_2d_to_row_major(X_eval, "X_eval");
 
                 auto y_vec =
-                    numpy_int_1d_to_vector(y_eval, "y_eval");
+                    numpy_prediction_1d_to_vector(y_eval, "y_eval");
 
                 auto bb_vec =
-                    numpy_int_1d_to_vector(
+                    numpy_prediction_1d_to_vector(
                         bb_pred_eval,
                         "bb_pred_eval"
                     );
@@ -2174,7 +2195,7 @@ PYBIND11_MODULE(_core, m) {
             py::arg("budget_override") = -1,
             py::arg("variable_columns") =
                 std::vector<std::vector<int>>{},
-            py::arg("bb_pred_eval") = py::array_t<int>(0),
+            py::arg("bb_pred_eval") = py::array_t<Prediction>(0),
             py::arg("matched_group_of_row_by_variable_eval") =
                 std::vector<std::vector<int>>{},
             py::arg("matched_group_size_by_variable_eval") =
@@ -2193,11 +2214,11 @@ PYBIND11_MODULE(_core, m) {
                 py::array::c_style | py::array::forcecast
             > X_donor,
             py::array_t<
-                int,
+                Prediction,
                 py::array::c_style | py::array::forcecast
             > y_recipient,
             double z_value,
-            int budget_override,
+            Objective budget_override,
             const std::vector<std::vector<int>>& variable_columns) {
 
                 auto recipient_vec =
@@ -2209,7 +2230,7 @@ PYBIND11_MODULE(_core, m) {
                         X_donor, "X_donor");
 
                 auto y_vec =
-                    numpy_int_1d_to_vector(
+                    numpy_prediction_1d_to_vector(
                         y_recipient, "y_recipient");
 
                 return self.get_divisive_wald_marginal_bounds(
@@ -2234,7 +2255,7 @@ PYBIND11_MODULE(_core, m) {
             "fit_prepared_majority_graph",
             [](ArborEnum& self,
                double lambda_reg, int depth_budget, double rashomon_mult,
-               int lookahead_k, int root_budget,
+               int lookahead_k, Objective root_budget,
                bool use_multipass, bool rule_list_mode, int oracle_style,
                bool majority_leaf_only, bool cache_cheap_subproblems,
                bool proxy_caching, bool restrict_proxy_in_lickety,
@@ -2302,11 +2323,11 @@ PYBIND11_MODULE(_core, m) {
                    py::array::c_style | py::array::forcecast
                > X_donor,
                py::array_t<
-                   int,
+                   Prediction,
                    py::array::c_style | py::array::forcecast
                > y_recipient,
                double z_value,
-               int budget_override,
+               Objective budget_override,
                const std::vector<std::vector<int>>& variable_columns) {
 
                 auto recipient_vec =
@@ -2318,7 +2339,7 @@ PYBIND11_MODULE(_core, m) {
                         X_donor, "X_donor");
 
                 auto y_vec =
-                    numpy_int_1d_to_vector(
+                    numpy_prediction_1d_to_vector(
                         y_recipient, "y_recipient");
 
                 return self.get_divisive_wald_3state_bounds(
@@ -2351,11 +2372,11 @@ PYBIND11_MODULE(_core, m) {
                    py::array::c_style | py::array::forcecast
                > X_donor,
                py::array_t<
-                   int,
+                   Prediction,
                    py::array::c_style | py::array::forcecast
                > y_recipient,
                double z_value,
-               int budget_override,
+               Objective budget_override,
                const std::vector<std::vector<int>>& variable_columns) {
 
                 auto recipient_vec =
@@ -2367,7 +2388,7 @@ PYBIND11_MODULE(_core, m) {
                         X_donor, "X_donor");
 
                 auto y_vec =
-                    numpy_int_1d_to_vector(
+                    numpy_prediction_1d_to_vector(
                         y_recipient, "y_recipient");
 
                 return self.get_divisive_wald_4state_bounds(
@@ -2397,19 +2418,19 @@ PYBIND11_MODULE(_core, m) {
                    py::array::c_style | py::array::forcecast
                > X_eval,
                py::array_t<
-                   int,
+                   Prediction,
                    py::array::c_style | py::array::forcecast
                > y_eval,
                const std::vector<std::vector<int>>& variable_columns,
                double z_value,
                std::uint64_t seed,
-               int budget_override) {
+               Objective budget_override) {
 
                 auto X_vec =
                     numpy_uint8_2d_to_row_major(X_eval, "X_eval");
 
                 auto y_vec =
-                    numpy_int_1d_to_vector(y_eval, "y_eval");
+                    numpy_prediction_1d_to_vector(y_eval, "y_eval");
 
                 return self
                     .get_wald_divisive_model_reliance_intervals_graph(
@@ -2437,13 +2458,13 @@ PYBIND11_MODULE(_core, m) {
                    py::array::c_style | py::array::forcecast
                > X_eval,
                py::array_t<
-                   int,
+                   Prediction,
                    py::array::c_style | py::array::forcecast
                > y_eval,
-               int budget_override,
+               Objective budget_override,
                const std::vector<std::vector<int>>& variable_columns,
                py::array_t<
-                   int,
+                   Prediction,
                    py::array::c_style | py::array::forcecast
                > bb_pred_eval,
                const std::vector<std::vector<int>>&
@@ -2455,10 +2476,10 @@ PYBIND11_MODULE(_core, m) {
                     numpy_uint8_2d_to_row_major(X_eval, "X_eval");
 
                 auto y_vec =
-                    numpy_int_1d_to_vector(y_eval, "y_eval");
+                    numpy_prediction_1d_to_vector(y_eval, "y_eval");
 
                 auto bb_vec =
-                    numpy_int_1d_to_vector(
+                    numpy_prediction_1d_to_vector(
                         bb_pred_eval,
                         "bb_pred_eval"
                     );
@@ -2479,7 +2500,7 @@ PYBIND11_MODULE(_core, m) {
             py::arg("budget_override") = -1,
             py::arg("variable_columns") =
                 std::vector<std::vector<int>>{},
-            py::arg("bb_pred_eval") = py::array_t<int>(0),
+            py::arg("bb_pred_eval") = py::array_t<Prediction>(0),
             py::arg("matched_group_of_row_by_variable_eval") =
                 std::vector<std::vector<int>>{},
             py::arg("matched_group_size_by_variable_eval") =
@@ -2488,7 +2509,7 @@ PYBIND11_MODULE(_core, m) {
 
         .def(
             "prediction_counts",
-            [](const ArborEnum& self, int sample_idx, int budget) {
+            [](const ArborEnum& self, int sample_idx, Objective budget) {
                 return prediction_counts_dict(self.prediction_counts<py::int_>(sample_idx, budget));
             },
             py::arg("sample_idx"),
@@ -2504,7 +2525,7 @@ PYBIND11_MODULE(_core, m) {
             "prediction_counts_for_rows",
             [](const ArborEnum& self,
                py::array_t<uint8_t, py::array::c_style | py::array::forcecast> X,
-               int budget) {
+               Objective budget) {
                 if (X.ndim() != 2) {
                     throw std::invalid_argument("X must be 2D.");
                 }
@@ -2522,7 +2543,7 @@ PYBIND11_MODULE(_core, m) {
             "has_disagreement_for_rows",
             [](const ArborEnum& self,
                py::array_t<uint8_t, py::array::c_style | py::array::forcecast> X,
-               int budget) {
+               Objective budget) {
                 if (X.ndim() != 2) {
                     throw std::invalid_argument("X must be 2D.");
                 }
@@ -2546,7 +2567,7 @@ PYBIND11_MODULE(_core, m) {
                 py::array::c_style | py::array::forcecast
             > X,
             py::array_t<
-                int,
+                Prediction,
                 py::array::c_style | py::array::forcecast
             > y,
             int n_boot,
@@ -2563,7 +2584,7 @@ PYBIND11_MODULE(_core, m) {
             bool use_deferral,
             double eta_defer,
             py::array_t<
-                int,
+                Prediction,
                 py::array::c_style | py::array::forcecast
             > bb_pred,
             bool return_joint_samples,
@@ -2572,8 +2593,13 @@ PYBIND11_MODULE(_core, m) {
             bool additive,
             int importance_interval_mode,
             int subsample,
-            int root_budget,
-            bool divisive_model_reliance
+            Objective root_budget,
+            bool divisive_model_reliance,
+            bool equivalent_points,
+            bool continuous_kmeans_bound,
+            int kmeans_min_remaining_depth,
+            int movement_bound_mode,
+            std::size_t movement_cache_bytes
         ) {
             py::buffer_info xinfo = X.request();
             py::buffer_info yinfo = y.request();
@@ -2599,7 +2625,7 @@ PYBIND11_MODULE(_core, m) {
             }
 
             auto *x_ptr = static_cast<uint8_t*>(xinfo.ptr);
-            auto *y_ptr = static_cast<int*>(yinfo.ptr);
+            auto *y_ptr = static_cast<Prediction*>(yinfo.ptr);
 
             std::vector<std::vector<uint8_t>> X_row_major(
                 static_cast<std::size_t>(n_samples),
@@ -2623,13 +2649,13 @@ PYBIND11_MODULE(_core, m) {
                 }
             }
 
-            std::vector<int> y_vec(
+            std::vector<Prediction> y_vec(
                 y_ptr,
                 y_ptr + n_samples
             );
 
             auto bb_pred_vec =
-                numpy_int_1d_to_vector(
+                numpy_prediction_1d_to_vector(
                     bb_pred,
                     "bb_pred"
                 );
@@ -2724,7 +2750,12 @@ PYBIND11_MODULE(_core, m) {
                     importance_interval_mode,
                     subsample,
                     root_budget,
-                    divisive_model_reliance
+                    divisive_model_reliance,
+                    equivalent_points,
+                    continuous_kmeans_bound,
+                    kmeans_min_remaining_depth,
+                    movement_bound_mode,
+                    movement_cache_bytes
                 );
 
             py::dict out;
@@ -2759,7 +2790,7 @@ PYBIND11_MODULE(_core, m) {
         py::arg("binning_map") = py::none(),
         py::arg("use_deferral") = false,
         py::arg("eta_defer") = 0.0,
-        py::arg("bb_pred") = py::array_t<int>(0),
+        py::arg("bb_pred") = py::array_t<Prediction>(0),
         py::arg("return_joint_samples") = false,
         py::arg("lossless") = false,
         py::arg("matched_groups_by_variable") =
@@ -2768,7 +2799,12 @@ PYBIND11_MODULE(_core, m) {
         py::arg("importance_interval_mode") = 0,
         py::arg("subsample") = -1,
         py::arg("root_budget") = -1,
-        py::arg("divisive_model_reliance") = false
+        py::arg("divisive_model_reliance") = false,
+        py::arg("equivalent_points") = false,
+        py::arg("continuous_kmeans_bound") = false,
+        py::arg("kmeans_min_remaining_depth") = 2,
+        py::arg("movement_bound_mode") = 1,
+        py::arg("movement_cache_bytes") = 128ULL * 1024 * 1024
         
     );
 
@@ -2786,7 +2822,7 @@ PYBIND11_MODULE(_core, m) {
                 py::array::forcecast
             > X_bin,
             py::array_t<
-                int,
+                Prediction,
                 py::array::c_style |
                 py::array::forcecast
             > y,
@@ -2833,7 +2869,7 @@ PYBIND11_MODULE(_core, m) {
             bool use_deferral,
             double eta_defer,
             py::array_t<
-                int,
+                Prediction,
                 py::array::c_style |
                 py::array::forcecast
             > bb_pred,
@@ -2843,8 +2879,13 @@ PYBIND11_MODULE(_core, m) {
             bool additive,
             int importance_interval_mode,
             int subsample,
-            int root_budget,
-            bool divisive_model_reliance
+            Objective root_budget,
+            bool divisive_model_reliance,
+            bool equivalent_points,
+            bool continuous_kmeans_bound,
+            int kmeans_min_remaining_depth,
+            int movement_bound_mode,
+            std::size_t movement_cache_bytes
         ) {
             py::buffer_info num_info =
                 X_num.request();
@@ -2994,10 +3035,10 @@ PYBIND11_MODULE(_core, m) {
                 static_cast<uint8_t*>(bin_info.ptr);
 
             auto* y_ptr =
-                static_cast<int*>(yinfo.ptr);
+                static_cast<Prediction*>(yinfo.ptr);
 
             auto* bb_pred_ptr =
-                static_cast<int*>(bb_pred_info.ptr);
+                static_cast<Prediction*>(bb_pred_info.ptr);
 
             auto* proxy_active_ptr =
                 static_cast<uint8_t*>(
@@ -3009,12 +3050,12 @@ PYBIND11_MODULE(_core, m) {
                     initial_active_info.ptr
                 );
 
-            std::vector<int> y_vec(
+            std::vector<Prediction> y_vec(
                 y_ptr,
                 y_ptr + n
             );
 
-            std::vector<int> bb_pred_vec;
+            std::vector<Prediction> bb_pred_vec;
 
             if (n_bb_pred > 0) {
                 bb_pred_vec.assign(
@@ -3446,7 +3487,12 @@ PYBIND11_MODULE(_core, m) {
                     importance_interval_mode,
                     subsample,
                     root_budget,
-                    divisive_model_reliance
+                    divisive_model_reliance,
+                    equivalent_points,
+                    continuous_kmeans_bound,
+                    kmeans_min_remaining_depth,
+                    movement_bound_mode,
+                    movement_cache_bytes
                 );
 
             py::dict out;
@@ -3521,7 +3567,7 @@ PYBIND11_MODULE(_core, m) {
         py::arg("memory_limit_mb") = -1.0,
         py::arg("use_deferral") = false,
         py::arg("eta_defer") = 0.0,
-        py::arg("bb_pred") = py::array_t<int>(0),
+        py::arg("bb_pred") = py::array_t<Prediction>(0),
         py::arg("return_joint_samples") = false,
         py::arg("lossless") = false,
         py::arg("matched_groups_by_variable") =
@@ -3530,9 +3576,17 @@ PYBIND11_MODULE(_core, m) {
         py::arg("importance_interval_mode") = 0,
         py::arg("subsample") = -1,
         py::arg("root_budget") = -1,
-        py::arg("divisive_model_reliance") = false
+        py::arg("divisive_model_reliance") = false,
+        py::arg("equivalent_points") = false,
+        py::arg("continuous_kmeans_bound") = false,
+        py::arg("kmeans_min_remaining_depth") = 2,
+        py::arg("movement_bound_mode") = 1,
+        py::arg("movement_cache_bytes") = 128ULL * 1024 * 1024
     );
 
     
     
 }
+#if defined(ARBORENUM_REGRESSION)
+}
+#endif

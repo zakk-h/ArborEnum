@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.utils import check_X_y
-from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.ensemble import GradientBoostingClassifier, GradientBoostingRegressor
 from sklearn.utils.validation import check_array, check_is_fitted
     
 class ThresholdGuessBinarizer(BaseEstimator, TransformerMixin):
@@ -98,7 +98,9 @@ class ThresholdGuessBinarizer(BaseEstimator, TransformerMixin):
         n_estimators: int = 100,
         max_depth: int = 3,
         random_state: int = 0,
-        column_elimination: bool = True
+        column_elimination: bool = True,
+        task: str = "classification",
+        backend: str = "sklearn",
 
     ):
         self.learning_rate = learning_rate
@@ -106,6 +108,8 @@ class ThresholdGuessBinarizer(BaseEstimator, TransformerMixin):
         self.max_depth = max_depth
         self.random_state = random_state
         self.column_elimination = column_elimination
+        self.task = task
+        self.backend = backend
         
     def fit(self, X, y, columns=None):
         """
@@ -149,31 +153,49 @@ class ThresholdGuessBinarizer(BaseEstimator, TransformerMixin):
         self.n_features_in_ = m
 
         # Extract the thresholds from the model
-        clf = GradientBoostingClassifier(loss='log_loss',
-                                                learning_rate=self.learning_rate,
-                                                n_estimators=self.n_estimators,
-                                                max_depth=self.max_depth,
-                                                random_state=self.random_state)
-        clf.fit(X, y)
-        thresholds = []
-        estimators = clf.estimators_
-        n_estimators = estimators.shape[0]
-        n_classes = estimators.shape[1] # can view as one-versus-many
-
-        for j in range(self.n_features_in_):
-            thresholds_j = []
-            for k in range(n_estimators):
-                for c in range(n_classes):
-                    tj = self.__threshold(estimators[k, c], j)
-                    if tj.size: # this seemingly isn't needed as the code doesn't crash, but just in case
-                        thresholds_j.append(tj)
-
-            if not thresholds_j:
-                continue
-
-            thresholds_j = np.unique(np.concatenate(thresholds_j))
-            for thresh in thresholds_j:
-                thresholds.append((j, thresh))
+        if self.task not in ("classification", "regression"):
+            raise ValueError("task must be 'classification' or 'regression'.")
+        options = dict(learning_rate=self.learning_rate, n_estimators=self.n_estimators,
+                       max_depth=self.max_depth, random_state=self.random_state)
+        if self.backend == "sklearn":
+            estimator = GradientBoostingRegressor if self.task == "regression" else GradientBoostingClassifier
+            clf = estimator(**options)
+            clf.fit(X, y)
+            thresholds = sorted(set(
+                (int(feature), float(threshold))
+                for tree in clf.estimators_.ravel()
+                for feature, threshold in zip(tree.tree_.feature, tree.tree_.threshold)
+                if feature >= 0
+            ))
+        elif self.backend == "xgboost":
+            import json
+            from xgboost import XGBClassifier, XGBRegressor
+            estimator = XGBRegressor if self.task == "regression" else XGBClassifier
+            clf = estimator(**options, n_jobs=1)
+            clf.fit(X, y)
+            thresholds = set()
+            feature_values = {}
+            nodes = [json.loads(tree) for tree in clf.get_booster().get_dump(dump_format="json")]
+            while nodes:
+                node = nodes.pop()
+                if "split" not in node:
+                    continue
+                feature = str(node["split"])
+                feature = int(feature[1:] if feature.startswith("f") else feature)
+                if feature not in feature_values:
+                    values = np.unique(X[:, feature].astype(np.float64))
+                    feature_values[feature] = (values, values.astype(np.float32))
+                values, encoded = feature_values[feature]
+                rank = int(np.searchsorted(encoded, np.float32(node["split_condition"]), side="left"))
+                if 0 < rank < len(values):
+                    lower, upper = values[rank - 1], values[rank]
+                    cutpoint = lower + .5 * (upper - lower)
+                    thresholds.add((feature, float(cutpoint if lower <= cutpoint < upper else lower)))
+                nodes.extend(node.get("children", ()))
+            thresholds = sorted(thresholds)
+        else:
+            raise ValueError("backend must be 'sklearn' or 'xgboost'.")
+        self.estimator_ = clf
 
         # for j in range(self.n_features_in_):
         #     thresholds_j = []
@@ -192,7 +214,7 @@ class ThresholdGuessBinarizer(BaseEstimator, TransformerMixin):
         X_thr, thresholds = self.__dedup_identical_columns(X_thr, thresholds) # deduplicated
 
         # Refit the model on the thresholded data
-        if self.column_elimination:
+        if self.column_elimination and thresholds:
             self.thresholds_ = self.__column_elimination(X_thr, y, thresholds, clf)
         else:
             self.thresholds_ = thresholds
@@ -251,7 +273,9 @@ class ThresholdGuessBinarizer(BaseEstimator, TransformerMixin):
             raise ValueError('Shape of input is different from what was seen'
                              'in `fit`')
 
-        return np.concatenate([np.atleast_2d(X[:, j] <= thresh).T for j, thresh in self.thresholds_], axis=1).astype(float)
+        if not self.thresholds_:
+            return np.empty((X.shape[0], 0), dtype=float)
+        return np.column_stack([X[:, j] <= thresh for j, thresh in self.thresholds_]).astype(float)
     
     def __threshold(self, estimator, feature):
         """

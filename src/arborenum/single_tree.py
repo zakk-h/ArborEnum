@@ -1,7 +1,9 @@
-from . import ArborEnum
+from . import ArborEnum, ArborEnumRegressor
+from sklearn.base import BaseEstimator, RegressorMixin
 
 
 class ArborEnumTree:
+    _estimator_class = ArborEnum
     # Fit one decision tree using ArborEnum's single-tree solver.
     # depth_budget : int, default=5, Maximum decision tree depth.
     # lambda_reg : float, default=0.005, lower values include more complex trees
@@ -37,8 +39,11 @@ class ArborEnumTree:
         self._extra_fit_kwargs = dict(kwargs)
         self._model = None
 
+    def _make_estimator(self):
+        return self._estimator_class()
+
     def fit(self, X, y, *, bb_pred=None, X_proxy=None):
-        model = ArborEnum()
+        model = self._make_estimator()
         options = dict(self._extra_fit_kwargs)
         options.update(
             depth_budget=self.depth_budget,
@@ -90,3 +95,81 @@ class ArborEnumTree:
     @property
     def arborenum_(self):
         return self._fitted()
+
+
+class ArborEnumTreeRegressor(RegressorMixin, ArborEnumTree, BaseEstimator):
+    _estimator_class = ArborEnumRegressor
+
+    def __init__(self, depth_budget=5, lambda_reg=.005, proxy_mode="hybrid", lookahead_k=1,
+                 heuristic_for_greedy=1, *, eta_defer=0., use_deferral=False,
+                 equivalent_points=False, continuous_kmeans_bound=False,
+                 kmeans_min_remaining_depth=2, movement_bound_mode="local", movement_cache_mb=128, **kwargs):
+        super().__init__(depth_budget, lambda_reg, proxy_mode, lookahead_k, heuristic_for_greedy,
+                         eta_defer=eta_defer, use_deferral=use_deferral, **kwargs)
+        self.equivalent_points = bool(equivalent_points)
+        self.continuous_kmeans_bound = bool(continuous_kmeans_bound)
+        self.kmeans_min_remaining_depth = kmeans_min_remaining_depth
+        self.movement_bound_mode = movement_bound_mode
+        self.movement_cache_mb = movement_cache_mb
+
+    def get_params(self, deep=True):
+        names = ("depth_budget", "lambda_reg", "proxy_mode", "lookahead_k", "heuristic_for_greedy",
+                 "eta_defer", "use_deferral", "equivalent_points", "continuous_kmeans_bound",
+                 "kmeans_min_remaining_depth", "movement_bound_mode", "movement_cache_mb")
+        return {**self._extra_fit_kwargs, **{name: getattr(self, name) for name in names}}
+
+    def set_params(self, **params):
+        valid = self.get_params()
+        for name, value in params.items():
+            if name not in valid:
+                raise ValueError(f"Invalid parameter {name!r} for ArborEnumTreeRegressor.")
+            if name in self._extra_fit_kwargs:
+                self._extra_fit_kwargs[name] = value
+            else:
+                setattr(self, name, value)
+        return self
+
+    def fit(self, X, y, *, bb_pred=None, X_proxy=None):
+        super().fit(X, y, bb_pred=bb_pred, X_proxy=X_proxy)
+        self.n_features_in_ = self._fitted().n_features_in_
+        self.feature_names_in_ = self._fitted().feature_names_in_
+        return self
+
+    def _make_estimator(self):
+        return self._estimator_class(equivalent_points=self.equivalent_points,
+                                     continuous_kmeans_bound=self.continuous_kmeans_bound,
+                                     kmeans_min_remaining_depth=self.kmeans_min_remaining_depth,
+                                     movement_bound_mode=self.movement_bound_mode,
+                                     movement_cache_mb=self.movement_cache_mb)
+
+    def get_movement_bound_stats(self):
+        return self._fitted().get_movement_bound_stats()
+
+    def transform(self, X):
+        return self._fitted().transform(X)
+
+    def get_internal_feature_info(self, internal_feature):
+        return self._fitted().get_internal_feature_info(internal_feature)
+
+    def get_continuous_cutpoints(self, continuous_group):
+        return self._fitted().get_continuous_cutpoints(continuous_group)
+
+    def permutation_importance_bounds(self, X_eval, y_eval, *, budget_override=None):
+        import pandas as pd
+        model = self._fitted()
+        bounds = model._single_tree_importance(X_eval, y_eval, budget_override, False)
+        return pd.DataFrame(bounds, index=pd.Index(model.feature_names_in_, name="feature", tupleize_cols=False),
+                            columns=["min_importance", "max_importance"])
+
+    def get_exact_replacement_importance_intervals(self, X_eval, y_eval, budget_override=None):
+        return self._fitted()._single_tree_importance(X_eval, y_eval, budget_override, False)
+
+    def get_exact_replacement_divisive_importance_intervals(self, X_eval, y_eval, budget_override=None):
+        return self._fitted()._single_tree_importance(X_eval, y_eval, budget_override, True)
+
+    def predict(self, X, *, bb_pred=None):
+        return self._fitted().get_predictions(0, X, bb_pred=bb_pred)
+
+    def score(self, X, y):
+        from sklearn.metrics import r2_score
+        return r2_score(y, self.predict(X))
