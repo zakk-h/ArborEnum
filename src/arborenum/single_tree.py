@@ -155,14 +155,10 @@ class ArborEnumTreeRegressor(RegressorMixin, ArborEnumTree, BaseEstimator):
         return self._fitted().get_continuous_cutpoints(continuous_group)
 
     def permutation_importance_bounds(self, X_eval, y_eval, *, budget_override=None):
-        import pandas as pd
-        model = self._fitted()
-        bounds = model._single_tree_importance(X_eval, y_eval, budget_override, False)
-        return pd.DataFrame(bounds, index=pd.Index(model.feature_names_in_, name="feature", tupleize_cols=False),
-                            columns=["min_importance", "max_importance"])
+        return self._fitted().permutation_importance_bounds(X_eval, y_eval, budget_override=budget_override)
 
     def get_exact_replacement_importance_intervals(self, X_eval, y_eval, budget_override=None):
-        return self._fitted()._single_tree_importance(X_eval, y_eval, budget_override, False)
+        return self._fitted().get_exact_replacement_importance_intervals(X_eval, y_eval, budget_override)
 
     def get_exact_replacement_divisive_importance_intervals(self, X_eval, y_eval, budget_override=None):
         return self._fitted()._single_tree_importance(X_eval, y_eval, budget_override, True)

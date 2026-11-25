@@ -3992,6 +3992,10 @@ public:
             root.w[(size_t)(n_words - 1)] &=
                 tail_mask;
 
+#if defined(ARBORENUM_REGRESSION)
+            regression_importance_training_mask_ = root;
+#endif
+
             const uint64_t subsample_hash =
                 hash_mask64(
                     root.w.data(),
@@ -7217,6 +7221,7 @@ private:
     void clear_fit_state_() {
         if (!proxy_trace_values_.empty()) proxy_trace_values_.clear();
 #if defined(ARBORENUM_REGRESSION)
+        regression_importance_training_mask_.w.clear();
         regression_lower_bounds_.clear();
         regression_moments_cache_.clear();
         regression_feature_buckets_.clear();
@@ -22142,9 +22147,11 @@ private:
         const std::vector<std::vector<int>>&
             matched_group_of_row_by_variable_eval,
         const std::vector<std::vector<int>>&
-            matched_group_size_by_variable_eval
+            matched_group_size_by_variable_eval,
+        const TreeTrieNode* graph = nullptr
     ) const {
-        if (!result) {
+        if (!graph) graph = result.get();
+        if (!graph) {
             throw std::runtime_error(
                 "No Rashomon trie has been constructed. Call fit() first."
             );
@@ -22167,7 +22174,7 @@ private:
         out.budget =
             (budget_override >= 0)
                 ? budget_override
-                : result->budget;
+                : graph->budget;
 
         if (!variable_columns_in.empty()) {
             out.variable_columns = variable_columns_in;
@@ -25783,6 +25790,10 @@ public:
         return out;
     }
 
+#if defined(ARBORENUM_REGRESSION)
+#include "regression_importance.hpp"
+#endif
+
     // if sum_samplewise_extrema=false, returns
     //   [ min_f Phi_j(f), max_f Phi_j(f) ]
     // if sum_samplewise_extrema=true, returns a wider range
@@ -25799,8 +25810,20 @@ public:
             matched_group_of_row_by_variable_eval = {},
         const std::vector<std::vector<int>>&
             matched_group_size_by_variable_eval = {},
-        bool sum_samplewise_extrema = false
+        bool sum_samplewise_extrema = false,
+        bool optimize_leaf_values = false
     ) const {
+#if defined(ARBORENUM_REGRESSION)
+        std::shared_ptr<TreeTrieNode> single_graph;
+        if (optimize_leaf_values && !result && !sum_samplewise_extrema && matched_group_of_row_by_variable_eval.empty()) {
+            if (trained_depth_budget < 0) throw std::runtime_error("Fit the model first.");
+            const Packed train = regression_importance_train_mask_();
+            const auto tree = single_tree_refined_override_ ? single_tree_refined_override_
+                : build_best_tree_from_caches(train, trained_depth_budget, empty_pk());
+            single_graph = regression_importance_graph_(tree.get(), train);
+            single_graph->budget = budget_override >= 0 ? budget_override : single_graph->min_objective;
+        }
+#endif
         auto setup =
             prepare_exact_replacement_interval_eval_(
                 X_row_major,
@@ -25810,11 +25833,19 @@ public:
                 bb_pred_eval,
                 matched_group_of_row_by_variable_eval,
                 matched_group_size_by_variable_eval
+#if defined(ARBORENUM_REGRESSION)
+                , single_graph.get()
+#endif
             );
 
         if (setup.ctx.n_eval <= 0) {
             return {};
         }
+
+#if defined(ARBORENUM_REGRESSION)
+        if (optimize_leaf_values && !sum_samplewise_extrema && !setup.use_matched_groups)
+            return regression_continuous_importance_(setup, result ? result.get() : single_graph.get());
+#endif
 
         const int number_of_variables =
             static_cast<int>(setup.variable_columns.size());

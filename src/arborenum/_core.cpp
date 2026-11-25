@@ -2110,7 +2110,8 @@ PYBIND11_MODULE(ARBORENUM_NATIVE_MODULE, m) {
                    Prediction,
                    py::array::c_style | py::array::forcecast
                > bb_pred_eval,
-               bool sum_samplewise_extrema) {
+               bool sum_samplewise_extrema,
+               bool optimize_leaf_values) {
 
                 auto X_vec =
                     numpy_uint8_2d_to_row_major(X_eval, "X_eval");
@@ -2133,7 +2134,8 @@ PYBIND11_MODULE(ARBORENUM_NATIVE_MODULE, m) {
                         bb_vec,
                         {}, // matched_group_of_row_by_variable_eval
                         {}, // matched_group_size_by_variable_eval
-                        sum_samplewise_extrema
+                        sum_samplewise_extrema,
+                        optimize_leaf_values
                     );
             },
             py::arg("X_eval"),
@@ -2142,7 +2144,8 @@ PYBIND11_MODULE(ARBORENUM_NATIVE_MODULE, m) {
             py::arg("variable_columns") =
                 std::vector<std::vector<int>>{},
             py::arg("bb_pred_eval") = py::array_t<Prediction>(0),
-            py::arg("sum_samplewise_extrema") = false
+            py::arg("sum_samplewise_extrema") = false,
+            py::arg("optimize_leaf_values") = regression_objective
         )
 
 

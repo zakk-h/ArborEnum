@@ -5465,8 +5465,13 @@ class ArborEnumRegressor(RegressorMixin, ArborEnum, BaseEstimator):
         return np.column_stack([values, values])
 
     def get_exact_replacement_importance_intervals(self, X_eval, y_eval, budget_override=None):
-        if getattr(self, "_single_tree_mode_", False):
-            return self._single_tree_importance(X_eval, y_eval, budget_override, False)
+        if budget_override is not None and not np.isfinite(budget_override):
+            raise ValueError("budget_override must be finite.")
+        if np.asarray(y_eval).size == 0:
+            raise ValueError("y_eval must be nonempty.")
+        if self.n_features_in_ is not None and budget_override is not None and budget_override >= 0:
+            if self.get_min_objective() > np.nextafter(float(budget_override), np.inf):
+                raise ValueError("budget_override excludes every represented tree.")
         return super().get_exact_replacement_importance_intervals(X_eval, y_eval, budget_override)
 
     def get_exact_replacement_divisive_importance_intervals(self, X_eval, y_eval, budget_override=None):
