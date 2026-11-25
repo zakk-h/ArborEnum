@@ -1768,6 +1768,7 @@ private:
 
             // remove objectives that are not over continuous features
             greedy_cache.clear();
+            if (sparsification_enabled_ && !proxy_split_indices_.empty()) proxy_split_indices_.clear();
 
             for (
                 auto it = lickety_cache_kla.begin();
@@ -2473,6 +2474,7 @@ public:
         }
 
         greedy_cache.clear();
+        if (sparsification_enabled_ && !proxy_split_indices_.empty()) proxy_split_indices_.clear();
         greedy_first_split_cache.clear();
     }
 
@@ -3746,9 +3748,9 @@ public:
         rule_list_mode = rule_list_mode_flag;
         majority_leaf_only = majority_leaf_only_flag;
         cache_cheap_subproblems =
-            cache_cheap_subproblems_flag || proxy_delta_ > 0;
+            cache_cheap_subproblems_flag || proxy_delta_ > 0 || sparsification_enabled_;
         proxy_style = proxy_style_in;
-        proxy_caching_enabled = proxy_caching_flag || proxy_delta_ > 0;
+        proxy_caching_enabled = proxy_caching_flag || proxy_delta_ > 0 || sparsification_enabled_;
         stronger_rollout = stronger_rollout_flag;
 
         restrict_proxy_in_lickety =
@@ -4020,6 +4022,7 @@ public:
 #endif
                 trie_cache.clear();
                 greedy_cache.clear();
+                if (sparsification_enabled_ && !proxy_split_indices_.empty()) proxy_split_indices_.clear();
                 
 
                 lickety_cache_k2.clear();
@@ -4378,9 +4381,9 @@ public:
         use_multipass = use_multipass_flag;
         rule_list_mode = rule_list_mode_flag;
         majority_leaf_only = majority_leaf_only_flag;
-        cache_cheap_subproblems = cache_cheap_subproblems_flag || proxy_delta_ > 0;
+        cache_cheap_subproblems = cache_cheap_subproblems_flag || proxy_delta_ > 0 || sparsification_enabled_;
         proxy_style = proxy_style_in;
-        proxy_caching_enabled = proxy_caching_flag || proxy_delta_ > 0;
+        proxy_caching_enabled = proxy_caching_flag || proxy_delta_ > 0 || sparsification_enabled_;
         stronger_rollout = stronger_rollout_flag;
         if (!rashomon_mode) { // force proxy caching on in single-tree mode - required for this codebase
             proxy_caching_enabled = true;
@@ -5092,9 +5095,9 @@ public:
         use_multipass = use_multipass_flag;
         rule_list_mode = rule_list_mode_flag;
         majority_leaf_only = majority_leaf_only_flag;
-        cache_cheap_subproblems = cache_cheap_subproblems_flag || proxy_delta_ > 0;
+        cache_cheap_subproblems = cache_cheap_subproblems_flag || proxy_delta_ > 0 || sparsification_enabled_;
         proxy_style = proxy_style_in;
-        proxy_caching_enabled = proxy_caching_flag || proxy_delta_ > 0;
+        proxy_caching_enabled = proxy_caching_flag || proxy_delta_ > 0 || sparsification_enabled_;
 
         if (!proxy_caching_enabled) { // we need this
             proxy_caching_enabled = true;
@@ -5971,7 +5974,7 @@ public:
         // in auto mode, we will decide whether to do this or not
 
         bool proxy_refinement_stopped_early = false;
-        if (proxy_refinement_mode != 0) {
+        if (proxy_refinement_mode != 0 && !sparsification_enabled_) {
 
             const int old_lookahead_init = lookahead_init;
             const int final_refinement_lookahead = std::max<int>(lookahead_init, depth_budget - 2); // d-1 is optimal at depth d, but we never evaluate at the root again, always one split lower
@@ -7219,6 +7222,7 @@ private:
     }
 
     void clear_fit_state_() {
+        clear_sparsification_state_();
         if (!proxy_trace_values_.empty()) proxy_trace_values_.clear();
 #if defined(ARBORENUM_REGRESSION)
         regression_importance_training_mask_.w.clear();
@@ -7245,6 +7249,7 @@ private:
         BBwrong = Packed();
 
         greedy_cache.clear();
+        if (sparsification_enabled_ && !proxy_split_indices_.empty()) proxy_split_indices_.clear();
         lickety_cache_k2.clear();
         lickety_cache_kla.clear();
         trie_cache.clear();
@@ -8627,6 +8632,11 @@ private:
             }
         }
 
+        if (sparsification_enabled_ && sparsify_subproblem_(mask, depth)) {
+            G = sparsified_split_(G, mask, depth, budget, pk, cpath, k_here, &B_active);
+            return;
+        }
+
         // now refine this OR node, using children that have already been updated.
         // this is important because we consider existing thresholds in enumerate_continuous_feature_for_trie_extend_restricted
         // and do iterative budget refinement again given that their minimum objectives could have improved with what we just did
@@ -9806,6 +9816,10 @@ private:
             : lookahead_init;
 
         
+        if (sparsification_enabled_ && sparsify_subproblem_(mask, depth)) {
+            return sparsified_split_(node, mask, depth, budget, pk, pi_cur, k_here, active_features);
+        }
+
         const int first_continuous_feature = continuous_starts.empty() ? n_features : continuous_starts[0];
         auto already_split = local_split_features_(node);
 
@@ -11530,6 +11544,7 @@ private:
             );
         }
 
+        Objective recorded_split = best_sum;
         Objective ans = leaf_loss;
 
         int8_t k_recurse;
@@ -11558,6 +11573,7 @@ private:
                 }
             }
 
+            if (sparsification_index_enabled_ && ans == recorded_split) remember_proxy_split_(kmask, depth_budget, ans, best_feat, use_kla_cache() ? k : 0);
             return ans;
         } else {
             // styles 1/2: recursively cycle k, k-1, ..., 1, k.
@@ -11615,6 +11631,7 @@ private:
                 *cpathRp
             );
 
+            recorded_split = std::min(recorded_split, left_loss + right_loss);
             ans = std::min(ans, left_loss + right_loss);
             ans = std::min(ans, best_sum);
         }
@@ -11631,6 +11648,7 @@ private:
             }
         }
 
+        if (sparsification_index_enabled_ && ans == recorded_split) remember_proxy_split_(kmask, depth_budget, ans, best_feat, use_kla_cache() ? k : 0);
         return ans;
     }
 
@@ -11695,6 +11713,7 @@ private:
             if (depth_budget == 1 && !use_deferral) {
                 const auto result = regression_stump_(mask, proxy_features_for_(ProxyLoopKind::DepthDExact), true);
                 if (proxy_caching_enabled) cache_lickety_if_true_(kmask, 1, 0, result.obj, true);
+                if (sparsification_index_enabled_) remember_proxy_split_(kmask, depth_budget, result.obj, result.first_feat, use_kla_cache() ? KTAG : 0);
                 return result.obj;
             }
         }
@@ -11738,6 +11757,7 @@ private:
         }
 
         Objective best_sum = leaf_loss;
+        int recorded_feature = -1;
         Objective best_cached_sum = std::numeric_limits<Objective>::max();
 
         Packed L(n_words), R(n_words);
@@ -11780,6 +11800,7 @@ private:
 
             if (cres.best_feat >= 0 && cres.best_sum < best_sum) {
                 best_sum = cres.best_sum;
+                recorded_feature = cres.best_feat;
             }
 
             if (cres.best_cached_sum < best_cached_sum) {
@@ -11865,6 +11886,7 @@ private:
 
             if (sum < best_sum) {
                 best_sum = sum;
+                recorded_feature = f;
             }
 
             update_cached_rollout_sum_if_available_(
@@ -11898,6 +11920,7 @@ private:
             );
         }
 
+        if (sparsification_index_enabled_ && ans == best_sum) remember_proxy_split_(kmask, depth_budget, ans, recorded_feature, use_kla_cache() ? KTAG : 0);
         return ans;
     }
 
@@ -11925,6 +11948,7 @@ private:
             if (!use_deferral) {
                 const auto result = regression_stump_(mask, proxy_features_for_(ProxyLoopKind::DepthDExact), true);
                 if (proxy_caching_enabled) greedy_first_split_cache.emplace(key, result);
+                if (sparsification_index_enabled_) remember_proxy_split_(key.k, depth_budget, result.obj, result.first_feat, -2);
                 return result;
             }
         }
@@ -11960,6 +11984,7 @@ private:
                 greedy_first_split_cache.emplace(key, out);
             }
 
+            if (sparsification_index_enabled_) remember_proxy_split_(key.k, depth_budget, out.obj, out.first_feat, -2);
             return out;
         }
 
@@ -12046,6 +12071,7 @@ private:
             greedy_first_split_cache.emplace(key, out);
         }
 
+        if (sparsification_index_enabled_) remember_proxy_split_(key.k, depth_budget, out.obj, out.first_feat, -2);
         return out;
     }
 
@@ -13422,6 +13448,7 @@ private:
             );
         }
 
+        if (sparsification_index_enabled_ && ans == split_loss) remember_proxy_split_(kmask, depth_budget, ans, best.feat, -1);
         return ans;
     }
 
@@ -13453,6 +13480,7 @@ private:
             if (!use_deferral) {
                 const auto result = regression_stump_(mask, proxy_features_for_(ProxyLoopKind::Greedy), true);
                 if (proxy_caching_enabled) greedy_cache.emplace(key, result.obj);
+                if (sparsification_index_enabled_) remember_proxy_split_(kmask, DEPTH, result.obj, result.first_feat, -1);
                 return result.obj;
             }
         }
@@ -13512,6 +13540,7 @@ private:
         }
 
         Objective best_sum = leaf_loss;
+        int recorded_feature = -1;
 
         Packed L(n_words);
         Packed R(n_words);
@@ -13561,6 +13590,7 @@ private:
 
             if (sum < best_sum) {
                 best_sum = sum;
+                if (sparsification_index_enabled_) recorded_feature = f;
             }
         }
 
@@ -13597,7 +13627,8 @@ private:
                     pos,
                     bb_wrong,
                     parent_counts,
-                    best_sum
+                    best_sum,
+                    sparsification_index_enabled_ ? &recorded_feature : nullptr
                 );
 
             if (candidate < best_sum) {
@@ -13613,6 +13644,7 @@ private:
             );
         }
 
+        if (sparsification_index_enabled_) remember_proxy_split_(kmask, DEPTH, best_sum, recorded_feature, -1);
         return best_sum;
     } 
 
@@ -13624,7 +13656,8 @@ private:
         int pos_total,
         int bb_wrong_total,
         const std::vector<int>& parent_counts,
-        Objective incumbent
+        Objective incumbent,
+        int* recorded_feature = nullptr
     ) const {
         if constexpr (regression_objective) {
             const auto split = regression_numerical_score_(num_group, sorted_rows);
@@ -13637,7 +13670,9 @@ private:
                     child.w[row >> 6] |= 1ULL << (row & 63);
                 }
                 if (!left.any() || !right.any()) return incumbent;
-                return std::min(incumbent, leaf_objective(left) + leaf_objective(right));
+                const Objective value = leaf_objective(left) + leaf_objective(right);
+                if (recorded_feature && value < incumbent) *recorded_feature = feature;
+                return std::min(incumbent, value);
             };
             if (!use_deferral) return evaluate(split.feat);
             const auto& allowed = proxy_features_for_(ProxyLoopKind::Greedy);
@@ -13865,6 +13900,7 @@ private:
 
             if (sum < best_sum) {
                 best_sum = sum;
+                if (recorded_feature) *recorded_feature = feat;
             }
 
             i = j;
@@ -14089,6 +14125,7 @@ private:
             greedy_cache.emplace(key, ans);
         }
 
+        if (sparsification_index_enabled_ && ans == split_loss) remember_proxy_split_(kmask, depth_budget, ans, best.feat, -1);
         return ans;
     }
 
@@ -14159,6 +14196,7 @@ private:
                 greedy_first_split_cache.emplace(key, out);
             }
 
+            if (sparsification_index_enabled_) remember_proxy_split_(key.k, depth_budget, out.obj, out.first_feat, -2);
             return out;
         }
 
@@ -14249,6 +14287,7 @@ private:
                 greedy_first_split_cache.emplace(key, out);
             }
 
+            if (sparsification_index_enabled_) remember_proxy_split_(key.k, depth_budget, out.obj, out.first_feat, -2);
             return out;
         }
 
@@ -14261,6 +14300,7 @@ private:
                 greedy_first_split_cache.emplace(key, out);
             }
 
+            if (sparsification_index_enabled_) remember_proxy_split_(key.k, depth_budget, out.obj, out.first_feat, -2);
             return out;
         }
 
@@ -14316,6 +14356,7 @@ private:
             greedy_first_split_cache.emplace(key, out); 
         }
 
+        if (sparsification_index_enabled_) remember_proxy_split_(key.k, depth_budget, out.obj, out.first_feat, -2);
         return out;
     }
 
@@ -14419,6 +14460,7 @@ private:
 
         Objective ans = min(leaf_loss, split_obj);
         if (proxy_caching_enabled) greedy_cache.emplace(key, ans);
+        if (sparsification_index_enabled_ && ans == split_obj) remember_proxy_split_(kmask, depth_budget, ans, best_feat, -1);
         return ans;
     }
 
@@ -14471,8 +14513,10 @@ private:
             }
         }
 
+        int recorded_feature = -1;
         auto cache_depth1 = [&](Objective val, bool allow_cache) {
             if (!proxy_caching_enabled || !allow_cache) return;
+            if (sparsification_index_enabled_) remember_proxy_split_(kmask, DEPTH, val, recorded_feature, use_greedy_cache_for_depth1 ? -1 : (use_kla_cache() ? KTAG : 0));
 
             if (use_greedy_cache_for_depth1) {
                 greedy_cache.emplace(K2{kmask, DEPTH}, val);
@@ -14484,6 +14528,7 @@ private:
         if constexpr (regression_objective) {
             if (!use_deferral) {
                 const auto result = regression_stump_(mask, proxy_features_for_(ProxyLoopKind::DepthDExact), false);
+                recorded_feature = result.first_feat;
                 cache_depth1(result.obj, true);
                 return result.obj;
             }
@@ -14568,6 +14613,7 @@ private:
 
                 if (sum < best_sum) {
                     best_sum = sum;
+                    recorded_feature = f;
                 }
             };
 
@@ -14606,7 +14652,7 @@ private:
             if (!L.any() || !R.any()) return;
 
             const Objective sum = leaf_objective(L) + leaf_objective(R);
-            if (sum < best_sum) best_sum = sum;
+            if (sum < best_sum) { best_sum = sum; recorded_feature = f; }
         };
 
         if (feats.empty()) {
@@ -14639,6 +14685,7 @@ private:
 
         if constexpr (regression_objective) {
             Objective best = leaf_objective(mask);
+            int recorded_feature = -1;
             if (!leaf_is_optimal_(mask, DEPTH, pk, best)) {
                 Packed left(n_words), right(n_words);
                 const auto evaluate = [&](int feature) {
@@ -14651,13 +14698,15 @@ private:
                     make_child_pks_if_needed_(feature, pk, left_pk, right_pk, left_path, right_path);
                     const Objective a = depth1_exact_solver_cached(left, *left_pk);
                     if (a + subtree_lower_bound_(right, 1, empty_pk()) >= best) return;
-                    best = std::min(best, a + depth1_exact_solver_cached(right, *right_pk));
+                    const Objective candidate = a + depth1_exact_solver_cached(right, *right_pk);
+                    if (candidate < best) { best = candidate; recorded_feature = feature; }
                 };
                 const auto& features = proxy_features_for_(ProxyLoopKind::DepthDExact);
                 if (features.empty()) for (int feature = 0; feature < n_features; ++feature) evaluate(feature);
                 else for (int feature : features) evaluate(feature);
             }
             if (proxy_caching_enabled) cache_lickety_if_true_(kmask, DEPTH, KTAG, best, true);
+            if (sparsification_index_enabled_) remember_proxy_split_(kmask, DEPTH, best, recorded_feature, use_kla_cache() ? KTAG : 0);
             return best;
         }
 
@@ -14693,6 +14742,7 @@ private:
         }
 
         Objective best_sum = std::numeric_limits<Objective>::max();
+        int recorded_feature = -1;
 
         Packed L(n_words), R(n_words);
         const auto& feats = proxy_features_for_(ProxyLoopKind::DepthDExact);
@@ -14717,7 +14767,7 @@ private:
             const Objective right_best = depth1_exact_solver_cached(R, *pkRp);
             const Objective sum = left_best + right_best;
 
-            if (sum < best_sum) best_sum = sum;
+            if (sum < best_sum) { best_sum = sum; recorded_feature = f; }
         };
 
         if (feats.empty()) {
@@ -14730,6 +14780,7 @@ private:
         if (best_sum != std::numeric_limits<Objective>::max()) ans = std::min(ans, best_sum);
 
         if (proxy_caching_enabled) cache_lickety_if_true_(kmask, DEPTH, KTAG, ans, /*allow_cache=*/true);
+        if (sparsification_index_enabled_ && ans == best_sum) remember_proxy_split_(kmask, DEPTH, ans, recorded_feature, use_kla_cache() ? KTAG : 0);
         return ans;
     }
 
@@ -14899,6 +14950,7 @@ private:
         }
 
         Objective best_sum = std::numeric_limits<Objective>::max();
+        int recorded_feature = -1;
         Objective best_cached_sum = std::numeric_limits<Objective>::max();
 
         Packed L(n_words), R(n_words);
@@ -14928,7 +14980,7 @@ private:
             const Objective right_best = depthd_exact_solver_cached(R, depth_budget - 1, *pkRp);
 
             const Objective sum = left_best + right_best;
-            if (sum < best_sum) best_sum = sum;
+            if (sum < best_sum) { best_sum = sum; recorded_feature = f; }
 
             update_cached_rollout_sum_if_available_(
                 best_cached_sum,
@@ -14959,6 +15011,7 @@ private:
         tighten_with_trie_min_if_available_(ans, kmask, depth_budget);
 
         if (proxy_caching_enabled) cache_lickety_if_true_(kmask, depth_budget, KTAG, ans, /*allow_cache=*/true);
+        if (sparsification_index_enabled_ && ans == best_sum) remember_proxy_split_(kmask, DEPTH, ans, recorded_feature, use_kla_cache() ? KTAG : 0);
         return ans;
     }
 
@@ -15180,6 +15233,7 @@ private:
             );
         }
 
+        Objective recorded_split = best_sum;
         Objective ans = leaf_loss;
 
         if (best_cached_sum != std::numeric_limits<Objective>::max()) {
@@ -15198,6 +15252,7 @@ private:
             const Objective left_loss  = lickety_split_k1(bestL, next_depth, *pkLp);
             const Objective right_loss = lickety_split_k1(bestR, next_depth, *pkRp);
 
+            recorded_split = std::min(recorded_split, left_loss + right_loss);
             ans = std::min(ans, left_loss + right_loss);
             ans = std::min(ans, best_sum);
         }
@@ -15207,6 +15262,7 @@ private:
         if (proxy_caching_enabled) {
             lickety_cache_k2.emplace(key2, ans);
         }
+        if (sparsification_index_enabled_ && ans == recorded_split) remember_proxy_split_(kmask, depth_budget, ans, best_feat, 0);
         return ans;
     }
 
@@ -15337,6 +15393,7 @@ private:
             andnot_bits(mask, X_bits[best_feat], bestR);
         }
 
+        Objective recorded_split = best_sum;
         Objective ans = leaf_loss;
 
         if (best_cached_sum != std::numeric_limits<Objective>::max()) {
@@ -15356,6 +15413,7 @@ private:
                 if (use_kla) lickety_cache_kla.emplace(keyla, ans);
                 else         lickety_cache_k2.emplace(key2,  ans);
             }
+            if (sparsification_index_enabled_ && ans == recorded_split) remember_proxy_split_(kmask, depth_budget, ans, best_feat, use_kla_cache() ? k : 0);
             return ans;
         } else {
             // styles 1/2: restart when it hits 0 (recursively applying SPLIT, so we're cycling k, k-1, k-2, ... 2 1 k)
@@ -15375,6 +15433,7 @@ private:
 
             left_loss  = generalized_lickety_split(bestL, next_depth, k_recurse, *pkLp);
             right_loss = generalized_lickety_split(bestR, next_depth, k_recurse, *pkRp);
+            recorded_split = std::min(recorded_split, left_loss + right_loss);
             ans = std::min(ans, left_loss + right_loss); // do licketysplit and take the minimum of it and leaf, even if greedy doesn't perform better than the leaf.
             ans = std::min(ans, best_sum); // if greedy is allowed more features, or heuristic pruning happens, we never want to be worse than greedy
 
@@ -15387,6 +15446,7 @@ private:
             else lickety_cache_k2.emplace(key2,  ans);
         }
         
+        if (sparsification_index_enabled_ && ans == recorded_split) remember_proxy_split_(kmask, depth_budget, ans, best_feat, use_kla_cache() ? k : 0);
         return ans;
     }
 
@@ -15487,13 +15547,17 @@ private:
         if (child_k <= 0) {
             Objective left_cost  = depthd_exact_proxy_objective_(bestL, child_d, *pkLp);
             Objective right_cost = depthd_exact_proxy_objective_(bestR, child_d, *pkRp);
-            return left_cost + right_cost;
+            const Objective value = left_cost + right_cost;
+            if (sparsification_index_enabled_) remember_proxy_split_(key_of_subproblem(mask, pk), depth_budget, value, best_feat, -3 - k);
+            return value;
         }
 
         // otherwise recurse using split() itself to find the next split it made
         Objective left_cost  = lickety_proxy_objective_(bestL, child_d, child_k, *pkLp);
         Objective right_cost = lickety_proxy_objective_(bestR, child_d, child_k, *pkRp);
-        return left_cost + right_cost;
+        const Objective value = left_cost + right_cost;
+        if (sparsification_index_enabled_) remember_proxy_split_(key_of_subproblem(mask, pk), depth_budget, value, best_feat, -3 - k);
+        return value;
     }
 
     int find_best_split_binary_known_counts(
@@ -16043,6 +16107,7 @@ private:
     }
 
 #include "proxy_delta.hpp"
+#include "sparsification.hpp"
 
     // not used by ArborEnum Rashomon mode, to support giving single decision tree algorithm results in package.
     shared_ptr<PredNode> build_best_tree_from_caches(const Packed& mask, int8_t depth_budget, const PathKey& pk) const {

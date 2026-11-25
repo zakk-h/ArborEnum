@@ -733,6 +733,28 @@ class ArborEnum:
             self._proxy_delta_value = value
         return value
 
+    def _set_sparsification(self, probability, seed, depth_budget, split_cache=True):
+        if not isinstance(split_cache, (bool, np.bool_)):
+            raise ValueError("sparsification_split_cache must be a boolean.")
+        if isinstance(seed, (bool, np.bool_)) or not isinstance(seed, (int, np.integer)) or not 0 <= seed < 2**64:
+            raise ValueError("sparsification_seed must be an integer between 0 and 2**64 - 1.")
+        if probability is None:
+            values = ()
+        else:
+            array = np.asarray(probability, dtype=float)
+            if array.ndim != 1 or len(array) != int(depth_budget):
+                raise ValueError("sparsification_probability must have length depth_budget.")
+            if not np.all(np.isfinite(array)) or np.any((array < 0) | (array > 1)):
+                raise ValueError("sparsification probabilities must be finite and between 0 and 1.")
+            values = tuple(array) if np.any(array) else ()
+        config = (values, int(seed), bool(split_cache))
+        if config != getattr(self, "_sparsification_config", ((), 0, True)):
+            self._model.set_sparsification(values, int(seed), bool(split_cache))
+            self._sparsification_config = config
+
+    def get_sparsification_stats(self):
+        return dict(self._model.get_sparsification_stats())
+
     def _prepare_bb_pred(self, *args, **kwargs):
         return _prepare_bb_pred(*args, regression=self._regression, **kwargs)
 
@@ -794,8 +816,12 @@ class ArborEnum:
         bb_pred=None,
         additive=False,
         proxy_delta=0,
+        sparsification_probability=None,
+        sparsification_seed=0,
+        sparsification_split_cache=True,
     ):
         proxy_delta = self._set_proxy_delta(proxy_delta, depth_budget)
+        self._set_sparsification(sparsification_probability, sparsification_seed, depth_budget, sparsification_split_cache)
         # fit directly from a mixed numerical matrix.
         # columns with at most binary_unique_threshold unique values are
         # threshold-binarized and treated as ordinary binary features. columns
@@ -932,6 +958,9 @@ class ArborEnum:
                 eta_defer=eta_defer,
                 additive=additive,         
                 proxy_delta=proxy_delta,
+                sparsification_probability=sparsification_probability,
+                sparsification_seed=sparsification_seed,
+                sparsification_split_cache=sparsification_split_cache,
             )
 
         return self.fit_prepared(
@@ -965,6 +994,9 @@ class ArborEnum:
             use_deferral=use_deferral,
             eta_defer=eta_defer,
             proxy_delta=proxy_delta,
+            sparsification_probability=sparsification_probability,
+            sparsification_seed=sparsification_seed,
+            sparsification_split_cache=sparsification_split_cache,
         )
 
     
@@ -1000,8 +1032,12 @@ class ArborEnum:
         eta_defer=0.0,
         bb_pred=None,
         proxy_delta=0,
+        sparsification_probability=None,
+        sparsification_seed=0,
+        sparsification_split_cache=True,
     ):
         proxy_delta = self._set_proxy_delta(proxy_delta, depth_budget)
+        self._set_sparsification(sparsification_probability, sparsification_seed, depth_budget, sparsification_split_cache)
         binary_names = list(X.columns) if hasattr(X, "columns") else None
         X = np.asarray(X, dtype=np.uint8)
         y = np.asarray(y, dtype=self._target_dtype)
@@ -1145,8 +1181,12 @@ class ArborEnum:
         seed=0,
         reuse_caches_between_subsamples=False,
         proxy_delta=0,
+        sparsification_probability=None,
+        sparsification_seed=0,
+        sparsification_split_cache=True,
     ):
         proxy_delta = self._set_proxy_delta(proxy_delta, depth_budget)
+        self._set_sparsification(sparsification_probability, sparsification_seed, depth_budget, sparsification_split_cache)
         X = np.asarray(X, dtype=np.uint8)
         y = np.asarray(y, dtype=self._target_dtype)
 
@@ -1346,8 +1386,12 @@ class ArborEnum:
         bb_pred=None,
         additive=False,
         proxy_delta=0,
+        sparsification_probability=None,
+        sparsification_seed=0,
+        sparsification_split_cache=True,
     ):
         proxy_delta = self._set_proxy_delta(proxy_delta, depth_budget)
+        self._set_sparsification(sparsification_probability, sparsification_seed, depth_budget, sparsification_split_cache)
         X = np.asarray(X, dtype=np.uint8)
         y = np.asarray(y, dtype=self._target_dtype)
 
@@ -1530,8 +1574,12 @@ class ArborEnum:
         bb_pred=None,
         additive=False,
         proxy_delta=0,
+        sparsification_probability=None,
+        sparsification_seed=0,
+        sparsification_split_cache=True,
     ):
         proxy_delta = self._set_proxy_delta(proxy_delta, depth_budget)
+        self._set_sparsification(sparsification_probability, sparsification_seed, depth_budget, sparsification_split_cache)
         X = np.asarray(X, dtype=np.uint8)
         y = np.asarray(y, dtype=self._target_dtype)
 
@@ -1839,8 +1887,12 @@ class ArborEnum:
         use_deferral=False,
         eta_defer=0.0,
         proxy_delta=0,
+        sparsification_probability=None,
+        sparsification_seed=0,
+        sparsification_split_cache=True,
     ):
         proxy_delta = self._set_proxy_delta(proxy_delta, depth_budget)
+        self._set_sparsification(sparsification_probability, sparsification_seed, depth_budget, sparsification_split_cache)
         proxy_style_int = parse_proxy_style(proxy_style)
         greedy_heur_int = parse_heuristic_for_greedy(heuristic_for_greedy)
         greedy_cont_mode = parse_greedy_continuous_mode(greedy_continuous_mode)
@@ -1918,8 +1970,12 @@ class ArborEnum:
         seed=0,
         reuse_caches_between_subsamples=False,
         proxy_delta=0,
+        sparsification_probability=None,
+        sparsification_seed=0,
+        sparsification_split_cache=True,
     ):
         proxy_delta = self._set_proxy_delta(proxy_delta, depth_budget)
+        self._set_sparsification(sparsification_probability, sparsification_seed, depth_budget, sparsification_split_cache)
         subsample_fraction = float(subsample_fraction)
 
         if (
@@ -2033,8 +2089,12 @@ class ArborEnum:
         eta_defer=0.0,
         additive=False,
         proxy_delta=0,
+        sparsification_probability=None,
+        sparsification_seed=0,
+        sparsification_split_cache=True,
     ):
         proxy_delta = self._set_proxy_delta(proxy_delta, depth_budget)
+        self._set_sparsification(sparsification_probability, sparsification_seed, depth_budget, sparsification_split_cache)
         first_rashomon_mult = float(first_rashomon_mult)
         second_rashomon_mult = float(second_rashomon_mult)
 
@@ -2139,8 +2199,12 @@ class ArborEnum:
         eta_defer=0.0,
         additive=False,
         proxy_delta=0,
+        sparsification_probability=None,
+        sparsification_seed=0,
+        sparsification_split_cache=True,
     ):
         proxy_delta = self._set_proxy_delta(proxy_delta, depth_budget)
+        self._set_sparsification(sparsification_probability, sparsification_seed, depth_budget, sparsification_split_cache)
         rashomon_mult = float(rashomon_mult)
 
         if second_rashomon_mult is None:

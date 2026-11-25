@@ -365,6 +365,8 @@ PYBIND11_MODULE(ARBORENUM_NATIVE_MODULE, m) {
         );
 
     py::class_<ArborEnum>(m, "ArborEnum")
+        .def("set_sparsification", &ArborEnum::set_sparsification, py::arg("probability"), py::arg("seed"), py::arg("cache_proxy_splits") = true)
+        .def("get_sparsification_stats", &ArborEnum::get_sparsification_stats)
         .def("set_proxy_delta", &ArborEnum::set_proxy_delta, py::arg("proxy_delta"))
         .def("set_regression_options", &ArborEnum::set_regression_options,
              py::arg("equivalent_points"), py::arg("continuous_kmeans"),
