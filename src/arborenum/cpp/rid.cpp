@@ -352,10 +352,20 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
     int movement_bound_mode = 1,
     std::size_t movement_cache_bytes = 128ULL * 1024 * 1024,
     int proxy_delta = 0
+#if defined(ARBORENUM_LOGISTIC)
+    , const std::vector<double>& base_logits = {}, double leaf_logit_clip = 30,
+    int newton_max_iter = 50, double newton_tol = 1e-10
+#endif
 ) {
     (void)memory_efficient;
 
     const int n_full = (int)X_row_major.size();
+#if defined(ARBORENUM_LOGISTIC)
+    if (!base_logits.empty() && base_logits.size() != y.size())
+        throw std::invalid_argument("RID base logits must match the input rows.");
+    for (double value : base_logits) if (!std::isfinite(value))
+        throw std::invalid_argument("RID base logits must be finite.");
+#endif
 
     if (n_full == 0) {
         throw std::runtime_error(
@@ -812,10 +822,18 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
             model.set_regression_options(equivalent_points, continuous_kmeans_bound, kmeans_min_remaining_depth);
             model.set_regression_movement_options(movement_bound_mode, movement_cache_bytes);
         }
+#if defined(ARBORENUM_LOGISTIC)
+        std::vector<double> bootstrap_logits;
+        if (!base_logits.empty()) {
+            bootstrap_logits.reserve(bootstrap_idx.size());
+            for (int row : bootstrap_idx) bootstrap_logits.push_back(base_logits[row]);
+        }
+        model.set_logistic_options(bootstrap_logits, leaf_logit_clip, newton_max_iter, newton_tol);
+#endif
         model.set_key_mode(key_mode);
         model.set_trie_cache_enabled(trie_cache_enabled);
         model.set_greedy_split_mode(greedy_split_mode);
-        model.set_greedy_continuous_mode(greedy_continuous_mode);
+        model.set_greedy_continuous_mode(logistic_objective ? 1 : greedy_continuous_mode);
         model.set_additive(additive);
 
         const bool any_proxy_is_restricted =
@@ -964,8 +982,9 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
             );
         }
 
-        const uint64_t trees_at_budget =
-            model.result->count_leq(budget_override);
+        const bool counted_trees = !logistic_objective || !lossless || importance_interval_mode == 0;
+        const uint64_t trees_at_budget = counted_trees ? model.result->count_leq(budget_override)
+            : (model.result->min_objective <= budget_override ? 1ULL : 0ULL);
 
         if (trees_at_budget == 0) {
             cout << "RID bootstrap " << (bootstrap + 1)
@@ -1084,10 +1103,9 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
                 cout << "Finished RID bootstrap: "
                      << (bootstrap + 1)
                      << " / "
-                     << n_bootstraps
-                     << " with "
-                     << number_of_trees
-                     << " trees represented (not enumerated)\n";
+                     << n_bootstraps;
+                if (counted_trees) cout << " with " << number_of_trees << " trees represented (not enumerated)\n";
+                else cout << " using the packed graph without tree counting\n";
 
                 const auto exact_end =
                     std::chrono::steady_clock::now();

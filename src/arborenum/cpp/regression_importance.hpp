@@ -8,10 +8,23 @@
         if (!tree) throw std::runtime_error("The fitted tree is empty.");
         auto graph = std::make_shared<TreeTrieNode>();
         if (tree->feature < 0) {
+#if defined(ARBORENUM_LOGISTIC)
+            long double loss = 0;
+            for (int word = 0; word < n_words; ++word) {
+                uint64_t bits = mask.w[word];
+                while (bits) {
+                    const int row = word * 64 + std::countr_zero(bits);
+                    loss += logistic_loss_(row, tree->prediction);
+                    bits &= bits - 1;
+                }
+            }
+            graph->add_leaf(tree->prediction, gamma + static_cast<Objective>(loss));
+#else
             const auto moments = regression_moments_(mask);
             if (tree->prediction == DEFER_PREDICTION)
                 graph->add_leaf(DEFER_PREDICTION, gamma + defer_penalty_from_count_(moments.count) + count_bb_wrong(mask));
             else graph->add_leaf(static_cast<Prediction>(moments.mean), gamma + static_cast<Objective>(moments.sse));
+#endif
         } else {
             Packed left(n_words), right(n_words);
             split_threshold_bits_(mask, tree->feature, left, right);

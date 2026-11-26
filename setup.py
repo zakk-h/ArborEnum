@@ -140,7 +140,7 @@ ext_modules = [
         sources=[
             "src/arborenum/_core.cpp",
         ],
-        depends=["src/arborenum/cpp/arborenum.cpp", "src/arborenum/cpp/rid.cpp", "src/arborenum/cpp/objective.hpp", "src/arborenum/cpp/native_headers.hpp", "src/arborenum/cpp/regression_objective.hpp", "src/arborenum/cpp/sparsification.hpp", "src/arborenum/cpp/regression_threshold.hpp"],
+        depends=["src/arborenum/cpp/arborenum.cpp", "src/arborenum/cpp/rid.cpp", "src/arborenum/cpp/objective.hpp", "src/arborenum/cpp/logistic_engine.hpp", "src/arborenum/cpp/native_headers.hpp", "src/arborenum/cpp/regression_objective.hpp", "src/arborenum/cpp/sparsification.hpp", "src/arborenum/cpp/regression_threshold.hpp"],
         include_dirs=[
             pybind11.get_include(),
             "src/arborenum",
@@ -151,7 +151,14 @@ ext_modules = [
     Extension(
         "arborenum._regression_core",
         sources=["src/arborenum/_regression_core.cpp"],
-        depends=["src/arborenum/_core.cpp", "src/arborenum/cpp/arborenum.cpp", "src/arborenum/cpp/rid.cpp", "src/arborenum/cpp/objective.hpp", "src/arborenum/cpp/native_headers.hpp", "src/arborenum/cpp/regression_objective.hpp", "src/arborenum/cpp/sparsification.hpp", "src/arborenum/cpp/regression_threshold.hpp", "src/arborenum/cpp/regression_importance.hpp"],
+        depends=["src/arborenum/_core.cpp", "src/arborenum/cpp/arborenum.cpp", "src/arborenum/cpp/rid.cpp", "src/arborenum/cpp/objective.hpp", "src/arborenum/cpp/logistic_engine.hpp", "src/arborenum/cpp/native_headers.hpp", "src/arborenum/cpp/regression_objective.hpp", "src/arborenum/cpp/sparsification.hpp", "src/arborenum/cpp/regression_threshold.hpp", "src/arborenum/cpp/regression_importance.hpp"],
+        include_dirs=[pybind11.get_include(), "src/arborenum", "src/arborenum/cpp"],
+        language="c++",
+    ),
+    Extension(
+        "arborenum._logistic_core",
+        sources=["src/arborenum/_logistic_core.cpp"],
+        depends=["src/arborenum/_core.cpp", "src/arborenum/cpp/arborenum.cpp", "src/arborenum/cpp/rid.cpp", "src/arborenum/cpp/objective.hpp", "src/arborenum/cpp/native_headers.hpp", "src/arborenum/cpp/logistic_engine.hpp", "src/arborenum/cpp/regression_objective.hpp", "src/arborenum/cpp/regression_threshold.hpp", "src/arborenum/cpp/sparsification.hpp", "src/arborenum/cpp/proxy_delta.hpp", "src/arborenum/cpp/regression_importance.hpp"],
         include_dirs=[pybind11.get_include(), "src/arborenum", "src/arborenum/cpp"],
         language="c++",
     ),

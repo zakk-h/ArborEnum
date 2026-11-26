@@ -923,6 +923,9 @@ struct EvalTargets : std::vector<Packed> {
 #if defined(ARBORENUM_REGRESSION)
     std::vector<Prediction> targets;
     std::vector<Prediction> bb_predictions;
+#if defined(ARBORENUM_LOGISTIC)
+    std::vector<double> base_logits;
+#endif
 #endif
 };
 
@@ -1132,6 +1135,9 @@ private:
         std::vector<std::pair<int, double>> points;
         std::vector<std::pair<Objective, Objective>> anchors;
         std::size_t scanned = 0;
+#if defined(ARBORENUM_LOGISTIC)
+        std::vector<long double> logistic_prefix;
+#endif
 
         RegressionFeatureScope(const ArborEnum& owner, const Packed& mask, int feature, int depth)
             : owner(owner), mask(mask), first(-1), end(-1), depth(depth), previous(owner.regression_feature_scope_) {
@@ -1150,6 +1156,8 @@ private:
 #else
     static constexpr std::vector<Prediction> regression_bb_predictions_{};
 #endif
+
+#include "logistic_engine.hpp"
 
     uint64_t regression_mask_key_(const Packed& mask) const {
         if (key_mode == KeyMode::LITS_EXACT) return mask_ids.intern(mask, n_words, tail_mask);
@@ -1237,6 +1245,7 @@ private:
 #endif
 
     GreedyObjFirstSplit regression_stump_(const Packed& mask, const std::vector<int>& allowed, bool continuous) const {
+        if constexpr (logistic_objective) return logistic_stump_(mask, allowed, continuous);
 #if defined(ARBORENUM_REGRESSION)
         const auto total = regression_moments_(mask);
         const Objective leaf = total.count ? gamma + static_cast<Objective>(total.sse) : 0;
@@ -1472,6 +1481,7 @@ private:
     }
 
     Objective subtree_lower_bound_(const Packed& mask, int8_t depth, const PathKey& pk) const {
+        if constexpr (logistic_objective) return logistic_lower_bound_(mask, depth);
 #if defined(ARBORENUM_REGRESSION)
         if (depth <= 0) return leaf_objective(mask);
         if (use_deferral || depth < regression_kmeans_min_depth_) return mask.any() ? gamma : 0;
@@ -1532,6 +1542,7 @@ private:
     }
 
     bool leaf_is_optimal_(const Packed& mask, int8_t depth, const PathKey& pk, Objective leaf) const {
+        if constexpr (logistic_objective) return logistic_leaf_optimal_(mask, leaf);
         if constexpr (regression_objective) {
             const Objective bound = subtree_lower_bound_(mask, depth, pk);
             return leaf <= 2 * gamma || leaf <= std::nextafter(bound, std::numeric_limits<double>::infinity());
@@ -1724,6 +1735,7 @@ private:
         const PathKey& pk,
         const ContinuousPath& cpath = empty_continuous_path()
     ) {
+        if constexpr (logistic_objective) return logistic_greedy_(mask, depth_budget, pk, restrict_proxy_in_greedy).obj;
         // if greedy is feature-restricted, always use the existing binary feature loop.
         if (restrict_proxy_in_greedy) {
             return train_greedy(mask, depth_budget, pk);
@@ -2101,7 +2113,7 @@ private:
             bound *= (1.0 + multiplicative_slack);
         }
 
-        return rounded_objective(bound);
+        return rounded_objective(logistic_objective ? logistic_budget_(bound, reference_n) : bound);
     }
 
     // standard formulas in greedy decision tree optimization
@@ -2801,6 +2813,7 @@ public:
         trained_depth_budget = depth_budget;
         continuous_starts = prepared_continuous_starts;
         y_train = prepared_y;
+        if constexpr (logistic_objective) initialize_logistic_();
         if constexpr (regression_objective) num_classes = 1;
         else {
         for (int label : prepared_y) {
@@ -3696,11 +3709,9 @@ public:
 
         continuous_starts = continuous_starts_in;
         y_train = y;
+        if constexpr (logistic_objective) initialize_logistic_();
 
-        if (
-            greedy_continuous_mode ==
-            GreedyContinuousMode::NUMERICAL
-        ) {
+        if (!logistic_objective && greedy_continuous_mode == GreedyContinuousMode::NUMERICAL) {
             if (
                 numerical_X_cols_for_greedy.size() !=
                     continuous_starts.size() ||
@@ -4018,6 +4029,7 @@ public:
 #if defined(ARBORENUM_REGRESSION)
                 regression_lower_bounds_.clear();
                 regression_moments_cache_.clear();
+                if constexpr (logistic_objective) clear_logistic_leaf_cache_();
                 regression_threshold_indices_.clear();
 #endif
                 trie_cache.clear();
@@ -4344,8 +4356,9 @@ public:
         n_samples = regression_objective && X_col_major.empty() ? static_cast<int>(y.size()) : (int)X_col_major[0].size();
         continuous_starts = continuous_starts_in;
         y_train = y;
+        if constexpr (logistic_objective) initialize_logistic_();
        
-        if (greedy_continuous_mode == GreedyContinuousMode::NUMERICAL) {
+        if (!logistic_objective && greedy_continuous_mode == GreedyContinuousMode::NUMERICAL) {
             if (numerical_X_cols_for_greedy.size() != continuous_starts.size() ||
                 numerical_global_sorted_idx.size() != continuous_starts.size() ||
                 numerical_unique_values_for_greedy.size() != continuous_starts.size()) {
@@ -4495,7 +4508,11 @@ public:
         // SINGLE TREE SUPPORT - always use all features
         if (!rashomon_mode) {
             Objective single_obj = 0;
-            if (lookahead_init <= 0) {
+            if constexpr (logistic_objective) {
+                single_obj = proxy_completion_objective_(root, depth_budget, lookahead_init, root_pk, root_cpath);
+                single_tree_refined_override_ = build_best_tree_from_caches(root, depth_budget, root_pk);
+                single_obj = tree_training_objective_raw_(single_tree_refined_override_.get());
+            } else if (lookahead_init <= 0) {
                 single_obj = train_greedy_continuous(root, depth_budget, root_pk, root_cpath);
             } else {
                 if (proxy_style == 4) {
@@ -5013,6 +5030,7 @@ public:
         n_samples = regression_objective && X_col_major.empty() ? static_cast<int>(y.size()) : (int)X_col_major[0].size();
         continuous_starts = continuous_starts_in;
         y_train = y;
+        if constexpr (logistic_objective) initialize_logistic_();
 
         if ((int)y.size() != n_samples) {
             throw std::runtime_error("y length does not match number of samples.");
@@ -5024,7 +5042,7 @@ public:
             }
         }
 
-        if (greedy_continuous_mode == GreedyContinuousMode::NUMERICAL) {
+        if (!logistic_objective && greedy_continuous_mode == GreedyContinuousMode::NUMERICAL) {
             if (numerical_X_cols_for_greedy.size() != continuous_starts.size() ||
                 numerical_global_sorted_idx.size() != continuous_starts.size() ||
                 numerical_unique_values_for_greedy.size() != continuous_starts.size()) {
@@ -7223,6 +7241,7 @@ private:
 
     void clear_fit_state_() {
         clear_sparsification_state_();
+        if constexpr (logistic_objective) clear_logistic_state_();
         if (!proxy_trace_values_.empty()) proxy_trace_values_.clear();
 #if defined(ARBORENUM_REGRESSION)
         regression_importance_training_mask_.w.clear();
@@ -8709,6 +8728,7 @@ private:
         Objective delta,
         bool conservative = false
     ) const {
+        if constexpr (logistic_objective) return logistic_movement_(mask, feat_a, feat_b, delta) >= delta;
         if constexpr (regression_objective) {
 #if defined(ARBORENUM_REGRESSION)
             const bool tighten = regression_continuous_kmeans_ && !conservative;
@@ -10586,6 +10606,11 @@ private:
     BestLeafAction best_leaf_action(
         const Packed& mask
     ) const {
+        if constexpr (logistic_objective) {
+            const auto value = logistic_leaf_(mask);
+            return BestLeafAction{static_cast<Prediction>(value.correction),
+                static_cast<Objective>(value.count ? gamma + value.loss : 0)};
+        }
         if constexpr (regression_objective) {
             const auto moments = regression_moments_(mask);
             if (!moments.count) return BestLeafAction{0, 0};
@@ -12741,6 +12766,7 @@ private:
         int8_t depth_budget,
         const PathKey& pk
     ) {
+        if constexpr (logistic_objective) return logistic_greedy_(mask, depth_budget, pk, false).obj;
         if (numerical_X_cols_for_greedy.size() != continuous_starts.size() ||
             numerical_global_sorted_idx.size() != continuous_starts.size() ||
             numerical_unique_values_for_greedy.size() != continuous_starts.size()) {
@@ -13193,6 +13219,7 @@ private:
         const PathKey& pk,
         const NumericalGreedyState& state
     ) {
+        if constexpr (logistic_objective) return logistic_greedy_(mask, depth_budget, pk, false).obj;
         if (depth_budget <= 0) {
             return leaf_objective(mask);
         }
@@ -13916,6 +13943,7 @@ private:
         const PathKey& pk,
         const ContinuousPath& cpath = empty_continuous_path()
     ) {
+        if constexpr (logistic_objective) return logistic_greedy_(mask, depth_budget, pk, false).obj;
         if (depth_budget <= 0) {
             return leaf_objective(mask);
         }
@@ -14136,6 +14164,7 @@ private:
         const PathKey& pk,
         const ContinuousPath& cpath = empty_continuous_path()
     ) {
+        if constexpr (logistic_objective) return logistic_greedy_(mask, depth_budget, pk, false);
         if (depth_budget <= 0) {
             return GreedyObjFirstSplit{leaf_objective(mask), -1};
         }
@@ -14365,6 +14394,7 @@ private:
     // these are now existing binary algorithms - nothing new exists beyond this point. our contribution ends here.
 
     Objective train_greedy(const Packed& mask, int8_t depth_budget, const PathKey& pk) {
+        if constexpr (logistic_objective) return logistic_greedy_(mask, depth_budget, pk, true).obj;
         if (depth_budget == 0) {
             return leaf_objective(mask);
         }
@@ -15889,8 +15919,9 @@ private:
         if constexpr (regression_objective) {
             long double error = 0;
             for (int row = 0; row < n_samples; ++row) {
-                const long double residual = y_train[row] - predict_training_sample_from_prednode_(tree, row);
-                error += residual * residual;
+                const double prediction = predict_training_sample_from_prednode_(tree, row);
+                const long double residual = y_train[row] - prediction;
+                error += logistic_objective ? logistic_loss_(row, prediction) : residual * residual;
             }
             return static_cast<Objective>(error);
         }
@@ -16022,13 +16053,17 @@ private:
                 while (bits) {
                     const int row = word * 64 + std::countr_zero(bits);
                     const long double target = y_train[row];
-                    const long double left = target - predict_training_sample_from_prednode_(node->left.get(), row);
-                    const long double right = target - predict_training_sample_from_prednode_(node->right.get(), row);
-                    const long double delta = left * left - right * right;
+                    const long double left_prediction = predict_training_sample_from_prednode_(node->left.get(), row);
+                    const long double right_prediction = predict_training_sample_from_prednode_(node->right.get(), row);
+                    const long double left = target - left_prediction;
+                    const long double right = target - right_prediction;
+                    const long double left_loss = logistic_objective ? logistic_loss_(row, left_prediction) : left * left;
+                    const long double right_loss = logistic_objective ? logistic_loss_(row, right_prediction) : right * right;
+                    const long double delta = left_loss - right_loss;
                     differences.emplace_back(row, delta);
-                    baseline += right * right;
+                    baseline += right_loss;
                     total_delta += delta;
-                    current += training_value_(row, node->feature) ? left * left : right * right;
+                    current += training_value_(row, node->feature) ? left_loss : right_loss;
                     bits &= bits - 1;
                 }
             }
@@ -16166,6 +16201,28 @@ private:
             return best;
         };
 
+        if constexpr (logistic_objective) {
+            const uint64_t key = key_of_subproblem(mask, pk);
+            const auto cached = greedy_first_split_cache.find(K2{key, depth_budget});
+            if (cached != greedy_first_split_cache.end() &&
+                    cached->second.obj == best_cached_obj(mask, depth_budget, pk)) {
+                auto tree = std::make_shared<PredNode>();
+                tree->feature = cached->second.first_feat;
+                if (tree->feature < 0) tree->prediction = leaf_pred;
+                else {
+                    Packed left(n_words), right(n_words);
+                    split_threshold_bits_(mask, tree->feature, left, right);
+                    PathKey pk_left, pk_right;
+                    const PathKey* left_key = &empty_pk();
+                    const PathKey* right_key = &empty_pk();
+                    make_child_pks_if_needed_(tree->feature, pk, left_key, right_key, pk_left, pk_right);
+                    tree->left = build_best_tree_from_caches(left, depth_budget - 1, *left_key);
+                    tree->right = build_best_tree_from_caches(right, depth_budget - 1, *right_key);
+                }
+                return tree;
+            }
+        }
+
         // choose best split using cached objectives
         const int8_t child_d = (int8_t)(depth_budget - 1);
 
@@ -16178,6 +16235,11 @@ private:
 
         const int F = n_features;
         for (int f = 0; f < F; ++f) {
+            if constexpr (logistic_objective) {
+                if (restrict_proxy_in_lickety && restrict_proxy_in_depthd_exact && restrict_proxy_in_greedy &&
+                        !allowed_proxy_features.empty() &&
+                        !std::binary_search(allowed_proxy_features.begin(), allowed_proxy_features.end(), f)) continue;
+            }
             and_bits(mask, X_bits[f], L);
             andnot_bits(mask, X_bits[f], R);
             if (!L.any() || !R.any()) continue;
@@ -17131,16 +17193,24 @@ private:
         return out;
     }
 
-    static inline EvalTargets build_eval_y_bits_(
+    inline EvalTargets build_eval_y_bits_(
         const std::vector<Prediction>& y_eval,
         int num_classes,
         int n_words,
         uint64_t tail_mask
-    ) {
+    ) const {
         EvalTargets Y_eval((size_t)num_classes, Packed((size_t)n_words));
 
 #if defined(ARBORENUM_REGRESSION)
         Y_eval.targets = y_eval;
+#if defined(ARBORENUM_LOGISTIC)
+        const auto& offsets = logistic_evaluation_offsets_.empty() ? logistic_offsets_ : logistic_evaluation_offsets_;
+        if (!offsets.empty() && offsets.size() != y_eval.size())
+            throw std::invalid_argument("Evaluation base logits must match evaluation rows.");
+        Y_eval.base_logits = offsets;
+        for (double value : y_eval) if (value != 0 && value != 1)
+            throw std::invalid_argument("Logistic evaluation targets must be zero or one.");
+#endif
         for (double value : y_eval) if (!std::isfinite(value)) throw std::invalid_argument("Evaluation targets must be finite.");
         return Y_eval;
 #endif
@@ -17436,6 +17506,19 @@ private:
         return out;
     }
 
+    long double fixed_prediction_evaluation_loss_(const EvalTargets& labels, int row, Prediction prediction) const {
+#if defined(ARBORENUM_LOGISTIC)
+        const double offset = labels.base_logits.empty() ? 0 : labels.base_logits[row];
+        return logistic_softplus_((1 - 2 * labels.targets[row]) * (offset + prediction));
+#elif defined(ARBORENUM_REGRESSION)
+        const double fitted = prediction == DEFER_PREDICTION ? labels.bb_predictions.at(row) : prediction;
+        const long double residual = labels.targets[row] - fitted;
+        return residual * residual;
+#else
+        return 0;
+#endif
+    }
+
     inline Objective exact_wrong_count_for_leaf_(
         const Packed& target_rows,
         Prediction prediction,
@@ -17449,9 +17532,7 @@ private:
             uint64_t bits = target_rows.w[word];
             while (bits) {
                 const int row = word * 64 + std::countr_zero(bits);
-                const double fitted = prediction == DEFER_PREDICTION ? Y_eval_bits.bb_predictions.at(row) : prediction;
-                const long double residual = Y_eval_bits.targets[row] - fitted;
-                error += residual * residual;
+                error += fixed_prediction_evaluation_loss_(Y_eval_bits, row, prediction);
                 bits &= bits - 1;
             }
         }
@@ -17521,9 +17602,7 @@ private:
             uint64_t bits = state.target_rows.w[word];
             while (bits) {
                 const int row = word * 64 + std::countr_zero(bits);
-                const double fitted = prediction == DEFER_PREDICTION ? labels.bb_predictions.at(row) : prediction;
-                const long double residual = labels.targets[row] - fitted;
-                error += residual * residual * weights[groups ? (*groups)[row] : 0];
+                error += fixed_prediction_evaluation_loss_(labels, row, prediction) * weights[groups ? (*groups)[row] : 0];
                 bits &= bits - 1;
             }
         }
@@ -18503,9 +18582,7 @@ private:
         if (!state.replacement_feature_used) return result;
         const auto weights = regression_replacement_weights_(state, ctx, matched_group_of_row_eval, matched_group_inv_size_eval);
         for (int row = 0; row < ctx.n_eval; ++row) {
-            const double fitted = prediction == DEFER_PREDICTION ? Y_eval_bits.bb_predictions.at(row) : prediction;
-            const long double residual = Y_eval_bits.targets[row] - fitted;
-            const long double loss = residual * residual;
+            const long double loss = fixed_prediction_evaluation_loss_(Y_eval_bits, row, prediction);
             if ((original_mask.w[row >> 6] >> (row & 63)) & 1ULL) result[row] -= static_cast<double>(loss);
             if ((state.target_rows.w[row >> 6] >> (row & 63)) & 1ULL) result[row] += static_cast<double>(loss * weights[matched_group_of_row_eval ? (*matched_group_of_row_eval)[row] : 0]);
         }
@@ -25532,6 +25609,17 @@ public:
         const std::vector<std::vector<int>>&
             matched_group_size_by_variable_eval = {}
     ) const {
+        std::shared_ptr<TreeTrieNode> single_graph;
+#if defined(ARBORENUM_LOGISTIC)
+        if (!result) {
+            if (trained_depth_budget < 0) throw std::runtime_error("Fit the model first.");
+            const Packed train = regression_importance_train_mask_();
+            const auto tree = single_tree_refined_override_ ? single_tree_refined_override_
+                : build_best_tree_from_caches(train, trained_depth_budget, empty_pk());
+            single_graph = regression_importance_graph_(tree.get(), train);
+        }
+#endif
+        const TreeTrieNode* evaluation_graph = result ? result.get() : single_graph.get();
         auto setup =
             prepare_exact_replacement_interval_eval_(
                 X_row_major,
@@ -25540,27 +25628,28 @@ public:
                 variable_columns_in,
                 bb_pred_eval,
                 matched_group_of_row_by_variable_eval,
-                matched_group_size_by_variable_eval
+                matched_group_size_by_variable_eval,
+                evaluation_graph
             );
 
         if (setup.ctx.n_eval <= 0) return {};
 
         // require_exact_importance_eval_is_training_(setup, y_eval);
 
-        if (!result) {
+        if (!evaluation_graph) {
             throw std::runtime_error(
                 "No Rashomon trie has been constructed. Call fit() first."
             );
         }
 
-        if (setup.budget > result->budget) {
+        if (setup.budget > evaluation_graph->budget) {
             throw std::runtime_error(
                 "Cached divisive importance can only query a budget no larger "
                 "than the fitted root graph budget."
             );
         }
 
-        const Objective delta = result->budget - setup.budget;
+        const Objective delta = evaluation_graph->budget - setup.budget;
         const int number_of_variables =
             static_cast<int>(setup.variable_columns.size());
 
@@ -25597,7 +25686,7 @@ public:
 
         auto root_entry =
             collect_exact_global_divisive_frontiers_cached_(
-                result.get(),
+                evaluation_graph,
                 static_cast<int>(trained_depth_budget),
                 delta,
                 setup.root_mask,
@@ -25702,6 +25791,17 @@ public:
         const std::vector<std::vector<int>>&
             matched_group_size_by_variable_eval = {}
     ) const {
+        std::shared_ptr<TreeTrieNode> single_graph;
+#if defined(ARBORENUM_LOGISTIC)
+        if (!result) {
+            if (trained_depth_budget < 0) throw std::runtime_error("Fit the model first.");
+            const Packed train = regression_importance_train_mask_();
+            const auto tree = single_tree_refined_override_ ? single_tree_refined_override_
+                : build_best_tree_from_caches(train, trained_depth_budget, empty_pk());
+            single_graph = regression_importance_graph_(tree.get(), train);
+        }
+#endif
+        const TreeTrieNode* evaluation_graph = result ? result.get() : single_graph.get();
         auto setup =
             prepare_exact_replacement_interval_eval_(
                 X_row_major,
@@ -25710,29 +25810,30 @@ public:
                 variable_columns_in,
                 bb_pred_eval,
                 matched_group_of_row_by_variable_eval,
-                matched_group_size_by_variable_eval
+                matched_group_size_by_variable_eval,
+                evaluation_graph
             );
 
         if (setup.ctx.n_eval <= 0) {
             return {};
         }
 
-        require_exact_importance_eval_is_training_(setup, y_eval);
+        if constexpr (!logistic_objective) require_exact_importance_eval_is_training_(setup, y_eval);
 
-        if (!result) {
+        if (!evaluation_graph) {
             throw std::runtime_error(
                 "No Rashomon trie has been constructed. Call fit() first."
             );
         }
 
-        if (setup.budget > result->budget) {
+        if (setup.budget > evaluation_graph->budget) {
             throw std::runtime_error(
                 "Cached global importance can only query a budget no larger "
                 "than the fitted root graph budget."
             );
         }
 
-        const Objective delta = result->budget - setup.budget;
+        const Objective delta = evaluation_graph->budget - setup.budget;
 
         const int number_of_variables =
             static_cast<int>(setup.variable_columns.size());
@@ -25776,7 +25877,7 @@ public:
 
         auto root_entry =
             collect_exact_global_importance_frontiers_cached_(
-                result.get(),
+                evaluation_graph,
                 static_cast<int>(trained_depth_budget),
                 delta,
                 setup.root_mask,
@@ -25878,9 +25979,16 @@ public:
         bool sum_samplewise_extrema = false,
         bool optimize_leaf_values = false
     ) const {
+        if constexpr (logistic_objective) {
+            if (optimize_leaf_values) throw std::invalid_argument("Logistic importance uses the fitted leaf corrections.");
+            if (!sum_samplewise_extrema)
+                return get_exact_replacement_importance_intervals_cached_frontier_packed_trie(
+                    X_row_major, y_eval, budget_override, variable_columns_in, bb_pred_eval,
+                    matched_group_of_row_by_variable_eval, matched_group_size_by_variable_eval);
+        }
 #if defined(ARBORENUM_REGRESSION)
         std::shared_ptr<TreeTrieNode> single_graph;
-        if (optimize_leaf_values && !result && !sum_samplewise_extrema && matched_group_of_row_by_variable_eval.empty()) {
+        if ((optimize_leaf_values || logistic_objective) && !result && !sum_samplewise_extrema && matched_group_of_row_by_variable_eval.empty()) {
             if (trained_depth_budget < 0) throw std::runtime_error("Fit the model first.");
             const Packed train = regression_importance_train_mask_();
             const auto tree = single_tree_refined_override_ ? single_tree_refined_override_
@@ -25903,13 +26011,18 @@ public:
 #endif
             );
 
+        const TreeTrieNode* evaluation_graph = result.get();
+#if defined(ARBORENUM_REGRESSION)
+        if (!evaluation_graph) evaluation_graph = single_graph.get();
+#endif
+
         if (setup.ctx.n_eval <= 0) {
             return {};
         }
 
 #if defined(ARBORENUM_REGRESSION)
         if (optimize_leaf_values && !sum_samplewise_extrema && !setup.use_matched_groups)
-            return regression_continuous_importance_(setup, result ? result.get() : single_graph.get());
+            return regression_continuous_importance_(setup, result ? evaluation_graph : single_graph.get());
 #endif
 
         const int number_of_variables =
@@ -25956,7 +26069,7 @@ public:
 
             auto buckets =
                 collect_exact_global_importance_extrema_by_obj_(
-                    result.get(),
+                    evaluation_graph,
                     setup.budget,
                     setup.root_mask,
                     setup.root_mask,
@@ -26023,7 +26136,7 @@ public:
 
         ExactNodeVariableMasks_ node_variable_masks;
         build_exact_node_variable_masks_(
-            result.get(),
+            evaluation_graph,
             setup.internal_to_variable,
             number_of_variables,
             node_variable_masks
@@ -26044,7 +26157,7 @@ public:
 
             auto all_extrema =
                 collect_exact_local_importance_numerator_extrema_all_at_most_(
-                result.get(),
+                evaluation_graph,
                 setup.budget,
                 setup.root_mask,
                 setup.root_mask,
@@ -26178,7 +26291,7 @@ public:
 
             auto extrema =
                 collect_exact_local_importance_numerator_extrema_at_most_(
-                    result.get(),
+                    evaluation_graph,
                     setup.budget,
                     setup.root_mask,
                     setup.root_mask,

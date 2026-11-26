@@ -1,5 +1,11 @@
 #pragma once
 
+#if defined(ARBORENUM_LOGISTIC)
+static constexpr bool logistic_objective = true;
+#else
+static constexpr bool logistic_objective = false;
+#endif
+
 #if defined(ARBORENUM_REGRESSION)
 static constexpr bool regression_objective = true;
 using Objective = double;

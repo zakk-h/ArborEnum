@@ -5,7 +5,9 @@
 
 #include "cpp/native_headers.hpp"
 
-#if defined(ARBORENUM_REGRESSION)
+#if defined(ARBORENUM_LOGISTIC)
+namespace arborenum_logistic {
+#elif defined(ARBORENUM_REGRESSION)
 namespace arborenum_regression {
 #endif
 
@@ -368,6 +370,12 @@ PYBIND11_MODULE(ARBORENUM_NATIVE_MODULE, m) {
         .def("set_sparsification", &ArborEnum::set_sparsification, py::arg("probability"), py::arg("seed"), py::arg("cache_proxy_splits") = true)
         .def("get_sparsification_stats", &ArborEnum::get_sparsification_stats)
         .def("set_proxy_delta", &ArborEnum::set_proxy_delta, py::arg("proxy_delta"))
+#if defined(ARBORENUM_LOGISTIC)
+        .def("set_logistic_evaluation_offsets", &ArborEnum::set_logistic_evaluation_offsets)
+#endif
+        .def("set_logistic_options", &ArborEnum::set_logistic_options,
+             py::arg("base_logits"), py::arg("leaf_logit_clip") = 30.0,
+             py::arg("newton_max_iter") = 50, py::arg("newton_tol") = 1e-10)
         .def("set_regression_options", &ArborEnum::set_regression_options,
              py::arg("equivalent_points"), py::arg("continuous_kmeans"),
              py::arg("kmeans_min_remaining_depth") = 2)
@@ -2147,7 +2155,7 @@ PYBIND11_MODULE(ARBORENUM_NATIVE_MODULE, m) {
                 std::vector<std::vector<int>>{},
             py::arg("bb_pred_eval") = py::array_t<Prediction>(0),
             py::arg("sum_samplewise_extrema") = false,
-            py::arg("optimize_leaf_values") = regression_objective
+            py::arg("optimize_leaf_values") = (regression_objective && !logistic_objective)
         )
 
 
@@ -2607,6 +2615,10 @@ PYBIND11_MODULE(ARBORENUM_NATIVE_MODULE, m) {
             int movement_bound_mode,
             std::size_t movement_cache_bytes,
             int proxy_delta
+#if defined(ARBORENUM_LOGISTIC)
+            , const std::vector<double>& base_logits, double leaf_logit_clip,
+            int newton_max_iter, double newton_tol
+#endif
         ) {
             py::buffer_info xinfo = X.request();
             py::buffer_info yinfo = y.request();
@@ -2764,6 +2776,9 @@ PYBIND11_MODULE(ARBORENUM_NATIVE_MODULE, m) {
                     movement_bound_mode,
                     movement_cache_bytes,
                     proxy_delta
+#if defined(ARBORENUM_LOGISTIC)
+                    , base_logits, leaf_logit_clip, newton_max_iter, newton_tol
+#endif
                 );
 
             py::dict out;
@@ -2814,6 +2829,11 @@ PYBIND11_MODULE(ARBORENUM_NATIVE_MODULE, m) {
         py::arg("movement_bound_mode") = 1,
         py::arg("movement_cache_bytes") = 128ULL * 1024 * 1024,
         py::arg("proxy_delta") = 0
+#if defined(ARBORENUM_LOGISTIC)
+        , py::arg("base_logits") = std::vector<double>{},
+        py::arg("leaf_logit_clip") = 30, py::arg("newton_max_iter") = 50,
+        py::arg("newton_tol") = 1e-10
+#endif
         
     );
 
@@ -2896,6 +2916,10 @@ PYBIND11_MODULE(ARBORENUM_NATIVE_MODULE, m) {
             int movement_bound_mode,
             std::size_t movement_cache_bytes,
             int proxy_delta
+#if defined(ARBORENUM_LOGISTIC)
+            , const std::vector<double>& base_logits, double leaf_logit_clip,
+            int newton_max_iter, double newton_tol
+#endif
         ) {
             py::buffer_info num_info =
                 X_num.request();
@@ -3504,6 +3528,9 @@ PYBIND11_MODULE(ARBORENUM_NATIVE_MODULE, m) {
                     movement_bound_mode,
                     movement_cache_bytes,
                     proxy_delta
+#if defined(ARBORENUM_LOGISTIC)
+                    , base_logits, leaf_logit_clip, newton_max_iter, newton_tol
+#endif
                 );
 
             py::dict out;
@@ -3594,6 +3621,11 @@ PYBIND11_MODULE(ARBORENUM_NATIVE_MODULE, m) {
         py::arg("movement_bound_mode") = 1,
         py::arg("movement_cache_bytes") = 128ULL * 1024 * 1024,
         py::arg("proxy_delta") = 0
+#if defined(ARBORENUM_LOGISTIC)
+        , py::arg("base_logits") = std::vector<double>{},
+        py::arg("leaf_logit_clip") = 30, py::arg("newton_max_iter") = 50,
+        py::arg("newton_tol") = 1e-10
+#endif
     );
 
     

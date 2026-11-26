@@ -6112,3 +6112,14 @@ from .single_tree import ArborEnumTree
 __all__.append("ArborEnumTree")
 
 from .single_tree import ArborEnumTreeRegressor
+
+__all__.extend(["ArborEnumLogisticClassifier", "ArborEnumTreeLogisticClassifier"])
+
+
+def __getattr__(name):
+    if name in ("ArborEnumLogisticClassifier", "ArborEnumTreeLogisticClassifier"):
+        from .logistic import ArborEnumLogisticClassifier, ArborEnumTreeLogisticClassifier
+        globals().update(ArborEnumLogisticClassifier=ArborEnumLogisticClassifier,
+                         ArborEnumTreeLogisticClassifier=ArborEnumTreeLogisticClassifier)
+        return globals()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
