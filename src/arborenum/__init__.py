@@ -3635,6 +3635,9 @@ class ArborEnum:
         root_n=None,
         gamma=None,
         eta_defer=None,
+        X=None,
+        y=None,
+        class_names=None,
         indent=2,
     ):
         graph = self.export_andor_graph(
@@ -3697,14 +3700,17 @@ class ArborEnum:
             )
 
         if gamma is None:
-            gamma = getattr(
-                self,
-                "gamma_",
-                None,
-            )
+            gamma = getattr(self, "gamma_", None)
+            if lambda_reg is not None and root_n is not None:
+                value = float(lambda_reg) * int(root_n)
+                gamma = value if self._regression else int(np.floor(value + 0.5))
 
         meta = {
             **feature_meta,
+            "schemaVersion": 2,
+            "originalFeatureNames": [str(name) for name in (self.feature_names_in_ if feature_names is None else feature_names)],
+            "use_deferral": any(leaf["prediction"] == self._defer_prediction for leaf in graph["leaf_nodes"]),
+            "proxy_delta": getattr(self, "_proxy_delta_value", 0),
 
             "featureDescriptions": feature_descriptions,
             "task": "regression" if self._regression else "classification",
@@ -3759,7 +3765,41 @@ class ArborEnum:
             and meta.get("root_n") is not None
         ):
             raw_gamma = float(lambda_reg) * int(meta["root_n"])
-            meta["gamma"] = raw_gamma if self._regression else int(round(raw_gamma))
+            meta["gamma"] = raw_gamma if self._regression else int(np.floor(raw_gamma + 0.5))
+
+        if (X is None) != (y is None):
+            raise ValueError("Pass both X and y to embed an analysis dataset.")
+        if class_names is not None:
+            if self._regression:
+                raise ValueError("class_names is only available for classification graphs.")
+            names = [str(name) for name in class_names]
+            if not names or len(set(names)) != len(names):
+                raise ValueError("class_names must be nonempty and unique.")
+            meta["classNames"] = names
+        if X is not None:
+            data = _as_2d_numeric_array(X, "X")
+            targets = np.asarray(y)
+            if targets.ndim != 1 or len(targets) != len(data):
+                raise ValueError("y must contain one target per analysis dataset row.")
+            if data.shape[1] != self.n_features_in_ or len(data) != int(meta["root_n"]):
+                raise ValueError("Analysis dataset dimensions must match the training dataset.")
+            if not np.all(np.isfinite(data)) or not np.all(np.isfinite(targets)):
+                raise ValueError("Analysis dataset values must be finite.")
+            names = []
+            if not self._regression:
+                if np.any(targets < 0) or np.any(targets != np.floor(targets)):
+                    raise ValueError("Classification targets must be nonnegative integer class IDs.")
+                count = int(np.max(targets)) + 1
+                names = meta.get("classNames", [str(i) for i in range(count)])
+                if len(names) < count:
+                    raise ValueError("class_names does not cover all analysis targets.")
+                meta["classNames"] = names
+            meta["analysisDataset"] = {
+                "feature_names": meta["originalFeatureNames"],
+                "class_names": names,
+                "X": data.tolist(),
+                "y": targets.tolist(),
+            }
 
         payload = {
             "graph": graph,
