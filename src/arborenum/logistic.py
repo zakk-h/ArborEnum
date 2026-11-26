@@ -252,8 +252,34 @@ class ArborEnumLogisticClassifier(ClassifierMixin, ArborEnumRegressor):
         raise NotImplementedError("This analysis is not implemented for logistic loss.")
 
     get_wald_divisive_model_reliance_intervals = _unsupported_logistic_analysis
-    save_builder_payload = _unsupported_logistic_analysis
-    save_builder_html = _unsupported_logistic_analysis
+
+    def save_builder_payload(self, path, *, X=None, y=None, base_logits=None, class_names=None, **kwargs):
+        import json
+        if (X is None) != (y is None):
+            raise ValueError("Pass both X and y to embed an analysis dataset.")
+        offsets = None
+        if X is not None:
+            labels = np.asarray(y, dtype=float)
+            if labels.ndim != 1 or len(labels) != len(X) or not np.all((labels == 0) | (labels == 1)):
+                raise ValueError("Logistic analysis targets must be binary and match X rows.")
+            offsets = np.asarray(self._prediction_offsets(X, base_logits), dtype=float)
+            if offsets.ndim == 0:
+                offsets = np.full(len(X), offsets, dtype=float)
+        elif base_logits is not None:
+            raise ValueError("Pass X and y when embedding base logits.")
+        names = [str(name) for name in (class_names if class_names is not None else self.classes_)]
+        if len(names) != 2 or len(set(names)) != 2:
+            raise ValueError("Logistic graphs require two distinct class names.")
+        path = ArborEnum.save_builder_payload(self, path, X=X, y=y, **kwargs)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        meta = payload["meta"]
+        meta.update(task="logistic", loss="log_loss", leaf_values="logit_correction",
+                    leaf_logit_clip=self.leaf_logit_clip, classNames=names,
+                    base_logits_permutation="fixed")
+        if offsets is not None:
+            meta["analysisDataset"].update(class_names=names, base_logits=offsets.tolist())
+        path.write_text(json.dumps(payload, indent=kwargs.get("indent", 2)), encoding="utf-8")
+        return path
 
 
 class ArborEnumTreeLogisticClassifier(ClassifierMixin, ArborEnumTree, BaseEstimator):
