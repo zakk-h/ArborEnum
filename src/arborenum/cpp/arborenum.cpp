@@ -11945,6 +11945,13 @@ private:
             );
         }
 
+        // Continuous Lickety delegates its last one or two levels here.
+        // Preserve the chosen split so anytime enumeration can reproduce
+        // that proxy completion even when its threshold is not active yet.
+        if (anytime_continuous_lickety_k1_first_split_enabled_() &&
+            depth_budget <= 2 && recorded_feature >= 0 && ans == best_sum) {
+            anytime_lickety_first_split_cache[K2{key_of_subproblem(mask, pk), depth_budget}] = recorded_feature;
+        }
         if (sparsification_index_enabled_ && ans == best_sum) remember_proxy_split_(kmask, depth_budget, ans, recorded_feature, use_kla_cache() ? KTAG : 0);
         return ans;
     }
